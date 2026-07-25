@@ -354,7 +354,7 @@ Format converter and composer. Optional fields are the switches: no
 | `private_key_pem` | optional, sensitive | |
 | `chain_pem` | optional, list | ordered, leaf-adjacent first |
 | `friendly_name` | optional | PKCS#12 / JKS alias |
-| `pkcs12_encoding` | optional | `modern` (default) or `legacy` |
+| `pkcs12_encoding` | optional | `modern` (default), `legacy`, `passwordless` |
 | `password_wo` | write-only, sensitive | never persisted to state |
 | `password_wo_version` | optional | change to force re-encryption |
 | `content` | computed | text formats only; null for binary |
@@ -367,12 +367,50 @@ Write-only attributes are always null in state and therefore invisible to drift
 detection, which is why `password_wo_version` exists — the standard framework
 pattern for rotating a write-only value.
 
-`pkcs12_encoding` matters for this deployment: `modern` is AES-256-CBC +
-PBKDF2, `legacy` is RC2/3DES for older iOS and Android import paths. The
-existing bundles were produced by OpenSSL 3's default `-export`, so the
-migration must confirm which one round-trips on the actual iPad and iPhone.
+#### PKCS#12 encoding
 
-Dependencies: `software.sslmate.com/src/go-pkcs12`,
+`go-pkcs12` covers every needed variant in pure Go — no cgo, no `openssl`. RSA,
+ECDSA, and Ed25519 keys all encode, with chains. Verified output, checked
+against OpenSSL 3.5.7:
+
+| `pkcs12_encoding` | go-pkcs12 encoder | Content encryption | MAC |
+| --- | --- | --- | --- |
+| `modern` (default) | `Modern2023` | AES-256-CBC + PBKDF2, iter 2048 | SHA-256 |
+| `legacy` | `LegacyDES` | 3DES, iter 2048 | SHA-1 |
+| `passwordless` | `Passwordless` | none | none |
+
+`LegacyRC2` is deliberately **not** exposed. It emits RC2-40, which OpenSSL 3
+cannot decrypt — verified by round-tripping a generated file back through
+`openssl pkcs12 -info`, which fails with
+`unsupported ... Algorithm (RC2-40-CBC)`. `Modern2026` (PBMAC1) is also omitted;
+it requires OpenSSL ≥ 3.4 or Java ≥ 26 and no mobile platform reads it.
+
+Client-certificate consumers are the reason `legacy` must stay available.
+Encryption and MAC are **independent** failure axes:
+
+| Platform | AES-256-CBC content | SHA-256 MAC |
+| --- | --- | --- |
+| iOS/iPadOS ≤ 17, macOS ≤ 14 | rejected (`Unknown format in import`) | rejected (`-25264 MAC verification failed`) |
+| iOS/iPadOS 18+, macOS 15+ | accepted | accepted |
+| Android ≤ 11 | rejected | rejected |
+| Android 12–13 | conditional — the BouncyCastle PBES2 fix ships in the ART mainline module (~April 2023), so it depends on the device's Play system update | conditional |
+| Android 14+ | accepted | accepted |
+
+Android 12 rejects a SHA-256 MAC even when the content is 3DES, so choosing
+`legacy` for the content alone is not sufficient — only `legacy`, which also
+uses a SHA-1 MAC, is universally importable.
+
+`modern` is the default because it is what `engine.py:118`'s bare
+`openssl pkcs12 -export` already produces under OpenSSL 3, making the migration
+behavior-preserving. Devices older than iOS 18 or Android 12 need
+`pkcs12_encoding = "legacy"`, and the provider documentation must carry this
+matrix.
+
+When `private_key_pem` is omitted for `format = "pkcs12"`, the bundle is built
+with `EncodeTrustStore` rather than `Encode` with a nil key — a PKCS#12
+truststore is a structurally different artifact from a cert-only keystore.
+
+Dependencies: `software.sslmate.com/src/go-pkcs12` (v0.7.3+),
 `github.com/smallstep/pkcs7`, `github.com/pavlo-v-chernykh/keystore-go/v4`.
 
 ## 7. Serial numbers
@@ -452,7 +490,13 @@ failure mode.
   leading-zero cases
 - Duration parsing: `"175320h"`, `"20y"`, `"90d"`, and rejection of garbage
 - Each bundle format round-tripping, cross-validated by shelling out to
-  `openssl` and `keytool` where available (skipped when absent)
+  `openssl` and `keytool` where available (skipped when absent). For PKCS#12
+  this must assert the *emitted algorithms*, not just that decoding succeeds:
+  `legacy` must produce 3DES with a SHA-1 MAC and `modern` must produce
+  AES-256-CBC with a SHA-256 MAC, since a silent shift between them is exactly
+  what locks a phone out.
+- PKCS#12 encoding for all three key algorithms (RSA, ECDSA, Ed25519), with and
+  without a chain, and cert-only truststore mode
 - OID table completeness and bidirectional consistency
 
 **Acceptance tests, `terraform-plugin-testing` under `TF_ACC`:**
@@ -495,6 +539,16 @@ Decodes any certificate PEM — including the Bitwarden CA — into subject, SAN
 serial, validity, extensions, key algorithm, and fingerprints. Useful for
 introspection and for asserting on adopted material.
 
+Accepts either `content_pem` or `content_base64`, so material read straight out
+of a Kubernetes Secret needs no decoding step.
+
+### `data "pki_cert_request"`
+
+Decodes a CSR PEM into subject (ordered form), SANs, requested extensions,
+public key algorithm, and a `signature_valid` boolean. Needed when signing a CSR
+generated off-box — a device or another team hands you a CSR and you want to
+inspect or assert on it before issuing, rather than signing blind.
+
 ### Provider functions
 
 ```hcl
@@ -518,6 +572,9 @@ a packaging decision deferred to the migration spec.
 
 1. Migration spec: rewrite `homelab-pki` onto the provider, delete `reconcile/`,
    strip cfssl/openssl/python from the Dockerfile, collapse the two-phase apply.
-2. Confirm PKCS#12 encoding compatibility on the real iPad and iPhone before
-   cutover.
+2. Confirm on-device that `modern` imports on the actual iPad, iPhone, and
+   Pixel 7, or switch those bundles to `legacy`. The version cutoffs in §6.6 say
+   it should work on iOS 18+/Android 14+, but the iOS Configuration Profile
+   install path may use a different parser than `SecPKCS12Import` and the
+   evidence there is thin. This is a device test, not a research question.
 3. Decide provider distribution (public registry vs in-cluster mirror).
