@@ -1,0 +1,52 @@
+# Runs on pull requests and on pushes to main. Scoping push to main avoids a
+# duplicate run when a branch in this repo also has an open PR.
+name: Tests
+on:
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'docs/superpowers/**'
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/superpowers/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - run: go mod download
+      - run: go build -v ./...
+      - name: gofmt
+        run: |
+          test -z "$(gofmt -l .)" || (gofmt -l . && echo "run 'make fmt'" && exit 1)
+      - run: go vet ./...
+
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - run: go mod download
+      - name: go test
+        run: go test -v -cover ./internal/...
