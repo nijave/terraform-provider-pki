@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/smallstep/pkcs7"
 	pkcs12 "software.sslmate.com/src/go-pkcs12"
@@ -247,6 +248,14 @@ func encodePKCS12(in BundleInput) ([]byte, error) {
 		if in.Password != "" {
 			return nil, fmt.Errorf("pkcs12_encoding %q cannot carry a password: clear password_wo or choose another pkcs12_encoding", PKCS12Passwordless)
 		}
+		// Passwordless.Encode emits an unshrouded key bag. openssl reads it and
+		// so does go-pkcs12's DecodeChain, but Java reports "0 entries" — and
+		// Java truststores are the only thing this encoding is good for, so the
+		// result is a bundle whose sole intended consumer sees it as empty.
+		// Rejecting is the only honest option; a keyless truststore is fine.
+		if in.PrivateKey != nil {
+			return nil, fmt.Errorf("pkcs12_encoding %q cannot carry a private key: Java reads such a bundle as empty, so drop private_key_pem to build a truststore, choose another pkcs12_encoding, or use format = \"pem\" for an unencrypted private key", PKCS12Passwordless)
+		}
 	} else if in.Password == "" {
 		return nil, fmt.Errorf("pkcs12_encoding %q requires a password: set password_wo, or use pkcs12_encoding %q for an unencrypted bundle", encoding, PKCS12Passwordless)
 	}
@@ -310,6 +319,11 @@ func encodePKCS12TrustStore(encoder *pkcs12.Encoder, in BundleInput) ([]byte, er
 // is used, falling back to its serial when the common name is empty. Any
 // remaining collision is broken with a numeric suffix, because a duplicate alias
 // is exactly the silent trust-anchor loss this function exists to prevent.
+//
+// Collisions are detected case-insensitively. Java folds PKCS#12 aliases to
+// lowercase, so common names of "Root" and "root" are one alias to keytool and
+// one of the two anchors would vanish. keystore-go lowercases aliases too, and
+// there the second entry overwrites the first rather than merging with it.
 func trustStoreAliases(friendlyName string, certs []*x509.Certificate) []string {
 	aliases := make([]string, len(certs))
 	used := make(map[string]bool, len(certs))
@@ -326,10 +340,10 @@ func trustStoreAliases(friendlyName string, certs []*x509.Certificate) []string 
 			alias = FormatSerial(cert.SerialNumber)
 		}
 		candidate := alias
-		for n := 2; used[candidate]; n++ {
+		for n := 2; used[strings.ToLower(candidate)]; n++ {
 			candidate = fmt.Sprintf("%s-%d", alias, n)
 		}
-		used[candidate] = true
+		used[strings.ToLower(candidate)] = true
 		aliases[i] = candidate
 	}
 	return aliases

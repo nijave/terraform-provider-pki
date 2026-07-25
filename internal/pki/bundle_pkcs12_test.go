@@ -360,6 +360,59 @@ func TestEncodePKCS12TrustStoreAliasesAreDistinct(t *testing.T) {
 	}
 }
 
+// TestEncodePKCS12TrustStoreAliasesAreCaseInsensitivelyDistinct is the same
+// hazard one step subtler. Java folds PKCS#12 aliases to lowercase, so common
+// names of "Root" and "root" are a collision even though the strings differ, and
+// a dedup keyed on the raw string lets both through unchanged. Measured before
+// the fix: aliases [Root root] and `keytool -list` reporting 1 entry, silently
+// dropping a trust anchor.
+//
+// This is distinct from TestEncodePKCS12TrustStoreAliasesAreDistinct, which uses
+// identical subjects and therefore passes even with a case-sensitive dedup.
+func TestEncodePKCS12TrustStoreAliasesAreCaseInsensitivelyDistinct(t *testing.T) {
+	t.Parallel()
+	requireKeytool(t, true)
+	upper, _ := testCA(t, nil, nil, "Root")
+	lower, _ := testCA(t, nil, nil, "root")
+
+	out, err := EncodeBundle(BundleInput{
+		Format: FormatPKCS12, Certificate: upper, Chain: []*x509.Certificate{lower},
+		Password: testPassword,
+	})
+	if err != nil {
+		t.Fatalf("EncodeBundle: %v", err)
+	}
+	text := keytoolList(t, out, testPassword)
+	if !strings.Contains(text, "contains 2 entries") {
+		t.Errorf("keytool -list does not report 2 entries; aliases differing only in case collapsed:\n%s", text)
+	}
+}
+
+// TestEncodePKCS12PasswordlessRejectsAPrivateKey covers a combination that
+// encodes without complaint and is then unreadable by the only consumer that
+// wants it. pkcs12.Passwordless.Encode emits an unshrouded key bag: openssl
+// prints the key bag and both certificates, and pkcs12.DecodeChain reads it back
+// intact, but `keytool -list` reports 0 entries -- and Java truststores are the
+// entire reason this encoding exists.
+func TestEncodePKCS12PasswordlessRejectsAPrivateKey(t *testing.T) {
+	t.Parallel()
+	leaf, key, ca := testLeaf(t)
+	_, err := EncodeBundle(BundleInput{
+		Format: FormatPKCS12, Certificate: leaf, PrivateKey: key,
+		Chain: []*x509.Certificate{ca}, PKCS12Encoding: PKCS12Passwordless,
+	})
+	if err == nil {
+		t.Fatal("EncodeBundle accepted a private key with the passwordless encoding; Java reads the result as empty")
+	}
+	// The message has to tell an operator which attribute to change and where an
+	// unencrypted private key does belong.
+	for _, want := range []string{"pkcs12_encoding", "private_key_pem", "pem"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
 func TestEncodePKCS12RejectsBadInput(t *testing.T) {
 	t.Parallel()
 	leaf, key, _ := testLeaf(t)
