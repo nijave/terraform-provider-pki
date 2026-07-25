@@ -1958,7 +1958,9 @@ func TestParseSubjectDERRoundTripsByteExact(t *testing.T) {
 func TestParseSubjectDERFlattensMultiValuedRDNs(t *testing.T) {
 	t.Parallel()
 	// A DN produced elsewhere may pack several attributes into one RDN SET.
-	// Parsing must not lose them; the ordered form flattens them in order.
+	// Parsing must not lose them; the ordered form flattens them in the
+	// order they appear ON THE WIRE, which is not necessarily the order the
+	// literal below declares -- see the sort note in the assertion.
 	// Re-encoding will produce single-attribute RDNs, so this case is
 	// deliberately NOT byte-exact -- it is the one shape import cannot
 	// reproduce, and callers detect it by comparing the DER themselves.
@@ -1982,9 +1984,28 @@ func TestParseSubjectDERFlattensMultiValuedRDNs(t *testing.T) {
 	if len(parsed.Attributes) != 3 {
 		t.Fatalf("parsed %d attributes, want 3", len(parsed.Attributes))
 	}
-	if parsed.Attributes[0].Value != "homelab" || parsed.Attributes[1].Value != "infra" || parsed.Attributes[2].Value != "cn" {
-		t.Fatalf("flattened order = %q, %q, %q; want homelab, infra, cn",
+
+	// The expected order is infra, homelab, cn -- NOT the declaration order
+	// above. DER requires the members of a SET OF to be sorted by their
+	// encodings (X.690 11.6), and asn1.Marshal enforces it, so the
+	// organizationalUnit ATV (which encodes to 30 0c ...) sorts before the
+	// organization ATV (30 0e ...). The bytes this fixture produces really do
+	// carry infra first, whatever the literal says.
+	if parsed.Attributes[0].Value != "infra" || parsed.Attributes[1].Value != "homelab" || parsed.Attributes[2].Value != "cn" {
+		t.Fatalf("flattened order = %q, %q, %q; want infra, homelab, cn (DER sorts SET OF members)",
 			parsed.Attributes[0].Value, parsed.Attributes[1].Value, parsed.Attributes[2].Value)
+	}
+
+	// Guard the fixture itself: if a future edit collapses the first RDN to a
+	// single attribute, the assertions above would still pass while no longer
+	// testing a multi-valued RDN at all.
+	var check rawRDNSequence
+	if _, err := asn1.Unmarshal(der, &check); err != nil {
+		t.Fatalf("re-parsing the fixture: %v", err)
+	}
+	if len(check) != 2 || len(check[0]) != 2 {
+		t.Fatalf("fixture is no longer a 2-RDN sequence whose first RDN is multi-valued: %d RDNs, first holds %d",
+			len(check), len(check[0]))
 	}
 }
 
@@ -2140,7 +2161,7 @@ var asn1Tag = map[StringType]int{
 	StringTypeUTF8:      asn1.TagUTF8String,      // 12
 	StringTypePrintable: asn1.TagPrintableString, // 19
 	StringTypeIA5:       asn1.TagIA5String,       // 22
-	StringTypeBMP:       28,                      // BMPString; encoding/asn1 has no constant
+	StringTypeBMP:       asn1.TagBMPString,       // 30 -- NOT 28, which is UniversalString (UCS-4)
 	StringTypeT61:       asn1.TagT61String,       // 20
 }
 
@@ -2178,7 +2199,7 @@ The empty-string-is-unset rule from `TestNamedSubjectExpandOmitsUnsetFields` app
 // Each attribute becomes its own single-element RDN SET. Multi-valued RDNs are
 // not produced: openssl's [dn] config section cannot express them, so no
 // certificate this provider needs to reproduce contains one. ParseSubjectDER
-// still reads them, flattening in order.
+// still reads them, flattening in wire order.
 func (s Subject) EncodeDER() ([]byte, error) {
 	if len(s.Attributes) == 0 {
 		// An empty DN is legal DER (an empty SEQUENCE) and is what a
@@ -2221,6 +2242,12 @@ func (s Subject) EncodeDER() ([]byte, error) {
 - `StringTypeIA5`: reject any rune above `unicode.MaxASCII`.
 - `StringTypeT61`: reject any rune above `unicode.MaxASCII` as an approximation; T.61's full repertoire is not worth implementing and no input this provider handles needs it. Say so in a comment.
 - `StringTypeBMP`: encode as big-endian UTF-16 (`unicode/utf16.Encode` over the runes, then two bytes per code unit); reject anything outside the BMP, meaning any code unit that came from a surrogate pair.
+
+**Add tests for `bmp`, `t61`, and the unknown-tag parse path.** The test file above exercises only `utf8`, `printable`, and `ia5`, which means an incorrect tag number for `bmp` or `t61` would ship green — and the first draft of this plan did in fact specify the wrong tag for `bmp` (28, which is UniversalString, rather than 30). Three cases close that hole:
+
+1. Encode a value as `StringTypeBMP` and as `StringTypeT61`, and assert the tag actually present in the emitted DER is 30 and 20 respectively. Read the tag off the wire rather than comparing against the `asn1Tag` map, or the test just restates the map to itself.
+2. Assert the repertoire rejections: a non-ASCII rune under `t61`, and a rune outside the BMP (any astral character, which UTF-16 encodes as a surrogate pair) under `bmp`.
+3. Assert `ParseSubjectDER` errors on an attribute whose value carries a string tag outside the five supported ones — construct one with an `asn1.RawValue` using, for instance, tag 27 (`GeneralString`). The prose already requires this rejection but nothing above exercises it.
 
 Setting `Bytes` on an `asn1.RawValue` (rather than `FullBytes`) makes `asn1.Marshal` write the tag and length itself, which is what keeps the output canonical DER.
 
@@ -5754,6 +5781,8 @@ type CompareInput struct {
 
 1. `Actual` non-nil, else an error (not drift — a caller with no certificate has a bug, not a diff).
 2. **Subject**: `Desired.Subject.EncodeDER()` against `Actual.RawSubject`, compared as bytes. Report `Field: "subject"` with both sides rendered through `Subject.String()` for readability.
+
+   **If `EncodeDER` fails, return the error — do not report it as drift.** This matters more than it looks. `Subject.Equal` (Task 6) swallows an encode failure and returns `false`, which is right for a boolean but wrong here: a subject that cannot be encoded would then be reported as permanently drifting with no stated cause, and the operator would watch Terraform propose the same replacement on every plan with no way to see why. The realistic trigger is an adopted certificate whose DN carries a value that violates its own declared string type — a `PrintableString` containing a character outside that repertoire, which Task 6's parser accepts but its encoder refuses. Surfacing the error names the attribute and turns unexplained churn into an actionable adoption failure. Task 6's implementer identified this and handed it forward specifically.
 3. **Public key**: `PublicKeysEqual(in.DesiredPublicKey, in.Actual.PublicKey)` when `DesiredPublicKey` is non-nil. Report `Field: "public_key"` with the fingerprints, never the keys.
 4. **Serial**: `Desired.Serial.Cmp(Actual.SerialNumber)`, reported as `serial_number` with `FormatSerial` on both sides.
 5. **Validity**: `NotBefore` and `NotAfter` compared with `Time.Equal` after truncating both to a second, because DER encodes `UTCTime` at second granularity and a template carrying sub-second precision would otherwise always differ. Report `not_before` and `not_after` in RFC3339.
