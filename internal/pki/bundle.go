@@ -10,6 +10,7 @@ import (
 	"io"
 
 	"github.com/smallstep/pkcs7"
+	pkcs12 "software.sslmate.com/src/go-pkcs12"
 )
 
 // Format names an output encoding for a certificate bundle.
@@ -37,10 +38,54 @@ func (f Format) IsText() bool {
 	return f == FormatPEM
 }
 
-// PKCS12Encoding selects the PKCS#12 encryption/MAC scheme EncodeBundle uses
-// for FormatPKCS12. It is declared here because BundleInput needs the type;
-// its constants and behavior are implemented in Task 12.
+// PKCS12Encoding selects the algorithm suite for a PKCS#12 bundle.
+//
+// Only three of go-pkcs12's encoders are exposed, and the omissions are
+// deliberate. LegacyRC2 emits RC2-40, which OpenSSL 3 refuses to decrypt.
+// Modern2026 uses PBMAC1, which needs OpenSSL 3.4+ or Java 26+ and which no
+// mobile platform reads.
 type PKCS12Encoding string
+
+const (
+	// PKCS12Modern is AES-256-CBC content encryption with PBKDF2 and an
+	// HMAC-SHA256 MAC. It is the default because it is what a bare
+	// `openssl pkcs12 -export` produces under OpenSSL 3, which is what the
+	// homelab reconciler already emits, so migrating to this provider does not
+	// change what lands on a device.
+	//
+	// Requires iOS/iPadOS 18+, macOS 15+, or Android 14+ (Android 12-13 depends
+	// on the device's Play system update).
+	PKCS12Modern PKCS12Encoding = "modern"
+
+	// PKCS12Legacy is 3DES content encryption with a SHA-1 MAC. It is the only
+	// combination that is universally importable on older devices. Encryption
+	// and MAC are independent failure axes: Android 12 rejects a SHA-256 MAC
+	// even when the content is 3DES, so switching only the cipher is not
+	// enough.
+	PKCS12Legacy PKCS12Encoding = "legacy"
+
+	// PKCS12Passwordless has no encryption and no MAC. go-pkcs12 requires the
+	// password to be empty with it, and it is really only useful for Java
+	// truststores.
+	PKCS12Passwordless PKCS12Encoding = "passwordless"
+)
+
+// PKCS12Encodings returns every PKCS#12 encoding this package supports, in the
+// order declared above. It exists for schema validation in Plan 2, so the
+// provider's allowed-values list can be derived from this package rather than
+// duplicated.
+func PKCS12Encodings() []PKCS12Encoding {
+	return []PKCS12Encoding{PKCS12Modern, PKCS12Legacy, PKCS12Passwordless}
+}
+
+// pkcs12Encoders maps the exposed encodings to go-pkcs12's encoders. It is the
+// only place an encoder is named, so an encoding absent from this table is
+// unreachable no matter what a caller puts in BundleInput.PKCS12Encoding.
+var pkcs12Encoders = map[PKCS12Encoding]*pkcs12.Encoder{
+	PKCS12Modern:       pkcs12.Modern2023,
+	PKCS12Legacy:       pkcs12.LegacyDES,
+	PKCS12Passwordless: pkcs12.Passwordless,
+}
 
 // BundleInput describes what to encode. Which fields are set is the interface:
 // omitting PrivateKey produces a certificate-only bundle, and omitting Chain
@@ -163,9 +208,131 @@ func encodePKCS7(in BundleInput) ([]byte, error) {
 	return out, nil
 }
 
-// encodePKCS12 is implemented in Task 12.
+// encodePKCS12 builds a PKCS#12 file. With a private key it is a keystore; with
+// no private key it is a Java truststore, which is a structurally different
+// artifact and not merely a keystore with the key left out.
+//
+// The certificate is mandatory when a key is present, which is not true of
+// pkcs7 above. The asymmetry is deliberate: a degenerate PKCS#7 is a flat bag of
+// certificates with no designated end entity, so a chain-only bundle is
+// meaningful there. A PKCS#12 keystore entry pairs the key with one specific
+// certificate, so the certificate is not optional — and the key must actually
+// match it, because pairing one device's key with another's certificate produces
+// a bundle that installs cleanly and then fails every TLS handshake.
+//
+// An unrecognized encoding is an error rather than a fall-through to
+// PKCS12Modern: a typo in pkcs12_encoding must fail at plan time, not quietly
+// emit algorithms an older device cannot read.
 func encodePKCS12(in BundleInput) ([]byte, error) {
-	return nil, fmt.Errorf("pkcs12 bundle encoding is not yet implemented")
+	encoding := in.PKCS12Encoding
+	if encoding == "" {
+		encoding = PKCS12Modern
+	}
+	encoder, ok := pkcs12Encoders[encoding]
+	if !ok {
+		return nil, fmt.Errorf("unknown pkcs12 encoding %q: supported encodings are %v", in.PKCS12Encoding, PKCS12Encodings())
+	}
+	if in.Rand != nil {
+		// WithRand has a value receiver and returns a new *Encoder, so this does
+		// not mutate the package-level encoder in pkcs12Encoders.
+		encoder = encoder.WithRand(in.Rand)
+	}
+
+	// go-pkcs12 rejects a non-empty password with Passwordless itself, saying
+	// "password must be empty", which is accurate but does not name the
+	// attribute to change. An empty password with the other two encodings is
+	// worse than useless: it produces a file whose MAC is keyed on the empty
+	// string, which some tools accept and others reject.
+	if encoding == PKCS12Passwordless {
+		if in.Password != "" {
+			return nil, fmt.Errorf("pkcs12_encoding %q cannot carry a password: clear password_wo or choose another pkcs12_encoding", PKCS12Passwordless)
+		}
+	} else if in.Password == "" {
+		return nil, fmt.Errorf("pkcs12_encoding %q requires a password: set password_wo, or use pkcs12_encoding %q for an unencrypted bundle", encoding, PKCS12Passwordless)
+	}
+
+	if in.PrivateKey == nil {
+		return encodePKCS12TrustStore(encoder, in)
+	}
+	if in.Certificate == nil {
+		return nil, fmt.Errorf("pkcs12 bundle with a private key requires a certificate: a keystore entry pairs the key with one specific certificate")
+	}
+	if !PublicKeysEqual(PublicKeyOf(in.PrivateKey), in.Certificate.PublicKey) {
+		return nil, fmt.Errorf("pkcs12 bundle private key does not match the certificate's public key")
+	}
+
+	// go-pkcs12 accepts a crypto.Signer for RSA, ECDSA, and Ed25519 alike, so
+	// there is no PKCS#8 conversion here. That is only the jks path.
+	//
+	// FriendlyName is not applied on this branch. go-pkcs12 v0.7.3's
+	// Encoder.Encode sets only the localKeyId attribute and exposes no way to
+	// add a friendlyName, so Java synthesizes the alias instead. jks honours
+	// FriendlyName, and so does the truststore path below.
+	out, err := encoder.Encode(in.PrivateKey, in.Certificate, in.Chain, in.Password)
+	if err != nil {
+		return nil, fmt.Errorf("building pkcs12 keystore: %w", err)
+	}
+	return out, nil
+}
+
+// encodePKCS12TrustStore builds a Java truststore: every certificate is a peer
+// marked as a trust anchor and none is designated the end entity.
+//
+// It uses EncodeTrustStoreEntries rather than EncodeTrustStore because
+// EncodeTrustStore derives each alias from the certificate's subject, and two
+// certificates sharing a subject — a re-keyed or cross-signed root — then
+// collapse into a single keytool entry, silently dropping a trust anchor.
+func encodePKCS12TrustStore(encoder *pkcs12.Encoder, in BundleInput) ([]byte, error) {
+	certs := make([]*x509.Certificate, 0, 1+len(in.Chain))
+	if in.Certificate != nil {
+		certs = append(certs, in.Certificate)
+	}
+	certs = append(certs, in.Chain...)
+
+	aliases := trustStoreAliases(in.FriendlyName, certs)
+	entries := make([]pkcs12.TrustStoreEntry, len(certs))
+	for i, cert := range certs {
+		entries[i] = pkcs12.TrustStoreEntry{Cert: cert, FriendlyName: aliases[i]}
+	}
+	out, err := encoder.EncodeTrustStoreEntries(entries, in.Password)
+	if err != nil {
+		return nil, fmt.Errorf("building pkcs12 truststore: %w", err)
+	}
+	return out, nil
+}
+
+// trustStoreAliases derives one alias per certificate for a truststore, in the
+// same order as certs. It is shared with the jks encoder, where duplicate
+// aliases silently overwrite each other rather than merely merging.
+//
+// A supplied friendlyName is used verbatim for a single certificate and
+// suffixed -1, -2, ... across several. Otherwise each certificate's common name
+// is used, falling back to its serial when the common name is empty. Any
+// remaining collision is broken with a numeric suffix, because a duplicate alias
+// is exactly the silent trust-anchor loss this function exists to prevent.
+func trustStoreAliases(friendlyName string, certs []*x509.Certificate) []string {
+	aliases := make([]string, len(certs))
+	used := make(map[string]bool, len(certs))
+	for i, cert := range certs {
+		var alias string
+		switch {
+		case friendlyName != "" && len(certs) == 1:
+			alias = friendlyName
+		case friendlyName != "":
+			alias = fmt.Sprintf("%s-%d", friendlyName, i+1)
+		case cert.Subject.CommonName != "":
+			alias = cert.Subject.CommonName
+		default:
+			alias = FormatSerial(cert.SerialNumber)
+		}
+		candidate := alias
+		for n := 2; used[candidate]; n++ {
+			candidate = fmt.Sprintf("%s-%d", alias, n)
+		}
+		used[candidate] = true
+		aliases[i] = candidate
+	}
+	return aliases
 }
 
 // encodeJKS is implemented in Task 13.

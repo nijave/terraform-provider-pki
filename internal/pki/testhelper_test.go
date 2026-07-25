@@ -7,7 +7,9 @@ import (
 	"crypto"
 	"crypto/x509"
 	"encoding/asn1"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -148,6 +150,83 @@ func testLeaf(t *testing.T) (*x509.Certificate, crypto.Signer, *x509.Certificate
 		t.Fatalf("ParseCertificatePEM: %v", err)
 	}
 	return leaf, key, ca
+}
+
+// testLeafWithAlgorithm is testLeaf with a caller-chosen key algorithm for the
+// leaf. The CA stays ECDSA; the two are independent.
+func testLeafWithAlgorithm(t *testing.T, alg Algorithm) (*x509.Certificate, crypto.Signer, *x509.Certificate) {
+	t.Helper()
+	ca, caKey := testCA(t, nil, nil, "homelab-ca")
+	key, err := GenerateKey(KeyParams{Algorithm: alg})
+	if err != nil {
+		t.Fatalf("GenerateKey(%s): %v", alg, err)
+	}
+	serial, err := RandomSerial()
+	if err != nil {
+		t.Fatalf("RandomSerial: %v", err)
+	}
+	certPEM, err := CreateCertificate(CertTemplate{
+		Subject:          NamedSubject{CommonName: "leaf-" + string(alg)}.Expand(),
+		Serial:           serial,
+		NotBefore:        time.Now().Add(-time.Hour),
+		NotAfter:         time.Now().Add(24 * time.Hour),
+		BasicConstraints: &BasicConstraints{CA: false, Critical: true},
+		KeyUsage:         DefaultLeafKeyUsagePtr(),
+	}, PublicKeyOf(key), ca, caKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate(%s): %v", alg, err)
+	}
+	leaf, err := ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatePEM: %v", err)
+	}
+	return leaf, key, ca
+}
+
+// pkcs12Algorithms summarizes a PKCS#12 file's algorithm identifiers, so tests
+// can compare two files whose salts and IVs necessarily differ.
+func pkcs12Algorithms(t *testing.T, pfx []byte) string {
+	t.Helper()
+	text := opensslRun(t, pfx, "pkcs12", "-info", "-nokeys", "-nocerts", "-passin", "pass:"+testPassword)
+	var kept []string
+	for _, line := range strings.Split(text, "\n") {
+		l := strings.ToLower(strings.TrimSpace(line))
+		if strings.Contains(l, "encryption") || strings.Contains(l, "mac") || strings.Contains(l, "pbe") {
+			kept = append(kept, l)
+		}
+	}
+	return strings.Join(kept, "|")
+}
+
+// requireKeytool returns the path to keytool, or "" when it is absent. Pass
+// mustHave = true to skip the test instead of returning empty.
+func requireKeytool(t *testing.T, mustHave bool) string {
+	t.Helper()
+	path, err := exec.LookPath("keytool")
+	if err != nil {
+		if mustHave {
+			t.Skip("keytool not found in PATH; skipping cross-validation")
+		}
+		return ""
+	}
+	return path
+}
+
+// keytoolList runs `keytool -list` over a PKCS#12 or JKS file.
+func keytoolList(t *testing.T, store []byte, password string) string {
+	t.Helper()
+	bin := requireKeytool(t, true)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store")
+	if err := os.WriteFile(path, store, 0o600); err != nil {
+		t.Fatalf("writing the keystore: %v", err)
+	}
+	cmd := exec.Command(bin, "-list", "-keystore", path, "-storepass", password)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("keytool -list failed: %v\n%s", err, out)
+	}
+	return string(out)
 }
 
 // opensslRun pipes input to openssl with the given arguments and returns
