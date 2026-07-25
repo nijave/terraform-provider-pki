@@ -310,6 +310,7 @@ package pki
 import (
 	"crypto/x509"
 	"encoding/asn1"
+	"strings"
 	"testing"
 )
 
@@ -381,8 +382,29 @@ func TestTablesAreBidirectional(t *testing.T) {
 		if len(tbl.ByName) == 0 {
 			t.Errorf("table %q has an empty ByName map", tbl.Name)
 		}
+		// Every entry in ByOID must round-trip back through ByName. This holds
+		// for all five groups, including signature_algorithms, where the
+		// reverse direction is a strict subset (see below).
+		for oid, name := range tbl.ByOID {
+			back, ok := tbl.ByName[name]
+			if !ok {
+				t.Errorf("table %q: ByOID[%q] = %q but ByName is missing that key", tbl.Name, oid, name)
+				continue
+			}
+			if back != oid {
+				t.Errorf("table %q: %q -> %q -> %q, want the original OID back", tbl.Name, oid, name, back)
+			}
+		}
+	}
+
+	// Four of the five groups are strict bijections. signature_algorithms is
+	// not, and cannot be: see TestSignatureAlgorithmTableIsNotBijective.
+	for _, tbl := range tables {
+		if tbl.Name == "signature_algorithms" {
+			continue
+		}
 		if len(tbl.ByName) != len(tbl.ByOID) {
-			t.Errorf("table %q: ByName has %d entries, ByOID has %d; the maps must be the same size",
+			t.Errorf("table %q: ByName has %d entries, ByOID has %d; this group must be a strict bijection",
 				tbl.Name, len(tbl.ByName), len(tbl.ByOID))
 		}
 		for name, oid := range tbl.ByName {
@@ -394,6 +416,73 @@ func TestTablesAreBidirectional(t *testing.T) {
 			if back != name {
 				t.Errorf("table %q: %q -> %q -> %q, want the original name back", tbl.Name, name, oid, back)
 			}
+		}
+	}
+}
+
+// TestSignatureAlgorithmTableIsNotBijective documents the one place the
+// name-to-OID mapping is genuinely many-to-one, so nobody "fixes" it by
+// inventing OID arcs that do not exist.
+//
+// RFC 8017 registers a single OID for RSASSA-PSS, 1.2.840.113549.1.1.10. The
+// hash lives in the AlgorithmIdentifier's PSS parameters, not in the OID, so
+// SHA256-RSAPSS, SHA384-RSAPSS, and SHA512-RSAPSS all share it. An OID alone
+// therefore cannot name a PSS variant, and the reverse map omits it rather
+// than guessing a hash or fabricating a sub-arc.
+func TestSignatureAlgorithmTableIsNotBijective(t *testing.T) {
+	t.Parallel()
+	const pssOID = "1.2.840.113549.1.1.10"
+
+	var sigs Table
+	for _, tbl := range Tables() {
+		if tbl.Name == "signature_algorithms" {
+			sigs = tbl
+		}
+	}
+	if sigs.Name == "" {
+		t.Fatal("Tables() has no signature_algorithms group")
+	}
+
+	// All three PSS names are present in ByName and all three share the one
+	// real registered OID.
+	for _, name := range []string{"SHA256-RSAPSS", "SHA384-RSAPSS", "SHA512-RSAPSS"} {
+		got, ok := sigs.ByName[name]
+		if !ok {
+			t.Errorf("ByName is missing %q", name)
+			continue
+		}
+		if got != pssOID {
+			t.Errorf("ByName[%q] = %q, want the single registered RSASSA-PSS OID %q", name, got, pssOID)
+		}
+	}
+
+	// The shared OID is absent from the reverse map, because it does not
+	// identify one algorithm.
+	if name, ok := sigs.ByOID[pssOID]; ok {
+		t.Errorf("ByOID[%q] = %q; the shared RSASSA-PSS OID must not appear in the reverse map, because it does not determine the hash", pssOID, name)
+	}
+
+	// No fabricated sub-arcs of the PSS OID anywhere in either direction.
+	for name, oid := range sigs.ByName {
+		if strings.HasPrefix(oid, pssOID+".") {
+			t.Errorf("ByName[%q] = %q invents a sub-arc of the RSASSA-PSS OID; no such arc is registered", name, oid)
+		}
+	}
+	for oid := range sigs.ByOID {
+		if strings.HasPrefix(oid, pssOID+".") {
+			t.Errorf("ByOID has key %q, which invents a sub-arc of the RSASSA-PSS OID", oid)
+		}
+	}
+
+	// Every non-PSS name still round-trips, so the exception is narrow.
+	for _, name := range []string{"SHA256-RSA", "ECDSA-SHA384", "Ed25519"} {
+		oid, ok := sigs.ByName[name]
+		if !ok {
+			t.Errorf("ByName is missing %q", name)
+			continue
+		}
+		if back := sigs.ByOID[oid]; back != name {
+			t.Errorf("%q -> %q -> %q, want the original name back", name, oid, back)
 		}
 	}
 }
@@ -528,6 +617,12 @@ The key usages "OID" side is the decimal RFC 5280 bit position, per the design d
 `SignatureAlgorithmNames` returns the table's keys via `slices.Sorted(maps.Keys(...))`, so the list is stable across runs — an unsorted list would make generated documentation churn between `make docs` invocations and fail the CI diff check in Plan 2.
 
 The signature algorithms table maps the names Go's `x509.SignatureAlgorithm.String()` produces, so `SignatureAlgorithmName` can be implemented as a reverse lookup on `a.String()` and the two directions cannot drift: `SHA256-RSA`, `SHA384-RSA`, `SHA512-RSA`, `SHA256-RSAPSS`, `SHA384-RSAPSS`, `SHA512-RSAPSS`, `ECDSA-SHA256`, `ECDSA-SHA384`, `ECDSA-SHA512`, `Ed25519`. The value side is the OID of the algorithm identifier (for example `SHA256-RSA` is 1.2.840.113549.1.1.11, `ECDSA-SHA256` is 1.2.840.10045.4.3.2, `Ed25519` is 1.3.101.112). Deliberately omit `MD2-RSA`, `MD5-RSA`, `SHA1-RSA`, `ECDSA-SHA1`, and `DSA-*`: SHA-1 and MD5 signatures are not offered, and Go cannot create DSA certificates.
+
+**RSASSA-PSS is the one genuine many-to-one entry, and it must not be papered over.** RFC 8017 registers exactly one OID for PSS — `1.2.840.113549.1.1.10` — and the hash is a PSS *parameter*, not part of the OID. So all three of `SHA256-RSAPSS`, `SHA384-RSAPSS`, and `SHA512-RSAPSS` map to that same value in `ByName`, and `ByOID` **omits** it, because an OID that cannot determine the hash cannot name one algorithm.
+
+Do not resolve this by appending a synthetic arc such as `1.2.840.113549.1.1.10.256`. No such arc is registered, and `data "pki_oids"` publishes this table to users who will paste values from it into configuration — a fabricated OID there produces a certificate no other implementation can interpret. Do not resolve it by picking one PSS name as the reverse value either; that silently misreports the hash. `TestSignatureAlgorithmTableIsNotBijective` pins both prohibitions, and `TestTablesAreBidirectional` exempts this one group from strict bijection while still requiring that every `ByOID` entry round-trips.
+
+The `signature_algorithms` group's description in the Plan 2 data source must state this asymmetry, so a user reading generated documentation is not surprised that `by_oid` is smaller than `by_name`.
 
 `OIDByName` and `NameByOID` search `dn_attributes`, then `extensions`, then `extended_key_usages`, and skip `key_usages` and `signature_algorithms` — the former has no OIDs and the latter's names would collide conceptually with nothing but add no value to the terse `provider::pki::oid()` path. Return an error naming the input on a miss, for example `unknown OID name "commonNam"`.
 
