@@ -1049,6 +1049,17 @@ func NormalizeSerial(s string) string {
 // all-zero input parses to zero.
 func ParseSerial(s string) (*big.Int, error) {
 	norm := NormalizeSerial(s)
+
+	// big.Int.SetString accepts a leading sign, so SetString("-1", 16)
+	// succeeds and yields -1. A negative serial is invalid under RFC 5280 and
+	// some parsers reject such a certificate outright, so the digits are
+	// checked explicitly first rather than trusting SetString's ok result.
+	for _, c := range norm {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return nil, fmt.Errorf("invalid serial number %q: want a hexadecimal string, optionally prefixed with 0x", s)
+		}
+	}
+
 	n, ok := new(big.Int).SetString(norm, 16)
 	if !ok {
 		return nil, fmt.Errorf("invalid serial number %q: want a hexadecimal string, optionally prefixed with 0x", s)
