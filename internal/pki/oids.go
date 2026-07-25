@@ -116,23 +116,23 @@ var keyUsages = map[string]string{
 // signature algorithms are deliberately omitted: SHA-1 and MD5 signatures
 // are not offered, and Go cannot create DSA certificates.
 //
-// RSASSA-PSS is a real exception to "one name, one registered OID": RFC 8017
-// registers a single id-RSASSA-PSS OID (1.2.840.113549.1.1.10) for all hash
-// sizes — the hash lives in the AlgorithmIdentifier's PSS parameters, not in
-// a distinct OID arc (this matches Go's own internal table in
-// crypto/x509/x509.go, which also uses one shared OID constant for all three
-// RSAPSS SignatureAlgorithm values). Since this table's contract requires
-// every name to map to a distinct value, the three RSAPSS entries below
-// append the hash size as a non-registered, synthetic disambiguating arc;
-// SignatureAlgorithmByName/Name never parse this column, so the synthetic
-// suffix only affects Tables()/the data source, not certificate generation.
+// RSASSA-PSS is a real exception to "one name, one OID": RFC 8017 registers a
+// single id-RSASSA-PSS OID (1.2.840.113549.1.1.10) for all hash sizes — the
+// hash lives in the AlgorithmIdentifier's PSS parameters, not in a distinct
+// OID arc (this matches Go's own internal table in crypto/x509/x509.go,
+// which also uses one shared OID constant for all three RSAPSS
+// SignatureAlgorithm values). So all three RSAPSS entries below map to that
+// same real OID; this table is therefore the one group that is not a strict
+// bijection, and Tables() below omits the shared OID from ByOID rather than
+// picking one PSS name to answer for it or fabricating a sub-arc that no
+// implementation would recognize. See TestSignatureAlgorithmTableIsNotBijective.
 var signatureAlgorithms = map[string]string{
 	"SHA256-RSA":    "1.2.840.113549.1.1.11",
 	"SHA384-RSA":    "1.2.840.113549.1.1.12",
 	"SHA512-RSA":    "1.2.840.113549.1.1.13",
-	"SHA256-RSAPSS": "1.2.840.113549.1.1.10.256",
-	"SHA384-RSAPSS": "1.2.840.113549.1.1.10.384",
-	"SHA512-RSAPSS": "1.2.840.113549.1.1.10.512",
+	"SHA256-RSAPSS": "1.2.840.113549.1.1.10",
+	"SHA384-RSAPSS": "1.2.840.113549.1.1.10",
+	"SHA512-RSAPSS": "1.2.840.113549.1.1.10",
 	"ECDSA-SHA256":  "1.2.840.10045.4.3.2",
 	"ECDSA-SHA384":  "1.2.840.10045.4.3.3",
 	"ECDSA-SHA512":  "1.2.840.10045.4.3.4",
@@ -165,9 +165,21 @@ func copyMap(m map[string]string) map[string]string {
 	return r
 }
 
+// invert builds the reverse of m, value->key. A value claimed by more than
+// one key (currently only the shared RSASSA-PSS OID in signatureAlgorithms)
+// is omitted rather than resolved by picking a winner: a value that does not
+// determine a single key cannot answer a reverse lookup, so silently
+// choosing one name would misreport the others.
 func invert(m map[string]string) map[string]string {
+	counts := make(map[string]int, len(m))
+	for _, v := range m {
+		counts[v]++
+	}
 	r := make(map[string]string, len(m))
 	for k, v := range m {
+		if counts[v] > 1 {
+			continue
+		}
 		r[v] = k
 	}
 	return r
