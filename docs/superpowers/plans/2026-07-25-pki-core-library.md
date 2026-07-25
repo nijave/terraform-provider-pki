@@ -1458,9 +1458,20 @@ Expected: PASS, including every subcase of the three-algorithm loops.
 
 - [ ] **Step 5: Cross-validate against `openssl`**
 
-The unit tests prove Go can read what Go wrote. This step proves an outside consumer can too. Add a test that shells out to `openssl pkey -check`, using the `requireOpenSSL` helper Task 6 introduces — write it now and let it fail to compile until Task 6 lands, or add the six-line helper here and delete the duplicate later. The helper:
+The unit tests prove Go can read what Go wrote. This step proves an outside consumer can too. Add a test that shells out to `openssl pkey -check`.
+
+Create `internal/pki/testhelper_test.go` in this task with the shared `requireOpenSSL` helper; Tasks 6, 9, 10, 11, and 12 extend the same file with their own fixtures:
 
 ```go
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package pki
+
+import (
+	"os/exec"
+	"testing"
+)
+
 // requireOpenSSL returns the path to the openssl binary, skipping the test when
 // it is not installed. Cross-validation against a real parser is valuable but
 // must never be the reason a contributor's test run fails.
@@ -1510,7 +1521,7 @@ func TestEmittedKeysAreReadableByOpenSSL(t *testing.T) {
 - [ ] **Step 6: Commit**
 
 ```bash
-git add internal/pki/key.go internal/pki/key_test.go go.mod go.sum
+git add internal/pki/key.go internal/pki/key_test.go internal/pki/testhelper_test.go go.mod go.sum
 git commit -m "feat: key generation, parsing, and encoding for RSA, ECDSA, Ed25519"
 ```
 
@@ -1523,6 +1534,7 @@ The highest-risk file in the package. DN attribute order and ASN.1 string type a
 **Files:**
 - Create: `internal/pki/subject.go`
 - Test: `internal/pki/subject_test.go`
+- Modify: `internal/pki/testhelper_test.go` (add the `mustDNOID` fixture; Task 5 created the file)
 
 **Interfaces:**
 - Consumes: `ParseOID`, `FormatOID`, `DNAttributeOID` (Task 2).
@@ -1964,7 +1976,7 @@ func TestSubjectString(t *testing.T) {
 }
 ```
 
-Add this helper to `internal/pki/testhelper_test.go` (create the file in this task; Task 9 and later tasks extend it):
+Add this helper to `internal/pki/testhelper_test.go`, which Task 5 created (its import block gains `encoding/asn1`):
 
 ```go
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -2178,41 +2190,7 @@ go test ./internal/pki/
 
 Expected: PASS. If `TestEncodeDERDefaultsToUTF8String` fails, the `asn1.RawValue` is not being used and `asn1.Marshal` has fallen back to its own string-type selection — that is the bug this whole design decision exists to prevent, so fix it rather than relaxing the test.
 
-- [ ] **Step 7: Cross-validate the DN against `openssl`**
-
-Byte-level assertions can pass while producing a DN no other tool renders correctly. Confirm with a real parser. Add this test, which skips cleanly where `openssl` is absent:
-
-```go
-func TestSubjectDERIsReadableByOpenSSL(t *testing.T) {
-	t.Parallel()
-	openssl := requireOpenSSL(t)
-
-	// A self-signed certificate is the smallest container openssl will parse a
-	// DN out of. Task 9 provides CreateCertificate; until then, skip.
-	t.Skip("enabled in Task 9, once CreateCertificate exists")
-	_ = openssl
-}
-```
-
-Also add the `requireOpenSSL` helper to `internal/pki/testhelper_test.go`:
-
-```go
-// requireOpenSSL returns the path to the openssl binary, skipping the test when
-// it is not installed. Cross-validation against a real parser is valuable but
-// must never be the reason a contributor's test run fails.
-func requireOpenSSL(t *testing.T) string {
-	t.Helper()
-	path, err := exec.LookPath("openssl")
-	if err != nil {
-		t.Skip("openssl not found in PATH; skipping cross-validation")
-	}
-	return path
-}
-```
-
-The skip is temporary and Task 9 Step 6 replaces the body. Leaving the shell in place now keeps the helper's first use in the same commit as the helper itself.
-
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add internal/pki/subject.go internal/pki/subject_test.go internal/pki/testhelper_test.go
@@ -3616,9 +3594,9 @@ go test ./internal/pki/ -v
 
 Expected: PASS.
 
-- [ ] **Step 6: Fill in the openssl cross-validation left skipped in Task 6**
+- [ ] **Step 6: Cross-validate the DN against `openssl`**
 
-Replace `TestSubjectDERIsReadableByOpenSSL` in `subject_test.go` with a real body now that certificates can be created:
+Task 6 could not do this: rendering a DN through an outside parser needs a certificate to put it in, and `CreateCertificate` did not exist yet. Add it now, to `subject_test.go` alongside the rest of the DN tests:
 
 ```go
 // TestSubjectDERIsReadableByOpenSSL confirms an outside parser renders the DN

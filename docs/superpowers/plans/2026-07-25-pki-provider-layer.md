@@ -2494,7 +2494,12 @@ func TestAccDataSourceCertificateRejectsBadInput(t *testing.T) {
 }
 ```
 
-The two tests referencing `pki_certificate_authority` and `pki_certificate` cannot pass until Tasks 8 and 9. Write them now — they are the specification of what those tasks must produce — and expect them red until then. Note that in the commit message for this task so a red test run is not mistaken for a regression.
+**Write only the tests this task can make pass.** Of the four above, `TestAccDataSourceCertificateRejectsBadInput` needs nothing beyond the data source, so it lands here. The other three exercise `pki_certificate_authority` and `pki_certificate`, which do not exist yet — so they do **not** land here. Instead:
+
+- `TestAccDataSourceCertificate` and `TestAccDataSourceCertificateAcceptsBase64` move to Task 8, which introduces `pki_certificate_authority` and the `testAccCAConfig` fragment they depend on. Task 8's Step 1 adds them to `data_source_certificate_test.go`.
+- `TestAccDataSourceCertificateExtensionsAndSAN` moves to Task 9, which introduces `pki_certificate`.
+
+The `testAccCAConfig` constant above moves with them: define it in Task 8's `resource_certificate_authority_test.go`, not here. This task's test file therefore contains one test and no references to resources that do not exist, so the suite is green at every commit.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -2568,22 +2573,20 @@ output "ca_expires" {
 }
 ```
 
-- [ ] **Step 5: Verify what can pass now**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 ```bash
-make testacc TESTARGS='-run "TestAccDataSourceCertificateRejectsBadInput"'
+make testacc TESTARGS='-run TestAccDataSourceCertificate'
+go test ./internal/... -count=1
 ```
 
-Expected: PASS. The other three tests in the file stay red until Tasks 8 and 9 land.
+Expected: PASS. The whole suite is green — the resource-dependent assertions were deferred to Tasks 8 and 9 rather than landing red here.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add internal/provider/data_source_certificate.go internal/provider/data_source_certificate_test.go internal/provider/provider.go examples/data-sources/pki_certificate/
-git commit -m "feat: pki_certificate data source
-
-Three of its acceptance tests depend on pki_certificate_authority and
-pki_certificate and stay red until those resources land."
+git commit -m "feat: pki_certificate data source"
 ```
 
 ---
@@ -2595,8 +2598,16 @@ Self-signs a root with no parent; issues an intermediate with one. This collapse
 **Files:**
 - Create: `internal/provider/resource_certificate_authority.go`
 - Test: `internal/provider/resource_certificate_authority_test.go`
+- Test: `internal/provider/data_source_certificate_test.go` (add the two tests deferred from Task 7, below)
 - Modify: `internal/provider/provider.go`
 - Create: `examples/resources/pki_certificate_authority/resource.tf`, `examples/resources/pki_certificate_authority/import.sh`
+
+**Deferred from Task 7.** Task 7 built the `pki_certificate` data source but could only test its input validation, because there was no certificate resource to decode. Two of its tests belong here, now that there is one. Add both to `internal/provider/data_source_certificate_test.go` in Step 1, taking their bodies from Task 7's Step 1 verbatim:
+
+- `TestAccDataSourceCertificate` — decodes `pki_certificate_authority.root.certificate_pem` and asserts on subject, `is_ca`, `signature_algorithm`, serial, `not_after`, `subject_key_id`, and `fingerprint_sha256`.
+- `TestAccDataSourceCertificateAcceptsBase64` — the same via `content_base64`, which is the shape a Kubernetes Secret delivers.
+
+Both depend on the `testAccCAConfig` constant, which this task defines (see Step 1).
 
 **Interfaces:**
 - Consumes: `pki.CreateCertificate`, `pki.CertTemplate`, `pki.ParseCertificatePEM`, `pki.ParseCertificateChainPEM`, `pki.EncodeCertificatePEM`, `pki.RandomSerial`, `pki.ParseSerial`, `pki.FormatSerial`, `pki.ParseDuration`, `pki.CompareValidity`, `pki.DefaultCAKeyUsage` (Plan 1); Task 4's blocks; Task 7's helpers; Task 5's `resolveImportID`.
@@ -3035,6 +3046,7 @@ Issues a leaf signed by a CA. The CA is supplied as bare PEM, so the Bitwarden-d
 **Files:**
 - Create: `internal/provider/resource_certificate.go`
 - Test: `internal/provider/resource_certificate_test.go`
+- Test: `internal/provider/data_source_certificate_test.go` (add `TestAccDataSourceCertificateExtensionsAndSAN`, deferred from Task 7 — take its body verbatim from Task 7's Step 1; it asserts on the SAN's three types, `key_usage`, `extended_key_usage`, `basic_constraints`, and `is_ca` of a decoded leaf)
 - Modify: `internal/provider/provider.go`
 - Create: `examples/resources/pki_certificate/resource.tf`, `examples/resources/pki_certificate/import.sh`
 
@@ -3590,7 +3602,7 @@ terraform import 'pki_certificate.device["nick-ipad"]' 'file:///tmp/nick-ipad.cr
 make testacc TESTARGS='-run "TestAccCertificate|TestAccDataSourceCertificate"'
 ```
 
-Expected: PASS, including `TestAccDataSourceCertificateExtensionsAndSAN`, which has been red since Task 7.
+Expected: PASS, including `TestAccDataSourceCertificateExtensionsAndSAN`, which this task adds to `data_source_certificate_test.go` (deferred there from Task 7, which had no `pki_certificate` to exercise).
 
 - [ ] **Step 6: Commit**
 
