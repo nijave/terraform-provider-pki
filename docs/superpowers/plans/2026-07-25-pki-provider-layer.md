@@ -820,7 +820,9 @@ Note the import is `datasource/schema`, not `resource/schema`. The five groups a
 - `extensions` — "Certificate extension types, such as `subjectAltName` and `basicConstraints`."
 - `extended_key_usages` — "Extended key usage purposes, such as `clientAuth`."
 - `key_usages` — "Key usage names mapped to their **RFC 5280 bit position**, not to an OID: key usages are bits in a `BIT STRING` and have no object identifiers. `by_oid` is therefore keyed by that same decimal bit position."
-- `signature_algorithms` — "Signature algorithm names, spelled as Go's `crypto/x509` spells them, mapped to their algorithm OIDs."
+- `signature_algorithms` — "Signature algorithm names, spelled as Go's `crypto/x509` spells them, mapped to their algorithm OIDs. **`by_oid` is smaller than `by_name`:** RFC 8017 registers a single OID for RSASSA-PSS (`1.2.840.113549.1.1.10`) across all hash sizes, because the hash is a PSS parameter rather than part of the OID. All three of `SHA256-RSAPSS`, `SHA384-RSAPSS`, and `SHA512-RSAPSS` therefore share that value in `by_name`, and `by_oid` omits it, because that OID alone cannot say which hash is in use."
+
+The bolded asymmetry is not optional wording. `signature_algorithms` is the one group in the table that is not a bijection, a user comparing `length(by_name)` against `length(by_oid)` will notice, and the alternative — inventing a sub-arc per hash size — was tried during Plan 1 Task 2 and rejected precisely because this data source publishes these strings to users who paste them into configuration. A test in Plan 1 (`TestSignatureAlgorithmTableIsNotBijective`) now forbids it.
 
 The `key_usages` description carries the design decision so a user reading generated docs is not surprised; that wording is the resolution of the gap spec §11 left open.
 
