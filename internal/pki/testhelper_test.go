@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -112,6 +113,53 @@ func opensslCRLText(t *testing.T, crlPEM []byte) string {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("openssl crl -text failed: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+// testLeaf issues a leaf certificate under a fresh CA and returns the leaf, the
+// leaf's key, and the CA certificate.
+func testLeaf(t *testing.T) (*x509.Certificate, crypto.Signer, *x509.Certificate) {
+	t.Helper()
+	ca, caKey := testCA(t, nil, nil, "homelab-ca")
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	serial, err := RandomSerial()
+	if err != nil {
+		t.Fatalf("RandomSerial: %v", err)
+	}
+	certPEM, err := CreateCertificate(CertTemplate{
+		Subject:          NamedSubject{CommonName: "nick-ipad.ha.apps.somemissing.info"}.Expand(),
+		SAN:              SAN{DNSNames: []string{"nick-ipad.ha.apps.somemissing.info"}, EmailAddresses: []string{"nick@venenga.com"}},
+		Serial:           serial,
+		NotBefore:        time.Now().Add(-time.Hour),
+		NotAfter:         time.Now().Add(24 * time.Hour),
+		BasicConstraints: &BasicConstraints{CA: false, Critical: true},
+		KeyUsage:         DefaultLeafKeyUsagePtr(),
+		ExtKeyUsage:      &ExtKeyUsage{Usages: []string{"clientAuth"}},
+	}, PublicKeyOf(key), ca, caKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	leaf, err := ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatePEM: %v", err)
+	}
+	return leaf, key, ca
+}
+
+// opensslRun pipes input to openssl with the given arguments and returns
+// combined output, failing the test if openssl exits non-zero.
+func opensslRun(t *testing.T, input []byte, args ...string) string {
+	t.Helper()
+	bin := requireOpenSSL(t)
+	cmd := exec.Command(bin, args...)
+	cmd.Stdin = bytes.NewReader(input)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("openssl %s failed: %v\n%s", strings.Join(args, " "), err, out)
 	}
 	return string(out)
 }
