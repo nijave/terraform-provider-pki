@@ -3686,6 +3686,11 @@ func testCA(t *testing.T, parent *x509.Certificate, parentKey crypto.Signer, cn 
 }
 
 // mustOID parses a dotted OID or fails the test.
+//
+// NOTE: Task 8 already added this helper to testhelper_test.go, because its
+// wrong-OID test needs it. Do not add it again -- a second declaration in the
+// same package will not compile. Check the file first; if it is present, use
+// it as is.
 func mustOID(t *testing.T, s string) asn1.ObjectIdentifier {
 	t.Helper()
 	oid, err := ParseOID(s)
