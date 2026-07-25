@@ -3695,7 +3695,16 @@ Reject a duplicate OID across the whole list — an `extra_extension` block whos
 // favor of the wrong copy.
 ```
 
-Set `SerialNumber`, `RawSubject`, `NotBefore`, `NotAfter`, `SignatureAlgorithm`, `ExtraExtensions`, and `SubjectKeyId`. `SubjectKeyId` must be set from the same computation `SubjectKeyIDExtension` uses, because Go skips its own SKI synthesis when `ExtraExtensions` already contains OID 2.5.29.14 but still needs the field populated for the AKI it writes into children.
+Set `SerialNumber`, `RawSubject`, `NotBefore`, `NotAfter`, `SignatureAlgorithm`, `ExtraExtensions`, and `SubjectKeyId`.
+
+**`SubjectKeyId` must always be set explicitly, from the same computation `SubjectKeyIDExtension` uses. Leaving it empty is a correctness bug, not a stylistic choice.** Two independent reasons, and the second is the dangerous one:
+
+- Go skips its own SKI synthesis when `ExtraExtensions` already contains OID 2.5.29.14, but it still reads the `SubjectKeyId` field to build the `authorityKeyIdentifier` it writes into children. An empty field yields children with no AKI.
+- **Go's automatic SKI is not RFC 5280's algorithm.** Since Go 1.22, `x509.CreateCertificate` fills an empty `SubjectKeyId` on a CA using RFC 7093 method 1 — SHA-256 truncated to 160 bits — and only falls back to RFC 5280's SHA-1 under `GODEBUG=x509sha256skid=0`. Both are 20 bytes, so the mistake is invisible to a length check. Verified directly on Go 1.25.12 for one ECDSA key: Go's automatic value was `17 5b 2e 7a 33 d6 c4 10 47 a5 38 05 68 98 4b 92 60 a8 60 b1` while RFC 5280's SHA-1 of the same key is `00 3b 02 f3 25 82 61 90 74 1b 54 b8 e0 57 d3 4f a2 a4 b7 99`.
+
+  The consequence is exactly the failure this whole design exists to prevent. The certificates being adopted carry SHA-1 SKIs, because `openssl`'s `subjectKeyIdentifier = hash` computes RFC 5280 method 1. If issuance produced RFC 7093 values instead, every adopted certificate would differ from its reissued form in the SKI alone, Task 14 would report drift on every plan, and the drift would never converge no matter how many times it was applied. Task 15's golden comparison against real `openssl` output is what would catch it, one task too late to be cheap.
+
+This finding came from Task 8's implementer, which confirmed it by re-running under `GODEBUG=x509sha256skid=0`.
 
 Self-signing: when `parent` is nil, Go requires the template itself as the parent, so pass a locally-built `x509.Certificate` that carries `RawSubject` and `SubjectKeyId`. Building it explicitly rather than reusing the template variable makes the intent legible and avoids Go's `RawSubject`-as-issuer path silently picking up a stale field.
 
