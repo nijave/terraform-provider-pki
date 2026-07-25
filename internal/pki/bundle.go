@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
+	keystore "github.com/pavlo-v-chernykh/keystore-go/v4"
 	"github.com/smallstep/pkcs7"
 	pkcs12 "software.sslmate.com/src/go-pkcs12"
 )
@@ -349,7 +351,108 @@ func trustStoreAliases(friendlyName string, certs []*x509.Certificate) []string 
 	return aliases
 }
 
-// encodeJKS is implemented in Task 13.
+// encodeJKS builds a Java keystore (JKS).
+//
+// Two properties of keystore-go make this less mechanical than it looks. It
+// does not validate the private key encoding, so handing it a SEC1 blob
+// produces a file that Store() accepts and Java rejects -- the key must be
+// PKCS#8 DER, which is why this function calls EncodePrivateKeyPKCS8DER rather
+// than any of key.go's PEM encoders. And every Certificate.Type here must be
+// the literal string "X509": that is what keystore-go's own decoder writes,
+// and "X.509" produces an entry Java does not recognize.
+//
+// keystore-go's default minimum password length is zero, so a two-character
+// store password would be accepted silently; JKS's own floor is six, which
+// this function enforces itself with a clear error, in addition to passing
+// WithMinPasswordLen(6) to the store.
 func encodeJKS(in BundleInput) ([]byte, error) {
-	return nil, fmt.Errorf("jks bundle encoding is not yet implemented")
+	if len(in.Password) < 6 {
+		return nil, fmt.Errorf("jks bundle requires a password of at least 6 characters")
+	}
+
+	// creationTime is a fixed value derived from the input, never time.Now():
+	// a wall-clock timestamp in the file would make every apply produce
+	// different bytes and churn the Kubernetes Secret it lands in.
+	var creationTime time.Time
+	switch {
+	case in.Certificate != nil:
+		creationTime = in.Certificate.NotBefore
+	case len(in.Chain) > 0:
+		creationTime = in.Chain[0].NotBefore
+	default:
+		// Unreachable via EncodeBundle's own nothing-to-encode check, since that
+		// leaves only in.PrivateKey set, and the private-key branch below already
+		// requires a certificate. Guarded anyway so this function stays correct
+		// if that invariant ever changes.
+		return nil, fmt.Errorf("jks bundle requires a certificate or a chain entry")
+	}
+
+	// WithOrderedAliases makes Aliases() -- and therefore Store()'s entry
+	// order -- deterministic for a given input, for the same reason as
+	// creationTime above.
+	ks := keystore.New(keystore.WithOrderedAliases(), keystore.WithMinPasswordLen(6))
+
+	if in.PrivateKey != nil {
+		if in.Certificate == nil {
+			return nil, fmt.Errorf("jks bundle with a private key requires a certificate: a keystore entry pairs the key with one specific certificate")
+		}
+		if !PublicKeysEqual(PublicKeyOf(in.PrivateKey), in.Certificate.PublicKey) {
+			return nil, fmt.Errorf("jks bundle private key does not match the certificate's public key")
+		}
+		keyDER, err := EncodePrivateKeyPKCS8DER(in.PrivateKey)
+		if err != nil {
+			return nil, fmt.Errorf("encoding private key: %w", err)
+		}
+
+		chain := make([]keystore.Certificate, 0, 1+len(in.Chain))
+		chain = append(chain, keystore.Certificate{Type: "X509", Content: in.Certificate.Raw})
+		for _, c := range in.Chain {
+			chain = append(chain, keystore.Certificate{Type: "X509", Content: c.Raw})
+		}
+
+		alias := in.FriendlyName
+		if alias == "" {
+			alias = in.Certificate.Subject.CommonName
+		}
+		if alias == "" {
+			alias = "key"
+		}
+
+		if err := ks.SetPrivateKeyEntry(alias, keystore.PrivateKeyEntry{
+			CreationTime:     creationTime,
+			PrivateKey:       keyDER,
+			CertificateChain: chain,
+		}, []byte(in.Password)); err != nil {
+			return nil, fmt.Errorf("adding jks private key entry: %w", err)
+		}
+	} else {
+		// Trust anchors only. Aliases are derived by trustStoreAliases, shared
+		// with the pkcs12 truststore path above -- not re-derived here. The
+		// consequence of a collision is strictly worse in jks than in pkcs12:
+		// keystore-go lowercases aliases and a duplicate silently overwrites the
+		// previous entry rather than merging with it, so a colliding alias means
+		// this keystore holds fewer trust anchors than the configuration asked
+		// for, with no error anywhere.
+		certs := make([]*x509.Certificate, 0, 1+len(in.Chain))
+		if in.Certificate != nil {
+			certs = append(certs, in.Certificate)
+		}
+		certs = append(certs, in.Chain...)
+
+		aliases := trustStoreAliases(in.FriendlyName, certs)
+		for i, cert := range certs {
+			if err := ks.SetTrustedCertificateEntry(aliases[i], keystore.TrustedCertificateEntry{
+				CreationTime: creationTime,
+				Certificate:  keystore.Certificate{Type: "X509", Content: cert.Raw},
+			}); err != nil {
+				return nil, fmt.Errorf("adding jks trusted certificate entry %q: %w", aliases[i], err)
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := ks.Store(&buf, []byte(in.Password)); err != nil {
+		return nil, fmt.Errorf("writing jks bundle: %w", err)
+	}
+	return buf.Bytes(), nil
 }

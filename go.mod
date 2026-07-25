@@ -8,4 +8,7 @@ require (
 	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
 
-require github.com/pavlo-v-chernykh/keystore-go/v4 v4.5.0 // indirect
+require (
+	github.com/pavlo-v-chernykh/keystore-go/v4 v4.5.0
+	golang.org/x/sys v0.47.0 // indirect
+)
