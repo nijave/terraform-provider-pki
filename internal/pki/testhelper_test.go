@@ -3,9 +3,13 @@
 package pki
 
 import (
+	"bytes"
+	"crypto"
+	"crypto/x509"
 	"encoding/asn1"
 	"os/exec"
 	"testing"
+	"time"
 )
 
 // mustDNOID looks up a DN attribute OID or fails the test. It exists so table
@@ -39,4 +43,62 @@ func requireOpenSSL(t *testing.T) string {
 		t.Skip("openssl not found in PATH; skipping cross-validation")
 	}
 	return path
+}
+
+// testCA issues a CA certificate and returns it with its key. With a nil parent
+// it self-signs a root; otherwise it issues an intermediate under the parent.
+// The key is ECDSA P-256 because these fixtures are created in almost every
+// test and RSA generation dominates the suite's runtime otherwise.
+func testCA(t *testing.T, parent *x509.Certificate, parentKey crypto.Signer, cn string) (*x509.Certificate, crypto.Signer) {
+	t.Helper()
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	signerKey := key
+	if parentKey != nil {
+		signerKey = parentKey
+	}
+	serial, err := RandomSerial()
+	if err != nil {
+		t.Fatalf("RandomSerial: %v", err)
+	}
+	certPEM, err := CreateCertificate(CertTemplate{
+		Subject:          NamedSubject{CommonName: cn, Organization: "homelab"}.Expand(),
+		Serial:           serial,
+		NotBefore:        time.Now().Add(-time.Hour),
+		NotAfter:         time.Now().Add(24 * time.Hour),
+		BasicConstraints: &BasicConstraints{CA: true, Critical: true},
+		KeyUsage:         DefaultCAKeyUsagePtr(),
+	}, PublicKeyOf(key), parent, signerKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate(%s): %v", cn, err)
+	}
+	cert, err := ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatePEM(%s): %v", cn, err)
+	}
+	return cert, key
+}
+
+// opensslText runs `openssl x509 -text -noout` over a PEM certificate and
+// returns its output, so tests can assert that a real parser agrees with what
+// this package produced.
+//
+// -nameopt oneline is passed explicitly rather than relying on the default,
+// because the default is not stable across builds: OpenSSL 3.5.7 renders a DN as
+// "CN=homelab, UID=nick" while oneline renders it as "CN = homelab, UID = nick",
+// and a test that hardcodes either form without pinning the flag fails on the
+// other. oneline is the spaced form, which is what openssl documents as its
+// name-printing default and what the assertions here are written against.
+func opensslText(t *testing.T, certPEM []byte) string {
+	t.Helper()
+	bin := requireOpenSSL(t)
+	cmd := exec.Command(bin, "x509", "-noout", "-text", "-nameopt", "oneline")
+	cmd.Stdin = bytes.NewReader(certPEM)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("openssl x509 -text failed: %v\n%s", err, out)
+	}
+	return string(out)
 }

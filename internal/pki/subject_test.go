@@ -6,7 +6,10 @@ import (
 	"bytes"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"math/big"
+	"strings"
 	"testing"
+	"time"
 )
 
 func attr(t *testing.T, name, value string) Attribute {
@@ -533,4 +536,69 @@ func TestSubjectString(t *testing.T) {
 	if (Subject{}).String() != "" {
 		t.Fatalf("String() on an empty subject = %q, want \"\"", (Subject{}).String())
 	}
+}
+
+// TestSubjectDERIsReadableByOpenSSL confirms an outside parser renders the DN
+// the way this package intends, including the attributes openssl has no short
+// name for. Byte-level assertions can pass while producing a DN nothing else
+// reads correctly.
+func TestSubjectDERIsReadableByOpenSSL(t *testing.T) {
+	t.Parallel()
+	requireOpenSSL(t)
+
+	display, err := DNAttributeOID("displayName")
+	if err != nil {
+		t.Fatalf("DNAttributeOID: %v", err)
+	}
+	subject := Subject{Attributes: []Attribute{
+		attr(t, "commonName", "nick-ipad.ha.apps.somemissing.info"),
+		attr(t, "uid", "nick"),
+		{OID: display, Value: "Nick V"},
+		attr(t, "givenName", "Nick"),
+		attr(t, "surname", "Venenga"),
+		attr(t, "organization", "homelab"),
+		attr(t, "organizationalUnit", "infra"),
+		attr(t, "organizationalUnit", "clients"),
+	}}
+
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	certPEM, err := CreateCertificate(CertTemplate{
+		Subject:   subject,
+		Serial:    big.NewInt(1),
+		NotBefore: time.Now().Add(-time.Hour),
+		NotAfter:  time.Now().Add(time.Hour),
+	}, PublicKeyOf(key), nil, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+
+	text := opensslText(t, certPEM)
+	for _, want := range []string{
+		"CN = nick-ipad.ha.apps.somemissing.info",
+		"UID = nick",
+		"2.16.840.1.113730.3.1.241 = Nick V",
+		"GN = Nick",
+		"SN = Venenga",
+		"O = homelab",
+		"OU = infra",
+		"OU = clients",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("openssl output does not contain %q; full Subject line:\n%s", want, subjectLine(text))
+		}
+	}
+}
+
+// subjectLine extracts the Subject: line from openssl x509 -text output, for
+// readable failure messages.
+func subjectLine(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, "Subject:") {
+			return strings.TrimSpace(line)
+		}
+	}
+	return "(no Subject line found)"
 }
