@@ -51,8 +51,18 @@ certificate.
 ## 3. Stack and repository layout
 
 Go with `terraform-plugin-framework`. SDKv2 is not an option: write-only
-attributes and provider-defined functions are framework-only. Terraform and
-OpenTofu ≥ 1.11 (OpenTofu 1.11 is already pinned in `tofu/main.tf:3`).
+attributes and provider-defined functions are framework-only.
+
+**OpenTofu is the primary target.** OpenTofu ≥ 1.11 is required and is what CI
+tests against; `tofu/main.tf:3` already pins that floor and the reconciler image
+runs 1.12. OpenTofu 1.11 supports write-only attributes, which `password_wo`
+depends on. The provider speaks plugin protocol 6 and works with Terraform
+≥ 1.11 too, but Terraform is not tested and not the reference implementation.
+
+There is no OpenTofu fork of `terraform-plugin-framework` or `tfplugindocs`, and
+none is needed — OpenTofu implements the same plugin protocol and consumes the
+same `docs/` layout. Those remain HashiCorp/IBM-published MPL-2.0 libraries; see
+§13 for why that is license-compatible.
 
 ```
 terraform-provider-pki/
@@ -559,16 +569,107 @@ provider::pki::oid_name("2.5.4.4")           # -> "surname"
 Both error on unknown input rather than returning empty, so a typo fails at plan
 time.
 
-## 12. Release
+## 12. Release and CI
 
-`goreleaser` producing multi-platform binaries with GPG-signed checksums,
-`tfplugindocs` for registry documentation, and GitHub Actions for test and
-release — mirroring the layout already present in
-`go/src/github.com/nijave/terraform-provider-mimirtool`. Whether this publishes
-to the public registry or is consumed via a filesystem mirror in the cluster is
-a packaging decision deferred to the migration spec.
+Modeled on `github.com/nijave/terraform-provider-cortextool`, with deliberate
+deviations noted below.
 
-## 13. Follow-ups
+### `.goreleaser.yml`
+
+goreleaser v2 config, matching cortextool's: `CGO_ENABLED=0`, `-trimpath`,
+`mod_timestamp` pinned to the commit timestamp, ldflags injecting
+`main.version` and `main.commit`, `goos` of freebsd/windows/linux/darwin ×
+`goarch` of amd64/arm64, zip archives, a `_SHA256SUMS` checksum file, GPG
+detached signature over the checksums via `--batch --local-user
+{{ .Env.GPG_FINGERPRINT }}`, `terraform-registry-manifest.json` attached as an
+extra file, `draft: true`, and `changelog.disable: true`.
+
+Two deviations from cortextool:
+
+- **No `windows/arm64` ignore rule.** cortextool excludes it because Prometheus'
+  Windows mmap code fails to compile on ARM. This provider has no such
+  dependency, so windows/arm64 ships.
+- **`terraform-registry-manifest.json` declares `protocol_versions: ["6.0"]`,
+  not `["5.0"]`.** cortextool is SDKv2 and speaks protocol 5;
+  terraform-plugin-framework speaks protocol 6. Getting this wrong makes the
+  published provider fail to load.
+
+### `.github/workflows/release.yml`
+
+Unchanged in shape from cortextool: triggers on `v*` tags, `contents: write`,
+checkout → `git fetch --prune --unshallow` → `actions/setup-go@v5` with
+`go-version-file: go.mod` → `crazy-max/ghaction-import-gpg@v6` reading
+`secrets.GPG_PRIVATE_KEY` and `secrets.PASSPHRASE` → `goreleaser-action@v6` with
+`args: release --clean`, passing `GPG_FINGERPRINT` and `GITHUB_TOKEN`.
+
+### `.github/workflows/test.yml`
+
+Same three-job shape as cortextool — `build`, `generate`, `test` — with
+OpenTofu substituted for Terraform throughout:
+
+- `opentofu/setup-opentofu` replaces `hashicorp/setup-terraform`.
+- The acceptance matrix runs OpenTofu `1.11.*` and `1.12.*` rather than
+  Terraform 1.10–1.14.
+- Acceptance tests set `TF_ACC=1` plus `TF_ACC_TERRAFORM_PATH` pointing at the
+  `tofu` binary. `terraform-plugin-testing` performs no version check against a
+  binary already present at that path, so the harness drives OpenTofu directly
+  and never downloads Terraform.
+- The `generate` job still runs `go generate ./...` and fails on a `git diff`,
+  keeping `tfplugindocs` output committed and current.
+
+Unlike cortextool, there is no upstream SaaS API to drift against, so the
+scheduled-cron trigger stays disabled.
+
+### Distribution
+
+Publish to the **OpenTofu registry**. An in-cluster filesystem mirror remains
+available as a fallback for the homelab and needs no registry presence at all.
+
+## 13. Licensing
+
+**The project is licensed GPLv3.** A `LICENSE` file containing the full GPL-3.0
+text goes in the repository root, with `SPDX-License-Identifier: GPL-3.0-or-later`
+headers on source files.
+
+Every dependency must be GPLv3-compatible. Verified for the dependencies this
+design introduces:
+
+| Dependency | License | GPLv3-compatible |
+| --- | --- | --- |
+| `hashicorp/terraform-plugin-framework` | MPL-2.0 | yes |
+| `hashicorp/terraform-plugin-testing` | MPL-2.0 | yes |
+| `hashicorp/terraform-plugin-docs` | MPL-2.0 | yes |
+| `software.sslmate.com/src/go-pkcs12` | BSD-3-Clause | yes |
+| `github.com/smallstep/pkcs7` | MIT | yes |
+| `github.com/pavlo-v-chernykh/keystore-go/v4` | MIT | yes |
+
+The MPL-2.0 entries deserve a note, because a naive `grep` of their `LICENSE`
+files for "Incompatible With Secondary Licenses" produces a **false positive** —
+that phrase appears four times in MPL-2.0's own boilerplate (§1.5's definition,
+§3.3, §10.4, and the Exhibit B template heading) in every copy of the license,
+applied or not. The real test is whether source files carry the Exhibit B
+notice. They do not: HashiCorp/IBM's framework, testing, and docs sources all
+carry a bare `// SPDX-License-Identifier: MPL-2.0`. MPL-2.0 §3.3 therefore
+permits distributing the combined work under a Secondary License, and §1.12
+defines Secondary License to include "any later versions" of GPL-2.0 — which
+covers GPLv3.
+
+Two constraints to enforce going forward:
+
+- **Nothing under BUSL-1.1 may be linked in.** Terraform CLI has been BUSL since
+  1.6. This is not a problem in practice: a provider runs as a separate process
+  speaking gRPC, so it is neither linked to nor a derivative work of the CLI.
+  Targeting OpenTofu (MPL-2.0) as the primary platform removes the question
+  entirely, including at test time.
+- **Apache-2.0 transitive dependencies are acceptable** because the project is
+  GPLv3, not GPLv2 — Apache-2.0 is compatible with the former and not the
+  latter. If the license is ever downgraded to GPLv2, this table must be
+  re-audited.
+
+A CI license-compliance check (`go-licenses` or equivalent) that fails the build
+on a non-compatible transitive dependency should be added to `test.yml`.
+
+## 14. Follow-ups
 
 1. Migration spec: rewrite `homelab-pki` onto the provider, delete `reconcile/`,
    strip cfssl/openssl/python from the Dockerfile, collapse the two-phase apply.
@@ -577,4 +678,6 @@ a packaging decision deferred to the migration spec.
    it should work on iOS 18+/Android 14+, but the iOS Configuration Profile
    install path may use a different parser than `SecPKCS12Import` and the
    evidence there is thin. This is a device test, not a research question.
-3. Decide provider distribution (public registry vs in-cluster mirror).
+3. Add a `go-licenses` compliance gate to `test.yml` once the dependency set is
+   final, so a GPL-incompatible transitive dependency fails CI rather than
+   shipping.
