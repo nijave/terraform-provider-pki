@@ -4844,11 +4844,22 @@ func TestEncodePKCS12ModernAndLegacyDifferInBothAxes(t *testing.T) {
 	modernText := strings.ToLower(opensslRun(t, modern, "pkcs12", "-info", "-nokeys", "-nocerts", "-passin", "pass:"+testPassword))
 	legacyText := strings.ToLower(opensslRun(t, legacy, "pkcs12", "-info", "-nokeys", "-nocerts", "-passin", "pass:"+testPassword))
 
-	if strings.Contains(modernText, "sha1") && !strings.Contains(modernText, "sha256") {
+	// Pin the MAC line on each side, positively. An earlier draft used the
+	// conjunction `Contains(modernText, "sha1") && !Contains(modernText,
+	// "sha256")`, which can never fire: modern always contains "sha256" via
+	// its PRF line, so the second clause is always false. Matching "mac: "
+	// specifically is what distinguishes the MAC from the PRF.
+	if !strings.Contains(modernText, "mac: sha256") {
+		t.Error("modern did not emit a SHA-256 MAC")
+	}
+	if strings.Contains(modernText, "mac: sha1") {
 		t.Error("modern emitted a SHA-1 MAC; it must be SHA-256")
 	}
-	if !strings.Contains(legacyText, "sha1") {
+	if !strings.Contains(legacyText, "mac: sha1") {
 		t.Error("legacy did not emit a SHA-1 MAC; Android 12 rejects SHA-256 even with 3DES content")
+	}
+	if strings.Contains(legacyText, "mac: sha256") {
+		t.Error("legacy emitted a SHA-256 MAC; only SHA-1 is universally importable")
 	}
 }
 
@@ -4927,10 +4938,21 @@ func TestEncodePKCS12FriendlyName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeBundle: %v", err)
 	}
+	// A keyed PKCS#12 bundle has NO settable alias. go-pkcs12 v0.7.3's
+	// Encoder.Encode writes only localKeyId; oidFriendlyName is emitted solely
+	// by EncodeTrustStoreEntries. keytool therefore shows the alias as "1"
+	// regardless of FriendlyName. Ruled 2026-07-25: accept and document.
+	//
+	// This assertion is deliberately negative and self-expiring: if go-pkcs12
+	// ever honors the name here, it fails and tells you to delete it and
+	// restore a positive assertion.
 	if requireKeytool(t, false) != "" {
-		text := keytoolList(t, out, testPassword)
-		if !strings.Contains(strings.ToLower(text), "nick-ipad") {
-			t.Errorf("keytool -list does not show the alias nick-ipad:\n%s", text)
+		text := strings.ToLower(keytoolList(t, out, testPassword))
+		if strings.Contains(text, "nick-ipad") {
+			t.Errorf("keytool -list now shows the friendly name on a KEYED pkcs12 bundle, "+
+				"which go-pkcs12 v0.7.3 could not do. Upstream has gained support: drop this "+
+				"negative assertion, assert the alias positively instead, and update the "+
+				"friendly_name documentation in spec section 6.6.\n%s", text)
 		}
 	}
 
@@ -5149,14 +5171,18 @@ var pkcs12Encoders = map[PKCS12Encoding]*pkcs12.Encoder{
 
 1. Default `PKCS12Encoding` to `PKCS12Modern` when empty, then look up the encoder and error naming the input on a miss. Do not fall through to a default on an unknown value — a typo must fail, not silently produce `modern`.
 2. Apply `Rand` when set, via `encoder.WithRand(in.Rand)`. Note that `WithRand` has a value receiver returning a new `*Encoder`, so this does not mutate the package-level variable.
-3. Validate the password against the encoding: `PKCS12Passwordless` requires an empty password (go-pkcs12 errors with `pkcs12: password must be empty`, which is accurate but does not tell the user which attribute to change, so pre-empt it with a message naming `pkcs12_encoding` and `password_wo`). The other two encodings require a non-empty password — an empty password with `modern` produces a file whose MAC is keyed on the empty string, which some tools accept and others reject, and no caller wants that ambiguity.
-4. When `PrivateKey` is nil, build a truststore. Use `EncodeTrustStoreEntries` with one `pkcs12.TrustStoreEntry` per certificate rather than `EncodeTrustStore`, because `EncodeTrustStore` derives each friendly name from the certificate's subject and two certificates sharing a subject then collapse into one keytool entry. Name the entries from `FriendlyName` when set — suffixing `-1`, `-2` and so on across multiple certificates — and otherwise from each certificate's `Subject.CommonName`, falling back to the serial when the CN is empty.
-5. When `PrivateKey` is set, require `Certificate` to be non-nil and require the key to match the certificate.
+3. **Reject `passwordless` together with a `PrivateKey`.** The combination encodes an unshrouded key bag that Java's `PKCS12KeyStore` will not load: `openssl pkcs12 -info` shows the key and both certificates, and `pkcs12.DecodeChain` reads it back fine, but `keytool -list` reports **0 entries** — measured. Since `passwordless` exists for Java truststores, silently emitting a bundle the one target consumer reads as empty is the sort of quiet breakage this plan exists to avoid. Error naming `pkcs12_encoding` and `private_key_pem`, and say that an unencrypted key belongs in `format = "pem"` instead.
+
+4. Validate the password against the encoding: `PKCS12Passwordless` requires an empty password (go-pkcs12 errors with `pkcs12: password must be empty`, which is accurate but does not tell the user which attribute to change, so pre-empt it with a message naming `pkcs12_encoding` and `password_wo`). The other two encodings require a non-empty password — an empty password with `modern` produces a file whose MAC is keyed on the empty string, which some tools accept and others reject, and no caller wants that ambiguity.
+5. When `PrivateKey` is nil, build a truststore. Use `EncodeTrustStoreEntries` with one `pkcs12.TrustStoreEntry` per certificate rather than `EncodeTrustStore`, because `EncodeTrustStore` derives each friendly name from the certificate's subject and two certificates sharing a subject then collapse into one keytool entry.
+
+   **De-duplicate the derived aliases case-insensitively.** Java folds PKCS#12 aliases to lowercase, so `Root` and `root` are the same alias and one trust anchor is silently dropped — measured with `keytool -list`, which reported one entry for two distinct self-signed roots. Key the seen-set on `strings.ToLower(candidate)`, not the raw string. A test using two certificates whose CNs differ only in case is required; identical subjects do not cover this. The same applies to Task 13, since `keystore-go` lowercases aliases too, where a collision overwrites rather than merges. Name the entries from `FriendlyName` when set — suffixing `-1`, `-2` and so on across multiple certificates — and otherwise from each certificate's `Subject.CommonName`, falling back to the serial when the CN is empty.
+6. When `PrivateKey` is set, require `Certificate` to be non-nil and require the key to match the certificate.
 
    **This asymmetry with `pkcs7` is deliberate.** A degenerate PKCS#7 is a flat bag of certificates with no designated end entity, so Task 11 correctly allows a chain-only bundle — that is how a trust bundle is distributed. PKCS#12 and JKS are different: a keystore entry pairs one specific certificate with the key, so with a key present the certificate is not optional. Without a key both become truststores, where every certificate is a peer and no leaf is designated. Task 11's reviewer asked whether the two behaviours were consistent; they differ because the formats differ.
 
    The check itself: compare `PublicKeyOf(in.PrivateKey)` against `in.Certificate.PublicKey` with `PublicKeysEqual`. This is the check that catches a crossed-wires HCL reference before a device does.
-6. Call `encoder.Encode(in.PrivateKey, in.Certificate, in.Chain, in.Password)`. go-pkcs12 accepts `crypto.Signer` for all three key types, so no PKCS#8 conversion is needed here — that is only the JKS path.
+7. Call `encoder.Encode(in.PrivateKey, in.Certificate, in.Chain, in.Password)`. go-pkcs12 accepts `crypto.Signer` for all three key types, so no PKCS#8 conversion is needed here — that is only the JKS path.
 
 `PKCS12Encodings()` returns the three constants in declaration order.
 
