@@ -3039,20 +3039,68 @@ func TestSubjectKeyIDExtension(t *testing.T) {
 	}
 }
 
+// TestParsersRejectWrongOID confirms each parser checks the extension's OID.
+//
+// Each case must carry a value that is VALID for that parser's own extension,
+// presented under the wrong OID. Sharing one placeholder value across all four
+// -- an empty SEQUENCE, say -- makes the test near-vacuous: every parser then
+// fails on the malformed value rather than on the OID, so deleting three of the
+// four OID guards leaves the suite green. Verified by doing exactly that.
 func TestParsersRejectWrongOID(t *testing.T) {
 	t.Parallel()
-	wrong := pkix.Extension{Id: asn1.ObjectIdentifier{1, 2, 3, 4}, Value: []byte{0x30, 0x00}}
-	if _, err := ParseBasicConstraints(wrong); err == nil {
-		t.Error("ParseBasicConstraints accepted the wrong OID")
+	const wrongOID = "2.5.29.99"
+
+	// A valid basicConstraints value: SEQUENCE { cA TRUE }.
+	bcValue, err := (BasicConstraints{CA: true, Critical: true}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid basicConstraints value: %v", err)
 	}
-	if _, err := ParseKeyUsage(wrong); err == nil {
-		t.Error("ParseKeyUsage accepted the wrong OID")
+	// A valid keyUsage BIT STRING.
+	kuValue, err := (KeyUsage{Usages: []string{"digitalSignature"}, Critical: true}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid keyUsage value: %v", err)
 	}
-	if _, err := ParseExtKeyUsage(wrong); err == nil {
-		t.Error("ParseExtKeyUsage accepted the wrong OID")
+	// A valid extendedKeyUsage SEQUENCE OF OID.
+	ekuValue, err := (ExtKeyUsage{Usages: []string{"clientAuth"}}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid extendedKeyUsage value: %v", err)
 	}
-	if _, err := ParseNameConstraints(wrong); err == nil {
-		t.Error("ParseNameConstraints accepted the wrong OID")
+	// A valid nameConstraints SEQUENCE with one permitted subtree.
+	ncValue, err := (NameConstraints{PermittedDNSDomains: []string{".example"}, Critical: true}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid nameConstraints value: %v", err)
+	}
+
+	misfiled := func(v pkix.Extension) pkix.Extension {
+		return pkix.Extension{Id: mustOID(t, wrongOID), Critical: v.Critical, Value: v.Value}
+	}
+
+	if _, err := ParseBasicConstraints(misfiled(bcValue)); err == nil {
+		t.Error("ParseBasicConstraints accepted a valid value under the wrong OID")
+	}
+	if _, err := ParseKeyUsage(misfiled(kuValue)); err == nil {
+		t.Error("ParseKeyUsage accepted a valid value under the wrong OID")
+	}
+	if _, err := ParseExtKeyUsage(misfiled(ekuValue)); err == nil {
+		t.Error("ParseExtKeyUsage accepted a valid value under the wrong OID")
+	}
+	if _, err := ParseNameConstraints(misfiled(ncValue)); err == nil {
+		t.Error("ParseNameConstraints accepted a valid value under the wrong OID")
+	}
+
+	// Sanity check the fixtures: each value must parse cleanly under its own
+	// OID, or the assertions above would pass for the wrong reason.
+	if _, err := ParseBasicConstraints(bcValue); err != nil {
+		t.Errorf("the basicConstraints fixture does not parse under its own OID: %v", err)
+	}
+	if _, err := ParseKeyUsage(kuValue); err != nil {
+		t.Errorf("the keyUsage fixture does not parse under its own OID: %v", err)
+	}
+	if _, err := ParseExtKeyUsage(ekuValue); err != nil {
+		t.Errorf("the extendedKeyUsage fixture does not parse under its own OID: %v", err)
+	}
+	if _, err := ParseNameConstraints(ncValue); err != nil {
+		t.Errorf("the nameConstraints fixture does not parse under its own OID: %v", err)
 	}
 }
 ```
@@ -3700,7 +3748,7 @@ Set `SerialNumber`, `RawSubject`, `NotBefore`, `NotAfter`, `SignatureAlgorithm`,
 **`SubjectKeyId` must always be set explicitly, from the same computation `SubjectKeyIDExtension` uses. Leaving it empty is a correctness bug, not a stylistic choice.** Two independent reasons, and the second is the dangerous one:
 
 - Go skips its own SKI synthesis when `ExtraExtensions` already contains OID 2.5.29.14, but it still reads the `SubjectKeyId` field to build the `authorityKeyIdentifier` it writes into children. An empty field yields children with no AKI.
-- **Go's automatic SKI is not RFC 5280's algorithm.** Since Go 1.22, `x509.CreateCertificate` fills an empty `SubjectKeyId` on a CA using RFC 7093 method 1 — SHA-256 truncated to 160 bits — and only falls back to RFC 5280's SHA-1 under `GODEBUG=x509sha256skid=0`. Both are 20 bytes, so the mistake is invisible to a length check. Verified directly on Go 1.25.12 for one ECDSA key: Go's automatic value was `17 5b 2e 7a 33 d6 c4 10 47 a5 38 05 68 98 4b 92 60 a8 60 b1` while RFC 5280's SHA-1 of the same key is `00 3b 02 f3 25 82 61 90 74 1b 54 b8 e0 57 d3 4f a2 a4 b7 99`.
+- **Go's automatic SKI is not RFC 5280's algorithm.** Since **Go 1.25** (`internal/godebugs/table.go` records `{Name: "x509sha256skid", Changed: 25}`), `x509.CreateCertificate` fills an empty `SubjectKeyId` on a CA using RFC 7093 method 1 — SHA-256 truncated to 160 bits — and only falls back to RFC 5280's SHA-1 under `GODEBUG=x509sha256skid=0`. Note that pinning an older toolchain is therefore *not* a workaround worth considering: this plan's floor is Go 1.25, and relying on pre-1.25 behavior would make the output depend on the build toolchain. Both are 20 bytes, so the mistake is invisible to a length check. Verified directly on Go 1.25.12 for one ECDSA key: Go's automatic value was `17 5b 2e 7a 33 d6 c4 10 47 a5 38 05 68 98 4b 92 60 a8 60 b1` while RFC 5280's SHA-1 of the same key is `00 3b 02 f3 25 82 61 90 74 1b 54 b8 e0 57 d3 4f a2 a4 b7 99`.
 
   The consequence is exactly the failure this whole design exists to prevent. The certificates being adopted carry SHA-1 SKIs, because `openssl`'s `subjectKeyIdentifier = hash` computes RFC 5280 method 1. If issuance produced RFC 7093 values instead, every adopted certificate would differ from its reissued form in the SKI alone, Task 14 would report drift on every plan, and the drift would never converge no matter how many times it was applied. Task 15's golden comparison against real `openssl` output is what would catch it, one task too late to be cheap.
 
