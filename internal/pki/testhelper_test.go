@@ -102,3 +102,16 @@ func opensslText(t *testing.T, certPEM []byte) string {
 	}
 	return string(out)
 }
+
+// opensslCRLText runs `openssl crl -text -noout` over a PEM CRL.
+func opensslCRLText(t *testing.T, crlPEM []byte) string {
+	t.Helper()
+	bin := requireOpenSSL(t)
+	cmd := exec.Command(bin, "crl", "-noout", "-text")
+	cmd.Stdin = bytes.NewReader(crlPEM)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("openssl crl -text failed: %v\n%s", err, out)
+	}
+	return string(out)
+}
