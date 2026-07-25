@@ -4919,7 +4919,7 @@ Schema per spec §6.6:
 | `certificate_pem` | Optional, String | |
 | `private_key_pem` | Optional, Sensitive, String | |
 | `chain_pem` | Optional, List of String | ordered, leaf-adjacent first |
-| `friendly_name` | Optional, String | PKCS#12 / JKS alias |
+| `friendly_name` | Optional, String | JKS alias; PKCS#12 alias for a truststore only. **No effect on a keyed PKCS#12 bundle** — `go-pkcs12` cannot set one (spec §6.6). The description must say so, since silently ignoring an attribute is worse than not offering it. |
 | `pkcs12_encoding` | Optional + Computed, String | `OneOf` over `pki.PKCS12Encodings()`; defaults to `modern` |
 | `password_wo` | Optional, **WriteOnly**, Sensitive, String | never persisted |
 | `password_wo_version` | Optional, Int64 | change to force re-encryption |
