@@ -5439,7 +5439,18 @@ func encodeJKS(in BundleInput) ([]byte, error) {
 Steps:
 
 1. Require a non-empty `Password` of at least six characters, the JKS minimum, and construct the store with `keystore.New(keystore.WithOrderedAliases(), keystore.WithMinPasswordLen(6))`. Ordered aliases make the output deterministic for a given input, which keeps a Kubernetes Secret from churning on every apply.
-2. `creationTime` must be a fixed value, not `time.Now()`, for the same determinism reason. Use `in.Certificate.NotBefore` when a certificate is present, and the first chain entry's `NotBefore` otherwise. Say why in a comment: a wall-clock timestamp in the file makes every apply produce different bytes.
+2. `creationTime` must be a fixed value, not `time.Now()`. Use `in.Certificate.NotBefore` when a certificate is present, and the first chain entry's `NotBefore` otherwise. Say why in a comment: a wall-clock timestamp in the file makes every encode produce different bytes for no reason.
+
+   **Scope the determinism claim honestly, and thread `in.Rand`.** Ordered aliases and a fixed `creationTime` remove *gratuitous* nondeterminism, and they make the **truststore** path fully byte-deterministic. They do not make a **keyed** keystore byte-deterministic, and nothing should: `keystore-go`'s Sun key protector draws a fresh random salt per `SetPrivateKeyEntry`, and pinning that salt in production would be a real security defect, not a fix. PKCS#12 has the same property, which is why Task 12 asserts *algorithms* rather than bytes.
+
+   Two consequences. First, pass `keystore.WithCustomRandomNumberGenerator(in.Rand)` when `in.Rand` is non-nil, mirroring what `encodePKCS12` already does with `WithRand` — production leaves `Rand` nil and gets `crypto/rand`, while a test can pin it. Second, assert the property that is actually true and useful:
+
+   - truststore path, no `Rand` set: two encodes of identical input are byte-identical;
+   - keyed path, `Rand` pinned to a deterministic reader: two encodes are byte-identical, which proves nothing *else* in the path is nondeterministic — no stray `time.Now()`, no map-iteration order leaking in.
+
+   Without the second test the earlier draft of this plan asserted determinism it did not have: two encodes of a keyed keystore differed from byte 61 to EOF and no test noticed. Task 13's reviewer found it by comparing two encodes directly.
+
+   This does not churn a Kubernetes Secret, and the reason is worth writing down where someone will find it: the provider encodes a bundle once at create and holds the bytes in state under `UseStateForUnknown`. `Read` never re-encodes — it cannot, since the password is write-only and absent from state. So state stability comes from the resource's plan modifiers, not from the encoder being deterministic.
 3. When `PrivateKey` is set: require `Certificate`, require the key to match it via `PublicKeysEqual`, convert with `EncodePrivateKeyPKCS8DER`, build the `[]keystore.Certificate` chain with `Type: "X509"` and `Content: cert.Raw` for the certificate followed by each chain entry, and call `SetPrivateKeyEntry(alias, entry, []byte(in.Password))`. The alias is `FriendlyName` when set, otherwise the certificate's CN, otherwise `"key"`.
 4. When `PrivateKey` is nil: add one `SetTrustedCertificateEntry` per certificate. **Reuse Task 12's `trustStoreAliases` helper — do not re-derive the aliases here.** It already handles the two hazards, and re-implementing them is how the two paths drift apart.
 
