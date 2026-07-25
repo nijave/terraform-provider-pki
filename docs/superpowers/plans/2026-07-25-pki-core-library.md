@@ -4182,10 +4182,16 @@ func TestCRLIsReadableByOpenSSL(t *testing.T) {
 		t.Fatalf("CreateCRL: %v", err)
 	}
 	text := opensslCRLText(t, crlPEM)
-	for _, want := range []string{"Serial Number: 2001", "Key Compromise", "CRL Number: 3"} {
+	for _, want := range []string{"Serial Number: 2001", "Key Compromise"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("openssl crl output does not contain %q:\n%s", want, text)
 		}
+	}
+	// The CRL number needs a whitespace-tolerant match: openssl 3.5.7 always
+	// prints an extension's name and its value on separate lines, so the
+	// literal "CRL Number: 3" never appears.
+	if !regexp.MustCompile(`(?s)X509v3 CRL Number:\s*3`).MatchString(text) {
+		t.Errorf("openssl crl output does not show CRL number 3:\n%s", text)
 	}
 	_ = x509.RevocationList{} // keep the x509 import honest if assertions change
 }
@@ -4268,7 +4274,9 @@ func CheckCRLSigner(caCert *x509.Certificate) error {
 
 `CreateCRL` validates the template (positive non-nil `Number`; non-zero `ThisUpdate` and `NextUpdate` with `NextUpdate` after `ThisUpdate`; every entry has a non-nil positive serial and a non-zero `RevokedAt`; reasons resolve; no duplicate serials), calls `CheckCRLSigner`, resolves the signature algorithm through `DefaultSignatureAlgorithm(caKey)` when zero, builds `x509.RevocationList` with `RevokedCertificateEntries`, calls `x509.CreateRevocationList`, and wraps the DER in an `X509 CRL` PEM block.
 
-Three details that the verified API notes make load-bearing. First, put the reason in `RevocationListEntry.ReasonCode` and never in `ExtraExtensions` — Go rejects a reasonCode OID appearing there. Second, `ReasonCode` 0 makes Go omit the extension entirely, which is the RFC-correct encoding for an unspecified reason and is what the test asserts; do not special-case it. Third, `Number` is required and must fit in 20 octets, so validate `Number.BitLen() <= 160` and give an error mentioning the limit rather than letting Go's message surface.
+Three details that the verified API notes make load-bearing. First, put the reason in `RevocationListEntry.ReasonCode` and never in `ExtraExtensions` — Go rejects a reasonCode OID appearing there. Second, `ReasonCode` 0 makes Go omit the extension entirely, which is the RFC-correct encoding for an unspecified reason and is what the test asserts; do not special-case it. Third, `Number` is required and must fit in 20 octets — but **do not validate it as `Number.BitLen() <= 160`**. That misses the boundary: a positive `Number` with `BitLen() == 160` has its top byte's high bit set, so the DER INTEGER encoding prepends a sign-padding octet and the value still exceeds 20 octets. `2^159` is exactly such a case — 20 bytes from `Bytes()`, rejected by Go. A `BitLen()` check would pass it through and Go would then fail with its own opaque `x509: CRL number exceeds 20 octets`, which is precisely the outcome this pre-validation exists to avoid.
+
+Replicate Go's own condition instead, which is `len(numBytes) > 20 || (len(numBytes) == 20 && numBytes[0]&0x80 != 0)` over `Number.Bytes()` (see `x509.go`'s `CreateRevocationList`), and give an error mentioning the 20-octet limit. Add a regression test at the boundary — `2^159` must be rejected — because nothing else in this task's tests exercises an oversized CRL number at all.
 
 Duplicate-serial rejection is not RFC-mandated but is always a config error, and a CRL with the same serial twice makes downstream revocation checks ambiguous.
 
