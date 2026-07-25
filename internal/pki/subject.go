@@ -160,7 +160,13 @@ func (n NamedSubject) Expand() Subject {
 // Each attribute becomes its own single-element RDN SET. Multi-valued RDNs are
 // not produced: openssl's [dn] config section cannot express them, so no
 // certificate this provider needs to reproduce contains one. ParseSubjectDER
-// still reads them, flattening in order.
+// still reads them, flattening in wire order -- see its doc comment for why
+// that is not the same as the order a producer declared.
+//
+// Emitting one attribute per RDN is also what keeps the output stable: DER
+// requires the members of a SET OF to be sorted by their encodings (X.690
+// 11.6), so a SET holding two or more attributes would be reordered underneath
+// us, while a single-element SET has nothing to sort.
 func (s Subject) EncodeDER() ([]byte, error) {
 	if len(s.Attributes) == 0 {
 		// An empty DN is legal DER (an empty SEQUENCE) and is what a
@@ -290,10 +296,16 @@ type rawRDNSequence []rawRelativeDistinguishedNameSET
 // plain Go string, discarding the tag -- exactly the information a byte-exact
 // re-encode needs.
 //
-// A multi-valued RDN is flattened into consecutive attributes in declaration
-// order. That is the one shape re-encoding cannot reproduce byte-for-byte,
-// since EncodeDER always emits single-attribute RDNs; callers that care compare
-// the DER themselves.
+// A multi-valued RDN is flattened into consecutive attributes in wire order,
+// which is not necessarily the order a producer declared: DER requires the
+// members of a SET OF to be sorted by their encodings (X.690 11.6), so a
+// lower-sorting attribute comes first regardless of how it was written. Wire
+// order is the only order the bytes carry, so it is the only order a parser can
+// report. See TestParseSubjectDERFlattensMultiValuedRDNs, which pins this.
+//
+// Re-encoding a flattened multi-valued RDN produces single-attribute RDNs, so
+// that one shape is deliberately not byte-exact; callers that care compare the
+// DER themselves.
 func ParseSubjectDER(der []byte) (Subject, error) {
 	var seq rawRDNSequence
 	rest, err := asn1.Unmarshal(der, &seq)
@@ -366,6 +378,14 @@ func (s Subject) IsEmpty() bool {
 // Comparing encoded bytes rather than struct fields is what lets a
 // hand-written named-field config plan clean against state imported in the
 // ordered form: any two configs that produce the same DN are the same DN.
+//
+// Equal is therefore NOT reflexive: a subject that cannot be encoded compares
+// unequal to everything, including itself. A DN can parse yet fail to
+// re-encode -- a PrintableString holding '@' or '_', a zero-length value, or a
+// UTF8String carrying invalid UTF-8 all do -- and this predicate has nowhere to
+// report the reason. A caller that needs the cause, rather than a bare "these
+// differ", must call EncodeDER itself and inspect the error; reporting such a
+// subject as drift would be misleading, because nothing has changed.
 func (s Subject) Equal(other Subject) bool {
 	a, err := s.EncodeDER()
 	if err != nil {
