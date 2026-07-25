@@ -3362,11 +3362,21 @@ func TestCreateCertificateCASignedChainVerifies(t *testing.T) {
 	}
 }
 
-// TestCreateCertificateEmitsExactlyOneOfEachExtension is the guard against the
-// double-emission trap: if a template field were passed to both
-// x509.Certificate's convenience field and ExtraExtensions, Go would write the
-// extension twice with different criticality and some parsers would take the
-// wrong one.
+// TestCreateCertificateEmitsExactlyOneOfEachExtension asserts every extension
+// appears exactly once and that the expected set is present.
+//
+// Note what this test does NOT prove, despite an earlier draft of this plan
+// claiming it did. It cannot catch a template field being set on both
+// x509.Certificate's convenience field and ExtraExtensions, because
+// crypto/x509 guards every one of those fields with
+// !oidInExtensions(oid, template.ExtraExtensions) -- see x509.go around lines
+// 1187-1269. Double emission is therefore impossible by construction, and
+// setting BasicConstraintsValid, IsCA, KeyUsage and DNSNames alongside the
+// extension list leaves this test green. Verified by doing exactly that.
+//
+// The real hazard is an extension appearing that the template never asked for,
+// which a count cannot see. TestCreateCertificateEmitsNothingBeyondTheTemplate
+// below is what covers it.
 func TestCreateCertificateEmitsExactlyOneOfEachExtension(t *testing.T) {
 	t.Parallel()
 	ca, caKey := testCA(t, nil, nil, "ca")
@@ -3742,10 +3752,19 @@ Reject a duplicate OID across the whole list — an `extra_extension` block whos
 // buildTemplate assembles the x509.Certificate Go needs. Note what is NOT set:
 // Subject, DNSNames, EmailAddresses, IPAddresses, URIs, KeyUsage,
 // ExtKeyUsage, BasicConstraintsValid, IsCA, MaxPathLen, and the name
-// constraint fields are all left zero. Every one of those has an equivalent in
-// t.Extensions(), and setting both would make Go emit the extension twice --
-// once with its own hardcoded criticality -- which some parsers resolve in
-// favor of the wrong copy.
+// constraint fields are all left zero.
+//
+// The reason is single-source-of-truth, not double emission. crypto/x509
+// guards each of those fields with !oidInExtensions(oid, ExtraExtensions), so
+// setting one alongside the extension list is silently ignored rather than
+// duplicated. Leaving them zero means t.Extensions() is the only thing that
+// decides what a certificate carries -- which is what lets Task 14 compare
+// against that same function instead of reimplementing the rules.
+//
+// One consequence of never setting IsCA: Go's automatic SubjectKeyId
+// generation is gated on it, so the RFC 7093 path described in the SubjectKeyId
+// note below is unreachable in this design. The note stands anyway, because the
+// gate is Go's implementation detail and not a promise.
 ```
 
 Set `SerialNumber`, `RawSubject`, `NotBefore`, `NotAfter`, `SignatureAlgorithm`, `ExtraExtensions`, and `SubjectKeyId`.
@@ -5848,7 +5867,9 @@ type CompareInput struct {
 3. **Public key**: `PublicKeysEqual(in.DesiredPublicKey, in.Actual.PublicKey)` when `DesiredPublicKey` is non-nil. Report `Field: "public_key"` with the fingerprints, never the keys.
 4. **Serial**: `Desired.Serial.Cmp(Actual.SerialNumber)`, reported as `serial_number` with `FormatSerial` on both sides.
 5. **Validity**: `NotBefore` and `NotAfter` compared with `Time.Equal` after truncating both to a second, because DER encodes `UTCTime` at second granularity and a template carrying sub-second precision would otherwise always differ. Report `not_before` and `not_after` in RFC3339.
-6. **Extensions**: build the desired list with `Desired.Extensions(in.DesiredPublicKey)` and index the actual certificate's `Extensions` by OID string. For each desired extension, report drift when it is absent, when `Critical` differs, or when the DER value differs. Then report every actual extension not in the desired set — that catches a removed `extra_extension`, and the `authorityKeyIdentifier` Go adds must be excluded from that sweep since the template never contains it. Use the extension's dotted OID as `Field` so the message is unambiguous even for extensions the provider has no friendly name for; the SAN is the one exception, reported as `san` because that is the schema block a user would edit.
+6. **Extensions**: build the desired list with `Desired.Extensions(in.DesiredPublicKey)` and index the actual certificate's `Extensions` by OID string.
+
+   **Index by OID; never compare positionally.** `Extensions()` returns its documented order, but the order in an *issued* certificate is not the same: `x509.CreateCertificate` prepends the `authorityKeyIdentifier` it synthesizes from the parent. Measured directly — a template yielding `[2.5.29.19, 2.5.29.15, 2.5.29.37, 2.5.29.17, 2.5.29.14]` produces a certificate carrying `[2.5.29.35, 2.5.29.19, 2.5.29.15, 2.5.29.37, 2.5.29.17, 2.5.29.14]`. A positional comparison would report drift on every extension of every certificate. Task 9's implementer found this. For each desired extension, report drift when it is absent, when `Critical` differs, or when the DER value differs. Then report every actual extension not in the desired set — that catches a removed `extra_extension`, and the `authorityKeyIdentifier` Go adds must be excluded from that sweep since the template never contains it. Use the extension's dotted OID as `Field` so the message is unambiguous even for extensions the provider has no friendly name for; the SAN is the one exception, reported as `san` because that is the schema block a user would edit.
 7. **Issuer and signature**: when `CA` is non-nil, compare `CA.RawSubject` against `Actual.RawIssuer` (`Field: "issuer"`) and call `Actual.CheckSignatureFrom(in.CA)` (`Field: "signature"`). When `CA` is nil, call `Actual.CheckSignatureFrom(in.Actual)` to confirm it really is self-signed.
 
 Render extension values as hex, truncated to 64 characters with an ellipsis, so a drift message stays readable in a plan.
@@ -6063,6 +6084,12 @@ func TestGoldenMatchesThePythonIssuer(t *testing.T) {
 	// criticality and the same value. authorityKeyIdentifier is compared
 	// separately below because openssl's "keyid, issuer" form and Go's keyid
 	// form can differ in what they include.
+	//
+	// Note both maps are keyed by OID rather than compared positionally. That
+	// is required, not stylistic: x509.CreateCertificate prepends the AKI it
+	// synthesizes, so the issued order differs from CertTemplate.Extensions()'
+	// order, and openssl's order differs from both. Only the set and the
+	// per-OID values are comparable.
 	akiOID := "2.5.29.35"
 	refExts := map[string]pkix.Extension{}
 	for _, e := range reference.Extensions {
