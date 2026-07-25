@@ -68,7 +68,12 @@ func TestParseSerialHandlesValuesBeyondInt64(t *testing.T) {
 	t.Parallel()
 	// A random 128-bit serial does not fit in an int64; big.Int is not
 	// decoration here.
-	const in = "0102030405060708090a0b0c0d0e0f10"
+	// The input deliberately has no leading zero, so it is already in
+	// canonical form and must round-trip to itself byte-for-byte. (Using a
+	// leading-zero input here would only re-assert what
+	// TestFormatSerialIsNormalizeSerialFixedPoint already covers, and would
+	// not show that a large value survives the round trip intact.)
+	const in = "102030405060708090a0b0c0d0e0f10"
 	got, err := ParseSerial(in)
 	if err != nil {
 		t.Fatalf("ParseSerial: %v", err)
@@ -76,8 +81,8 @@ func TestParseSerialHandlesValuesBeyondInt64(t *testing.T) {
 	if got.BitLen() != 121 {
 		t.Fatalf("BitLen = %d, want 121", got.BitLen())
 	}
-	if FormatSerial(got) != NormalizeSerial(in) {
-		t.Fatalf("FormatSerial round-trip = %q, want %q", FormatSerial(got), NormalizeSerial(in))
+	if FormatSerial(got) != in {
+		t.Fatalf("FormatSerial round-trip = %q, want %q", FormatSerial(got), in)
 	}
 }
 
