@@ -4776,17 +4776,20 @@ func TestEncodePKCS12EmittedAlgorithms(t *testing.T) {
 		{
 			encoding: PKCS12Modern,
 			password: testPassword,
-			// AES-256-CBC content encryption with PBKDF2, HMAC-SHA256 MAC.
-			wantInOutput: []string{"PBES2", "aes-256-cbc", "sha256"},
-			notInOutput:  []string{"des-ede3-cbc", "RC2"},
+			// AES-256-CBC content encryption with PBKDF2, and an HMAC-SHA256
+			// MAC. The MAC assertion pins the "MAC:" line specifically, not a
+			// bare "sha256" -- modern's PRF line also mentions SHA-256, so a
+			// bare substring would pass even if the MAC were SHA-1.
+			wantInOutput: []string{"PBES2", "PBKDF2", "AES-256-CBC", "MAC: sha256"},
+			notInOutput:  []string{"TripleDES", "RC2", "MAC: sha1"},
 		},
 		{
 			encoding: PKCS12Legacy,
 			password: testPassword,
-			// 3DES content encryption, SHA-1 MAC. This is the only combination
-			// that is universally importable on iOS < 18 and Android < 14.
-			wantInOutput: []string{"des-ede3-cbc", "sha1"},
-			notInOutput:  []string{"aes-256-cbc", "RC2"},
+			// 3DES content encryption with a SHA-1 MAC -- the only combination
+			// universally importable on iOS < 18 and Android < 14.
+			wantInOutput: []string{"pbeWithSHA1And3-KeyTripleDES-CBC", "MAC: sha1"},
+			notInOutput:  []string{"AES-256-CBC", "PBES2", "RC2", "sha256"},
 		},
 	} {
 		out, err := EncodeBundle(BundleInput{
@@ -5165,7 +5168,18 @@ go test ./internal/pki/ -run PKCS12 -v
 
 Expected: PASS. `TestEncodePKCS12EmittedAlgorithms` skips if openssl is absent; on this machine (OpenSSL 3.5.7) it runs.
 
-If `openssl pkcs12 -info` labels the algorithms differently than the assertions expect, read the actual output before editing the test, and adjust the expected substrings to whatever that OpenSSL build prints for AES-256-CBC/PBES2/SHA-256 and 3DES/SHA-1. Do not weaken the test to "it decoded" — the whole point is asserting the algorithms.
+**The substrings above are what OpenSSL 3.5.7 actually prints, measured.** An earlier draft of this plan expected `des-ede3-cbc` for `legacy`, which OpenSSL never emits — it prints `pbeWithSHA1And3-KeyTripleDES-CBC`. That error was worse than a failing test: `legacy`'s assertion would have failed always, while `modern`'s `notInOutput: ["des-ede3-cbc"]` passed **vacuously**, because that string appears in no output at all. So `modern` could have silently emitted 3DES and no test would have noticed — exactly the device-lockout bug these assertions exist to prevent. Verified observed output, OpenSSL 3.5.7:
+
+```
+modern:  MAC: sha256, Iteration 2048
+         PKCS7 Encrypted data: PBES2, PBKDF2, AES-256-CBC, Iteration 2048, PRF hmacWithSHA256
+legacy:  MAC: sha1, Iteration 1
+         PKCS7 Encrypted data: pbeWithSHA1And3-KeyTripleDES-CBC, Iteration 2048
+```
+
+Two lessons encoded in the assertions above. Match the `MAC:` line rather than a bare hash name, because `modern`'s PRF line also says SHA-256 and a bare match would not distinguish MAC from PRF. And put a *positive* assertion on each axis for both encodings, so neither can pass by the absence of a string that never appears.
+
+If a future OpenSSL changes these labels, read the real output and re-pin — but never weaken an assertion to "it decoded". Go decodes both encodings happily; only an external tool can tell them apart, which is the entire reason this test exists.
 
 - [ ] **Step 5: Verify against a real device path, manually, once**
 
