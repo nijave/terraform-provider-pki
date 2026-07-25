@@ -119,13 +119,34 @@ func TestEncodeJKSRejectsBadInput(t *testing.T) {
 	t.Parallel()
 	leaf, key, _ := testLeaf(t)
 	for label, in := range map[string]BundleInput{
-		"no password":      {Format: FormatJKS, Certificate: leaf, PrivateKey: key, FriendlyName: "a"},
-		"short password":   {Format: FormatJKS, Certificate: leaf, PrivateKey: key, Password: "12345", FriendlyName: "a"},
-		"key without cert": {Format: FormatJKS, PrivateKey: key, Password: testPassword, FriendlyName: "a"},
+		"no password":    {Format: FormatJKS, Certificate: leaf, PrivateKey: key, FriendlyName: "a"},
+		"short password": {Format: FormatJKS, Certificate: leaf, PrivateKey: key, Password: "12345", FriendlyName: "a"},
 	} {
 		if _, err := EncodeBundle(in); err == nil {
 			t.Errorf("EncodeBundle(jks, %s) returned nil error, want an error", label)
 		}
+	}
+
+	// "key without cert" gets its own assertion, on the message rather than
+	// merely on error-ness: encodeJKS used to let creationTime's generic
+	// nothing-to-derive-a-timestamp-from branch fire first for this input,
+	// which shipped the wrong (and, per its own comment, supposedly
+	// unreachable) error instead of the specific one naming the actual
+	// problem. Asserting the substring pins the branch order so that
+	// regression cannot come back silently.
+	if _, err := EncodeBundle(BundleInput{
+		Format: FormatJKS, PrivateKey: key, Password: testPassword, FriendlyName: "a",
+	}); err == nil {
+		t.Error("EncodeBundle(jks, key without cert) returned nil error, want an error")
+	} else if !strings.Contains(err.Error(), "pairs the key with one specific certificate") {
+		// This substring is unique to the specific "private key requires a
+		// certificate" error. The generic creationTime fallback error also
+		// contains the words "requires a certificate" (as part of "requires a
+		// certificate or a chain entry"), so asserting on that shorter phrase
+		// would not have caught the regression this test exists to guard
+		// against: encodeJKS used to let that generic branch fire first for
+		// this exact input.
+		t.Errorf("EncodeBundle(jks, key without cert) error = %q, want the specific key-requires-a-certificate message", err.Error())
 	}
 
 	other, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
@@ -186,5 +207,66 @@ func TestEncodeJKSTrustStoreAliasesAreCaseInsensitivelyDistinct(t *testing.T) {
 	text := keytoolList(t, out, testPassword)
 	if !strings.Contains(text, "contains 2 entries") {
 		t.Errorf("keytool -list does not report 2 entries; aliases differing only in case collapsed:\n%s", text)
+	}
+}
+
+// TestEncodeJKSTrustStoreIsDeterministic checks the property WithOrderedAliases
+// and the fixed creationTime exist for: a truststore built from the same input
+// twice is byte-for-byte identical, so the Kubernetes Secret it lands in does
+// not churn on every apply. Unlike the keyed path, nothing here draws from a
+// random source, so no Rand is needed to make this hold.
+func TestEncodeJKSTrustStoreIsDeterministic(t *testing.T) {
+	t.Parallel()
+	leaf, _, ca := testLeaf(t)
+	in := BundleInput{
+		Format: FormatJKS, Certificate: leaf, Chain: []*x509.Certificate{ca},
+		Password: testPassword, FriendlyName: "homelab",
+	}
+
+	first, err := EncodeBundle(in)
+	if err != nil {
+		t.Fatalf("EncodeBundle (first): %v", err)
+	}
+	second, err := EncodeBundle(in)
+	if err != nil {
+		t.Fatalf("EncodeBundle (second): %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("two truststore encodes of identical input differ: %d bytes vs %d bytes", len(first), len(second))
+	}
+}
+
+// TestEncodeJKSKeyedBundleIsDeterministicWithPinnedRand is the valuable half
+// of the determinism story. keystore-go's Sun key protector draws a fresh
+// random 20-byte salt from its random source on every SetPrivateKeyEntry --
+// the same way a PKCS#12 keystore is freshly salted on every encode -- so the
+// keyed path can never be byte-identical across two encodes in production,
+// and encodeJKS does not claim otherwise. But with in.Rand pinned to a
+// deterministic reader (mirroring what encodePKCS12 already supports via
+// WithRand), two encodes must still be byte-identical. If they were not, that
+// would mean something else in the path is nondeterministic -- a stray
+// time.Now(), map iteration order leaking into the output, and so on -- which
+// this test exists to catch.
+func TestEncodeJKSKeyedBundleIsDeterministicWithPinnedRand(t *testing.T) {
+	t.Parallel()
+	leaf, key, ca := testLeaf(t)
+	salt := bytes.Repeat([]byte{0x42}, 64) // more than the 20-byte salt keyprotector.go reads
+	in := BundleInput{
+		Format: FormatJKS, Certificate: leaf, PrivateKey: key,
+		Chain: []*x509.Certificate{ca}, Password: testPassword, FriendlyName: "nick-ipad",
+	}
+
+	in.Rand = bytes.NewReader(salt)
+	first, err := EncodeBundle(in)
+	if err != nil {
+		t.Fatalf("EncodeBundle (first): %v", err)
+	}
+	in.Rand = bytes.NewReader(salt)
+	second, err := EncodeBundle(in)
+	if err != nil {
+		t.Fatalf("EncodeBundle (second): %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("two keyed encodes with the same pinned rand differ: %d bytes vs %d bytes", len(first), len(second))
 	}
 }

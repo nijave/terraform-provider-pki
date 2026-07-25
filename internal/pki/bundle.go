@@ -365,9 +365,31 @@ func trustStoreAliases(friendlyName string, certs []*x509.Certificate) []string 
 // store password would be accepted silently; JKS's own floor is six, which
 // this function enforces itself with a clear error, in addition to passing
 // WithMinPasswordLen(6) to the store.
+//
+// Determinism is only a property of the truststore path (no PrivateKey).
+// There, WithOrderedAliases and the fixed creationTime below are the entire
+// story, and two encodes of the same input are byte-identical. The keyed
+// path cannot make that promise: keystore-go's Sun key protector draws a
+// fresh random 20-byte salt from its random source on every
+// SetPrivateKeyEntry, the same way a PKCS#12 keystore is freshly salted on
+// every encodePKCS12 call. Pinning that salt in production would be a
+// security regression, not a determinism win, so this function does not
+// attempt it -- it only threads in.Rand through when a caller supplies one
+// (as tests do, mirroring encodePKCS12's WithRand above), leaving
+// crypto/rand as the production default.
+//
+// None of this churns the Kubernetes Secret a keyed bundle lands in, despite
+// the random salt: the provider encodes once at resource creation, holds the
+// resulting bytes under UseStateForUnknown, and Read never re-encodes to
+// compare, because the password is write-only and is not itself persisted in
+// state. A truststore (no key, no password-gated secret) has no such
+// protection, which is exactly why its path is held to full determinism.
 func encodeJKS(in BundleInput) ([]byte, error) {
 	if len(in.Password) < 6 {
 		return nil, fmt.Errorf("jks bundle requires a password of at least 6 characters")
+	}
+	if in.PrivateKey != nil && in.Certificate == nil {
+		return nil, fmt.Errorf("jks bundle with a private key requires a certificate: a keystore entry pairs the key with one specific certificate")
 	}
 
 	// creationTime is a fixed value derived from the input, never time.Now():
@@ -380,22 +402,28 @@ func encodeJKS(in BundleInput) ([]byte, error) {
 	case len(in.Chain) > 0:
 		creationTime = in.Chain[0].NotBefore
 	default:
-		// Unreachable via EncodeBundle's own nothing-to-encode check, since that
-		// leaves only in.PrivateKey set, and the private-key branch below already
-		// requires a certificate. Guarded anyway so this function stays correct
-		// if that invariant ever changes.
+		// Unreachable: EncodeBundle's own nothing-to-encode check rejects
+		// Certificate, PrivateKey, and Chain all being absent, and the guard
+		// above already rejects PrivateKey set with Certificate absent -- so
+		// reaching here with both Certificate and Chain empty would require
+		// PrivateKey alone to be set, which is exactly the case that guard
+		// catches first. Kept anyway so this function stays correct if that
+		// ordering ever changes.
 		return nil, fmt.Errorf("jks bundle requires a certificate or a chain entry")
 	}
 
 	// WithOrderedAliases makes Aliases() -- and therefore Store()'s entry
 	// order -- deterministic for a given input, for the same reason as
-	// creationTime above.
-	ks := keystore.New(keystore.WithOrderedAliases(), keystore.WithMinPasswordLen(6))
+	// creationTime above. WithCustomRandomNumberGenerator is added only when
+	// the caller supplies in.Rand (tests do, for reproducible bytes);
+	// production leaves it nil and keystore-go falls back to crypto/rand.
+	opts := []keystore.Option{keystore.WithOrderedAliases(), keystore.WithMinPasswordLen(6)}
+	if in.Rand != nil {
+		opts = append(opts, keystore.WithCustomRandomNumberGenerator(in.Rand))
+	}
+	ks := keystore.New(opts...)
 
 	if in.PrivateKey != nil {
-		if in.Certificate == nil {
-			return nil, fmt.Errorf("jks bundle with a private key requires a certificate: a keystore entry pairs the key with one specific certificate")
-		}
 		if !PublicKeysEqual(PublicKeyOf(in.PrivateKey), in.Certificate.PublicKey) {
 			return nil, fmt.Errorf("jks bundle private key does not match the certificate's public key")
 		}
