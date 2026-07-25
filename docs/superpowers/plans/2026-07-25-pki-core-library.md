@@ -73,7 +73,6 @@ Module, license, Makefile, and a CI job that runs unit tests. Nothing here is pr
 - Create: `GNUmakefile`
 - Create: `.github/workflows/test.yml`
 - Create: `internal/pki/doc.go`
-- Test: `internal/pki/doc_test.go`
 - Modify: `README.md`
 
 **Interfaces:**
@@ -130,34 +129,17 @@ Do not add a copyright line inside `LICENSE` itself; the per-file SPDX headers c
 package pki
 ```
 
-- [ ] **Step 4: Write a failing test that the package builds and is importable**
+- [ ] **Step 4: Verify the module builds**
 
-`internal/pki/doc_test.go`:
-
-```go
-// SPDX-License-Identifier: GPL-3.0-or-later
-
-package pki
-
-import "testing"
-
-// TestPackageBuilds is a placeholder that keeps the package's test binary
-// buildable before any real code lands. Later tasks may delete it once the
-// package has real tests.
-func TestPackageBuilds(t *testing.T) {
-	t.Parallel()
-}
-```
-
-- [ ] **Step 5: Run the tests**
+Do **not** add a placeholder test file. `go test ./...` succeeds on a package with no test file at all — it reports `?  <package>  [no test files]` and exits zero — so a test that asserts nothing buys nothing, and Task 2 adds real tests to this package immediately.
 
 ```bash
-gofmt -l . && go vet ./... && go test ./...
+gofmt -l . && go vet ./... && go build ./... && go test ./...
 ```
 
-Expected: `gofmt -l` prints nothing, `go vet` is silent, `go test` reports `ok github.com/nijave/terraform-provider-pki/internal/pki`.
+Expected: `gofmt -l` prints nothing, `go vet` and `go build` are silent, and `go test` reports `?  github.com/nijave/terraform-provider-pki/internal/pki  [no test files]` with exit status 0.
 
-- [ ] **Step 6: Write the GNUmakefile**
+- [ ] **Step 5: Write the GNUmakefile**
 
 `GNUmakefile` (the `docs` and `testacc` targets are placeholders until Plan 2 adds the framework layer, but they belong here so the target names never change):
 
@@ -191,7 +173,7 @@ release:
 	@git push origin $$RELEASE_VERSION
 ```
 
-- [ ] **Step 7: Write the CI workflow**
+- [ ] **Step 6: Write the CI workflow**
 
 `.github/workflows/test.yml`. This is the unit-test half of spec §12; Plan 2 adds the `generate` job and the OpenTofu acceptance matrix to this same file. The triggers, `permissions`, and `concurrency` block are already in their final form, per spec §12's correction of cortextool's push-only trigger.
 
@@ -252,7 +234,7 @@ jobs:
 
 The `unit` job deliberately does not set `TF_ACC`, so acceptance tests added in Plan 2 skip here and run only in the matrix job Plan 2 adds.
 
-- [ ] **Step 8: Replace the README stub**
+- [ ] **Step 7: Replace the README stub**
 
 `README.md` currently contains only the title with no trailing newline. Replace it with:
 
@@ -283,11 +265,11 @@ CRL support. This provider closes those gaps.
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 ```
 
-- [ ] **Step 9: Verify and commit**
+- [ ] **Step 8: Verify and commit**
 
 ```bash
 gofmt -l . && go vet ./... && go test ./...
-git add go.mod go.sum LICENSE GNUmakefile README.md .github/workflows/test.yml internal/pki/doc.go internal/pki/doc_test.go
+git add go.mod go.sum LICENSE GNUmakefile README.md .github/workflows/test.yml internal/pki/doc.go
 git commit -m "chore: module foundation, GPLv3 license, unit-test CI"
 ```
 
@@ -6063,7 +6045,6 @@ The architectural invariant from spec §3, enforced rather than documented, plus
 
 **Files:**
 - Create: `internal/pki/boundary_test.go`
-- Modify: `internal/pki/doc_test.go` (delete the placeholder)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -6167,15 +6148,7 @@ go test ./internal/pki/ -run 'Boundary|Package|SPDX' -v
 
 Expected: PASS. If `TestEveryFileHasTheSPDXHeader` fails, add the missing headers rather than relaxing the test.
 
-- [ ] **Step 3: Delete the Task 1 placeholder test**
-
-`internal/pki/doc_test.go` exists only so the package had a test binary before any real code landed. The package now has real tests, so delete the file.
-
-```bash
-rm internal/pki/doc_test.go
-```
-
-- [ ] **Step 4: Verify the whole package, including race and coverage**
+- [ ] **Step 3: Verify the whole package, including race and coverage**
 
 ```bash
 gofmt -l .
@@ -6187,7 +6160,7 @@ go test ./internal/pki/ -cover
 
 Expected: `gofmt -l` silent, `go vet` silent, all three test runs green. Coverage should be above 85% for the package; if any file is far below that, the gap is a missing test case, not a reason to lower the bar. Note the actual number in the commit message.
 
-- [ ] **Step 5: Confirm the dependency licenses one final time**
+- [ ] **Step 4: Confirm the dependency licenses one final time**
 
 The dependency set is now final for this plan, so run the audit spec §13 requires:
 
@@ -6199,11 +6172,10 @@ For each module, confirm the license is one of MPL-2.0, BSD-3-Clause, MIT, or Ap
 
 Note that the automated `go-licenses` gate is spec §14 follow-up 3 and lands in Plan 2's CI task, once the full dependency set including the plugin framework is present.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add internal/pki/boundary_test.go
-git rm internal/pki/doc_test.go
 git commit -m "test: enforce the no-Terraform-imports boundary and SPDX headers"
 ```
 
