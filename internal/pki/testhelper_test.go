@@ -19,6 +19,16 @@ func mustDNOID(t *testing.T, name string) asn1.ObjectIdentifier {
 	return oid
 }
 
+// mustOID parses a dotted OID or fails the test.
+func mustOID(t *testing.T, s string) asn1.ObjectIdentifier {
+	t.Helper()
+	oid, err := ParseOID(s)
+	if err != nil {
+		t.Fatalf("ParseOID(%q): %v", s, err)
+	}
+	return oid
+}
+
 // requireOpenSSL returns the path to the openssl binary, skipping the test when
 // it is not installed. Cross-validation against a real parser is valuable but
 // must never be the reason a contributor's test run fails.

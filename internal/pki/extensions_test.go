@@ -670,19 +670,67 @@ func selfSignedWith(t *testing.T, exts ...pkix.Extension) *x509.Certificate {
 	return cert
 }
 
+// TestParsersRejectWrongOID confirms each parser checks the extension's OID.
+//
+// Each case must carry a value that is VALID for that parser's own extension,
+// presented under the wrong OID. Sharing one placeholder value across all four
+// -- an empty SEQUENCE, say -- makes the test near-vacuous: every parser then
+// fails on the malformed value rather than on the OID, so deleting three of the
+// four OID guards leaves the suite green. Verified by doing exactly that.
 func TestParsersRejectWrongOID(t *testing.T) {
 	t.Parallel()
-	wrong := pkix.Extension{Id: asn1.ObjectIdentifier{1, 2, 3, 4}, Value: []byte{0x30, 0x00}}
-	if _, err := ParseBasicConstraints(wrong); err == nil {
-		t.Error("ParseBasicConstraints accepted the wrong OID")
+	const wrongOID = "2.5.29.99"
+
+	// A valid basicConstraints value: SEQUENCE { cA TRUE }.
+	bcValue, err := (BasicConstraints{CA: true, Critical: true}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid basicConstraints value: %v", err)
 	}
-	if _, err := ParseKeyUsage(wrong); err == nil {
-		t.Error("ParseKeyUsage accepted the wrong OID")
+	// A valid keyUsage BIT STRING.
+	kuValue, err := (KeyUsage{Usages: []string{"digitalSignature"}, Critical: true}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid keyUsage value: %v", err)
 	}
-	if _, err := ParseExtKeyUsage(wrong); err == nil {
-		t.Error("ParseExtKeyUsage accepted the wrong OID")
+	// A valid extendedKeyUsage SEQUENCE OF OID.
+	ekuValue, err := (ExtKeyUsage{Usages: []string{"clientAuth"}}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid extendedKeyUsage value: %v", err)
 	}
-	if _, err := ParseNameConstraints(wrong); err == nil {
-		t.Error("ParseNameConstraints accepted the wrong OID")
+	// A valid nameConstraints SEQUENCE with one permitted subtree.
+	ncValue, err := (NameConstraints{PermittedDNSDomains: []string{".example"}, Critical: true}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid nameConstraints value: %v", err)
+	}
+
+	misfiled := func(v pkix.Extension) pkix.Extension {
+		return pkix.Extension{Id: mustOID(t, wrongOID), Critical: v.Critical, Value: v.Value}
+	}
+
+	if _, err := ParseBasicConstraints(misfiled(bcValue)); err == nil {
+		t.Error("ParseBasicConstraints accepted a valid value under the wrong OID")
+	}
+	if _, err := ParseKeyUsage(misfiled(kuValue)); err == nil {
+		t.Error("ParseKeyUsage accepted a valid value under the wrong OID")
+	}
+	if _, err := ParseExtKeyUsage(misfiled(ekuValue)); err == nil {
+		t.Error("ParseExtKeyUsage accepted a valid value under the wrong OID")
+	}
+	if _, err := ParseNameConstraints(misfiled(ncValue)); err == nil {
+		t.Error("ParseNameConstraints accepted a valid value under the wrong OID")
+	}
+
+	// Sanity check the fixtures: each value must parse cleanly under its own
+	// OID, or the assertions above would pass for the wrong reason.
+	if _, err := ParseBasicConstraints(bcValue); err != nil {
+		t.Errorf("the basicConstraints fixture does not parse under its own OID: %v", err)
+	}
+	if _, err := ParseKeyUsage(kuValue); err != nil {
+		t.Errorf("the keyUsage fixture does not parse under its own OID: %v", err)
+	}
+	if _, err := ParseExtKeyUsage(ekuValue); err != nil {
+		t.Errorf("the extendedKeyUsage fixture does not parse under its own OID: %v", err)
+	}
+	if _, err := ParseNameConstraints(ncValue); err != nil {
+		t.Errorf("the nameConstraints fixture does not parse under its own OID: %v", err)
 	}
 }
