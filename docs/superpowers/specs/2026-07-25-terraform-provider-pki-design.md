@@ -617,8 +617,76 @@ OpenTofu substituted for Terraform throughout:
 - The `generate` job still runs `go generate ./...` and fails on a `git diff`,
   keeping `tfplugindocs` output committed and current.
 
-Unlike cortextool, there is no upstream SaaS API to drift against, so the
-scheduled-cron trigger stays disabled.
+**Triggers must cover pull requests, which cortextool's do not.** Its
+`test.yml` has only a `push` trigger despite a header comment claiming "each
+commit push and/or PR", so fork PRs are never tested. This provider uses both:
+
+```yaml
+on:
+  pull_request:
+    paths-ignore: ['README.md', 'docs/superpowers/**']
+  push:
+    branches: [main]
+    paths-ignore: ['README.md', 'docs/superpowers/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+```
+
+Scoping `push` to `main` avoids duplicate runs when a branch in this repo also
+has an open PR. `permissions: contents: read` is least-privilege; only
+`release.yml` needs `contents: write`. The concurrency group cancels superseded
+runs on force-push.
+
+There is no upstream SaaS API to drift against, so the scheduled-cron trigger
+cortextool suggests stays disabled.
+
+One consequence worth stating: **the acceptance tests require no secrets.**
+Every resource is self-contained with no external API, so there is nothing to
+authenticate against. That matters for Dependabot — GitHub runs Dependabot PRs
+with a read-only token and withholds normal repository secrets, so on a provider
+that needed API credentials those PRs would fail or silently skip coverage.
+Here they get the full matrix.
+
+### `.github/dependabot.yml`
+
+Two ecosystems, matching cortextool:
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      terraform-plugin:
+        patterns: ["github.com/hashicorp/terraform-plugin-*"]
+      golang-x:
+        patterns: ["golang.org/x/*"]
+```
+
+Two deviations from cortextool: `weekly` rather than `daily`, and grouped
+updates. cortextool's ungrouped daily config opens a separate PR per module,
+which on a repo with the full plugin-framework dependency tree is a lot of noise
+for changes that should land together — the `terraform-plugin-*` modules in
+particular expect to move in lockstep.
+
+Dependabot PRs are also the main consumer of the license gate in §13: a
+transitive dependency changing to a GPL-incompatible license is exactly the kind
+of drift that arrives via an automated bump rather than a human commit.
 
 ### Distribution
 
