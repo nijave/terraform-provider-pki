@@ -249,13 +249,24 @@ func CreateCertificate(t CertTemplate, pub crypto.PublicKey, parent *x509.Certif
 		return nil, err
 	}
 
-	// buildTemplate assembles the x509.Certificate Go needs. Note what is NOT set:
-	// Subject, DNSNames, EmailAddresses, IPAddresses, URIs, KeyUsage,
-	// ExtKeyUsage, BasicConstraintsValid, IsCA, MaxPathLen, and the name
-	// constraint fields are all left zero. Every one of those has an equivalent in
-	// t.Extensions(), and setting both would make Go emit the extension twice --
-	// once with its own hardcoded criticality -- which some parsers resolve in
-	// favor of the wrong copy.
+	// Assemble the x509.Certificate Go needs. Note what is NOT set: Subject,
+	// DNSNames, EmailAddresses, IPAddresses, URIs, KeyUsage, ExtKeyUsage,
+	// BasicConstraintsValid, IsCA, MaxPathLen, and the name constraint fields are
+	// all left zero. Every one of those has an equivalent in t.Extensions().
+	//
+	// Setting one would not duplicate the extension: crypto/x509 guards every
+	// convenience field with !oidInExtensions(oid, template.ExtraExtensions)
+	// (x509.go ~1187-1281), so whenever Extensions() already supplies that OID Go
+	// silently ignores the field. The reason to leave them zero is that the guard
+	// only holds while Extensions() supplies the OID -- a field set
+	// unconditionally emits its extension for a template that asked for *none*,
+	// which adds an extension the configuration never requested and makes an
+	// adopted certificate drift forever against its reissued form.
+	//
+	// Leaving them zero makes t.Extensions() the single thing deciding what a
+	// certificate carries, which is exactly what lets Task 14 compare a desired
+	// template against an issued certificate by calling that same function.
+	// TestCreateCertificateEmitsNothingBeyondTheTemplate enforces it.
 	//
 	// SubjectKeyId is the one identifier-bearing field that IS set, always, from
 	// the same computation the extension uses. It is set for two reasons, only
@@ -312,10 +323,12 @@ func CreateCertificate(t CertTemplate, pub crypto.PublicKey, parent *x509.Certif
 // CreateCertRequest builds a PEM certificate signing request for key.
 //
 // The SAN goes into ExtraExtensions rather than the x509.CertificateRequest
-// DNSNames/EmailAddresses/IPAddresses/URIs fields, for the same reason
-// CreateCertificate avoids the convenience fields: those fields make Go encode
-// the extension itself, with its own criticality, and this package's SAN encoder
-// is what produces the GeneralName ordering an adopted request must match.
+// DNSNames/EmailAddresses/IPAddresses/URIs fields. Those fields would not
+// duplicate the extension -- crypto/x509 guards them with the same
+// !oidInExtensions(oid, template.ExtraExtensions) test it uses for certificates
+// (x509.go ~1491) -- but they would encode the SAN with Go's own GeneralName
+// ordering and criticality instead of this package's, and it is this package's
+// ordering that an adopted request has to match.
 func CreateCertRequest(key crypto.Signer, t CertRequestTemplate) ([]byte, error) {
 	if key == nil {
 		return nil, fmt.Errorf("private key is required")
@@ -504,29 +517,40 @@ func DefaultSignatureAlgorithm(k crypto.Signer) (x509.SignatureAlgorithm, error)
 	}
 }
 
-// signatureAlgorithmKeyTypes maps each signature algorithm to the public key
-// family it can only be used with. It exists so a mismatch between a configured
-// signature_algorithm and the signing key is reported against the two names the
-// operator wrote, rather than as crypto/x509's "requested SignatureAlgorithm
-// does not match private key type", which names neither.
-var signatureAlgorithmKeyTypes = map[x509.SignatureAlgorithm]x509.PublicKeyAlgorithm{
-	x509.MD2WithRSA:       x509.RSA,
-	x509.MD5WithRSA:       x509.RSA,
-	x509.SHA1WithRSA:      x509.RSA,
-	x509.SHA256WithRSA:    x509.RSA,
-	x509.SHA384WithRSA:    x509.RSA,
-	x509.SHA512WithRSA:    x509.RSA,
-	x509.SHA256WithRSAPSS: x509.RSA,
-	x509.SHA384WithRSAPSS: x509.RSA,
-	x509.SHA512WithRSAPSS: x509.RSA,
-	x509.DSAWithSHA1:      x509.DSA,
-	x509.DSAWithSHA256:    x509.DSA,
-	x509.ECDSAWithSHA1:    x509.ECDSA,
-	x509.ECDSAWithSHA256:  x509.ECDSA,
-	x509.ECDSAWithSHA384:  x509.ECDSA,
-	x509.ECDSAWithSHA512:  x509.ECDSA,
-	x509.PureEd25519:      x509.Ed25519,
-}
+// signatureAlgorithmKeyTypes maps each signature algorithm this package will
+// sign with to the public key family it requires. It serves two purposes: a
+// mismatch between a requested signature_algorithm and the signing key is
+// reported against the two names the operator wrote, rather than as
+// crypto/x509's "requested SignatureAlgorithm does not match private key type",
+// which names neither; and the map's domain is the allow-list of algorithms this
+// package offers at all.
+//
+// The domain is derived from signatureAlgorithmValues rather than written out
+// again, so the two cannot drift. That derivation is what keeps MD5, SHA-1 and
+// DSA out: oids.go omits them deliberately, because Go's own CheckSignature
+// refuses a SHA-1 or MD5 signature with InsecureAlgorithmError -- accepting one
+// here would mint a certificate this library cannot then verify, with no error
+// at issuance. DSA is doubly unreachable, since publicKeyAlgorithmOf can never
+// return x509.DSA.
+//
+// An algorithm added to oids.go but not classified in the switch below is absent
+// from the map and therefore rejected, which fails closed.
+// TestSignatureAlgorithmKeyTypesCoversEveryOfferedAlgorithm catches the omission.
+var signatureAlgorithmKeyTypes = func() map[x509.SignatureAlgorithm]x509.PublicKeyAlgorithm {
+	m := make(map[x509.SignatureAlgorithm]x509.PublicKeyAlgorithm, len(signatureAlgorithmValues))
+	for _, a := range signatureAlgorithmValues {
+		switch a {
+		case x509.SHA256WithRSA, x509.SHA384WithRSA, x509.SHA512WithRSA,
+			x509.SHA256WithRSAPSS, x509.SHA384WithRSAPSS, x509.SHA512WithRSAPSS:
+			m[a] = x509.RSA
+		case x509.ECDSAWithSHA256, x509.ECDSAWithSHA384, x509.ECDSAWithSHA512:
+			m[a] = x509.ECDSA
+		case x509.PureEd25519:
+			m[a] = x509.Ed25519
+		}
+	}
+	return m
+}()
 
 // resolveSignatureAlgorithm returns the algorithm to sign with: the requested
 // one when it is compatible with signerKey, or the key's default when none was
@@ -537,7 +561,7 @@ func resolveSignatureAlgorithm(requested x509.SignatureAlgorithm, signerKey cryp
 	}
 	needs, ok := signatureAlgorithmKeyTypes[requested]
 	if !ok {
-		return x509.UnknownSignatureAlgorithm, fmt.Errorf("unsupported signature algorithm %v", requested)
+		return x509.UnknownSignatureAlgorithm, fmt.Errorf("signature algorithm %v is not offered; supported algorithms are %v", requested, SignatureAlgorithmNames())
 	}
 	have, err := publicKeyAlgorithmOf(signerKey)
 	if err != nil {

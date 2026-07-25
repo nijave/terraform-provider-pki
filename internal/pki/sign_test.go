@@ -4,6 +4,7 @@ package pki
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/x509"
 	"encoding/asn1"
 	"math/big"
@@ -188,11 +189,20 @@ func TestCreateCertificateCASignedChainVerifies(t *testing.T) {
 	}
 }
 
-// TestCreateCertificateEmitsExactlyOneOfEachExtension is the guard against the
-// double-emission trap: if a template field were passed to both
-// x509.Certificate's convenience field and ExtraExtensions, Go would write the
-// extension twice with different criticality and some parsers would take the
-// wrong one.
+// TestCreateCertificateEmitsExactlyOneOfEachExtension proves two things: every
+// extension the certificate carries appears exactly once, and the six OIDs a
+// fully-specified leaf must have are all present.
+//
+// It is deliberately NOT a guard against setting one of x509.Certificate's
+// convenience fields alongside ExtraExtensions. That cannot produce a duplicate:
+// crypto/x509 guards every such field with
+// !oidInExtensions(oid, template.ExtraExtensions) (x509.go ~1187-1281), so Go
+// silently skips its own copy whenever Extensions() already supplies the OID.
+// Setting all four of BasicConstraintsValid, IsCA, KeyUsage and DNSNames was
+// verified to leave this test passing.
+//
+// The hazard a count cannot see is an extension appearing that the template never
+// requested. TestCreateCertificateEmitsNothingBeyondTheTemplate covers that.
 func TestCreateCertificateEmitsExactlyOneOfEachExtension(t *testing.T) {
 	t.Parallel()
 	ca, caKey := testCA(t, nil, nil, "ca")
@@ -281,8 +291,16 @@ func TestCreateCertificateHonorsCriticality(t *testing.T) {
 
 func TestCreateCertificateExtensionOrderIsStable(t *testing.T) {
 	t.Parallel()
-	// A stable order is what lets Task 14 compare extension lists positionally
-	// and lets an imported certificate re-encode byte-exact.
+	// This pins the order Extensions() returns, which is what lets an imported
+	// certificate re-encode byte-exact.
+	//
+	// It is NOT the order an issued certificate carries, and a comparison against
+	// a real certificate must match extensions by OID rather than by position.
+	// Extensions() yields [2.5.29.19, 2.5.29.15, 2.5.29.37, 2.5.29.17, 2.5.29.30,
+	// 2.5.29.14, ...extras], while a CA-signed certificate built from the same
+	// template carries [2.5.29.35, 2.5.29.19, ...] because crypto/x509 prepends
+	// the authorityKeyIdentifier it derives from the issuer. See
+	// CreateCertificate's doc comment for both shapes.
 	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
@@ -709,6 +727,100 @@ func TestCreateCertRequestRejectsMismatchedSignatureAlgorithm(t *testing.T) {
 	}); err == nil {
 		t.Fatal("CreateCertRequest accepted an ECDSA signature algorithm with an Ed25519 key")
 	}
+}
+
+// TestCreateCertificateRejectsInsecureSignatureAlgorithms pins that a SHA-1 or
+// MD5 algorithm is refused at issuance even though the signing key is the right
+// family for it, so the family check alone cannot wave it through.
+//
+// The failure this prevents is a certificate the library cannot verify: Go signs
+// a SHA-1 or MD5 request without complaint, and its own CheckSignature then
+// rejects the result with InsecureAlgorithmError. oids.go omits these algorithms
+// from the provider's vocabulary for exactly that reason, and this package is a
+// public API surface in its own right rather than something only reachable
+// through the schema.
+func TestCreateCertificateRejectsInsecureSignatureAlgorithms(t *testing.T) {
+	t.Parallel()
+	ca, caKey := testCA(t, nil, nil, "ca") // ECDSA P-256
+	rsaCA, rsaCAKey := testRSACA(t, "rsa-ca")
+
+	for _, tc := range []struct {
+		name   string
+		alg    x509.SignatureAlgorithm
+		parent *x509.Certificate
+		signer crypto.Signer
+	}{
+		// Each case pairs the algorithm with a signing key of the family it
+		// requires, so only the allow-list can reject it.
+		{"SHA1WithRSA", x509.SHA1WithRSA, rsaCA, rsaCAKey},
+		{"MD5WithRSA", x509.MD5WithRSA, rsaCA, rsaCAKey},
+		{"ECDSAWithSHA1", x509.ECDSAWithSHA1, ca, caKey},
+	} {
+		key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+		if err != nil {
+			t.Fatalf("GenerateKey: %v", err)
+		}
+		if _, err := CreateCertificate(CertTemplate{
+			Subject:            NamedSubject{CommonName: "cn"}.Expand(),
+			Serial:             big.NewInt(1),
+			NotBefore:          time.Now(),
+			NotAfter:           time.Now().Add(time.Hour),
+			SignatureAlgorithm: tc.alg,
+		}, PublicKeyOf(key), tc.parent, tc.signer); err == nil {
+			t.Errorf("CreateCertificate accepted %s, which this package does not offer", tc.name)
+		}
+	}
+}
+
+// TestSignatureAlgorithmKeyTypesCoversEveryOfferedAlgorithm keeps the allow-list
+// and oids.go's vocabulary in step. The map derives its domain from
+// signatureAlgorithmValues, so an algorithm added there but left unclassified
+// would be silently rejected at issuance rather than reported as a gap.
+func TestSignatureAlgorithmKeyTypesCoversEveryOfferedAlgorithm(t *testing.T) {
+	t.Parallel()
+	for _, name := range SignatureAlgorithmNames() {
+		alg, err := SignatureAlgorithmByName(name)
+		if err != nil {
+			t.Fatalf("SignatureAlgorithmByName(%q): %v", name, err)
+		}
+		if _, ok := signatureAlgorithmKeyTypes[alg]; !ok {
+			t.Errorf("signature algorithm %q (%v) is offered by oids.go but has no key family, so issuance would reject it", name, alg)
+		}
+	}
+	if len(signatureAlgorithmKeyTypes) != len(SignatureAlgorithmNames()) {
+		t.Errorf("signatureAlgorithmKeyTypes has %d entries, want %d; the allow-list admits an algorithm oids.go does not offer",
+			len(signatureAlgorithmKeyTypes), len(SignatureAlgorithmNames()))
+	}
+}
+
+// testRSACA issues a self-signed RSA CA, for the cases that need an RSA signing
+// key. testCA is ECDSA because RSA generation dominates the suite's runtime.
+func testRSACA(t *testing.T, cn string) (*x509.Certificate, crypto.Signer) {
+	t.Helper()
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmRSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	serial, err := RandomSerial()
+	if err != nil {
+		t.Fatalf("RandomSerial: %v", err)
+	}
+	certPEM, err := CreateCertificate(CertTemplate{
+		Subject:          NamedSubject{CommonName: cn, Organization: "homelab"}.Expand(),
+		Serial:           serial,
+		NotBefore:        time.Now().Add(-time.Hour),
+		NotAfter:         time.Now().Add(24 * time.Hour),
+		BasicConstraints: &BasicConstraints{CA: true, Critical: true},
+		KeyUsage:         DefaultCAKeyUsagePtr(),
+	}, PublicKeyOf(key), nil, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate(%s): %v", cn, err)
+	}
+	cert, err := ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatePEM(%s): %v", cn, err)
+	}
+	return cert, key
 }
 
 // keyIDOf returns the raw RFC 5280 method 1 key identifier for pub, unwrapped
