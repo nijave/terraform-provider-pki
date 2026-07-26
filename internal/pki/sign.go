@@ -484,9 +484,38 @@ func EncodeCertificatePEM(der []byte) []byte {
 
 // decodeSinglePEMBlock decodes exactly one PEM block of the given type,
 // rejecting a wrong type and any further block.
+//
+// "Exactly one" is counted the same way ParseCertificateChainPEM counts, and for
+// the same reason: pem.Decode reports a malformed or truncated block by skipping
+// it and returning the next well-formed one, or nil if there is none. Without a
+// marker count, a "-----BEGIN " that failed to decode is indistinguishable here
+// from one that was never written -- so an input carrying a corrupt certificate
+// followed by an intact one parsed as the intact one alone, and an input carrying
+// only a corrupt certificate reported "no PEM block found", which is a true
+// statement about pem.Decode's output and a misleading one about the file. Both
+// hide the fact that something in the input was thrown away.
+//
+// This function is stricter than the chain parser in one respect only, and it was
+// already: the chain parser wants markers == len(certs) for any number of certs,
+// while this one wants exactly one block, because its callers
+// (ParseCertificatePEM, ParseCertRequestPEM) back single-certificate attributes
+// where a chain is a configuration mistake.
+//
+// Non-PEM text remains legal before, between, and after -- unchanged, and
+// deliberately so. See ParseCertificateChainPEM's comment for why: `openssl pkcs7
+// -print_certs` prefixes every block with "subject=" and "issuer=" lines,
+// including when the PKCS#7 holds a single certificate, and that output is a
+// realistic thing to hand a certificate_pem attribute.
 func decodeSinglePEMBlock(b []byte, wantType string) (*pem.Block, error) {
+	// Counted before anything is decoded, so the count describes the input rather
+	// than what survived it.
+	markers := bytes.Count(b, []byte(pemBeginMarker))
+
 	block, rest := pem.Decode(b)
 	if block == nil {
+		if markers > 0 {
+			return nil, fmt.Errorf("input opens %d PEM block(s) and none of them decoded; a truncated or corrupt block is being reported rather than treated as absent", markers)
+		}
 		return nil, fmt.Errorf("no PEM block found")
 	}
 	if block.Type != wantType {
@@ -494,6 +523,12 @@ func decodeSinglePEMBlock(b []byte, wantType string) (*pem.Block, error) {
 	}
 	if extra, _ := pem.Decode(rest); extra != nil {
 		return nil, fmt.Errorf("input carries more than one PEM block")
+	}
+	// Reached when the input opened more blocks than pem.Decode returned: one
+	// decoded and the rest did not. The check above cannot see those, because
+	// pem.Decode skips them silently.
+	if markers != 1 {
+		return nil, fmt.Errorf("input opens %d PEM blocks but only 1 decoded; a truncated or corrupt block would be dropped silently, so the whole input is rejected", markers)
 	}
 	return block, nil
 }
