@@ -28,8 +28,13 @@ func TestPackageImportsNoTerraform(t *testing.T) {
 	}
 	fset := token.NewFileSet()
 	forbidden := []string{
-		"github.com/hashicorp/terraform-plugin-",
+		// The dash matters: it distinguishes the modern, split-out
+		// terraform-plugin-* / terraform-* module families from the bare
+		// github.com/hashicorp/terraform/... path, which is the legacy
+		// pre-split in-tree SDK (e.g. github.com/hashicorp/terraform/helper/schema).
+		// Both prefixes are required; do not collapse this to one entry.
 		"github.com/hashicorp/terraform-",
+		"github.com/hashicorp/terraform/",
 		"github.com/opentofu/",
 	}
 	checked := 0

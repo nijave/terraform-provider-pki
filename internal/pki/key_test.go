@@ -88,6 +88,7 @@ func TestGenerateKeyRejectsBadParams(t *testing.T) {
 		{Algorithm: AlgorithmRSA, RSABits: 2047}, // not a multiple of 8 and below floor
 		{Algorithm: AlgorithmECDSA, ECDSACurve: "P192"},
 		{Algorithm: AlgorithmECDSA, ECDSACurve: "p256"},
+		{Algorithm: AlgorithmECDSA, RSABits: 2048},   // rsa_bits is meaningless here
 		{Algorithm: AlgorithmED25519, RSABits: 2048}, // rsa_bits is meaningless here
 		{Algorithm: AlgorithmED25519, ECDSACurve: "P256"},
 		{Algorithm: AlgorithmRSA, ECDSACurve: "P256"}, // ecdsa_curve is meaningless here
