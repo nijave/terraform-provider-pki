@@ -212,46 +212,94 @@ func TestEncodeDEROneAttributePerRDN(t *testing.T) {
 // asn1.Marshal of a Go string emits PrintableString when the value fits, which
 // would produce different bytes for the same DN and make every imported
 // certificate plan a replace.
+// The tag assertions here and in TestEncodeDERHonorsExplicitStringType read the
+// tag off the attribute value's own TLV rather than searching the DN for a byte.
+// A scan cannot tell a tag byte from a length byte or a content byte that
+// happens to hold the same number, so it can pass or fail for reasons that have
+// nothing to do with the string type. The organization value below makes that
+// concrete: it is 19 characters, so its DER length byte is 0x13, which is also
+// the PrintableString tag -- a byte scan for "no 0x13 anywhere" fails on this
+// perfectly correct all-UTF8String DN. Reading the tag off each value's own TLV
+// can only pass when the encoder really tagged the value.
 func TestEncodeDERDefaultsToUTF8String(t *testing.T) {
 	t.Parallel()
-	s := Subject{Attributes: []Attribute{attr(t, "commonName", "plain-ascii")}}
+	s := Subject{Attributes: []Attribute{
+		attr(t, "commonName", "plain-ascii"),
+		// 19 characters, so the value's own length byte is 0x13 -- the
+		// PrintableString tag a byte scan would have tripped over.
+		attr(t, "organization", "nineteen-char-value"),
+	}}
 	der, err := s.EncodeDER()
 	if err != nil {
 		t.Fatalf("EncodeDER: %v", err)
 	}
-	// ASN.1 tag 12 (0x0c) is UTF8String; tag 19 (0x13) is PrintableString.
-	if bytes.IndexByte(der, 0x13) != -1 {
-		t.Errorf("DN contains a PrintableString tag (0x13); every value must encode as UTF8String by default:\n% x", der)
-	}
-	if bytes.IndexByte(der, 0x0c) == -1 {
-		t.Errorf("DN contains no UTF8String tag (0x0c):\n% x", der)
+	for i, got := range attributeValues(t, der) {
+		if got.Tag != asn1.TagUTF8String || got.Class != asn1.ClassUniversal || got.IsCompound {
+			t.Errorf("attribute %d encoded with class %d tag %d (compound %v), want universal primitive tag %d (UTF8String):\n% x",
+				i, got.Class, got.Tag, got.IsCompound, asn1.TagUTF8String, der)
+		}
+		if len(got.FullBytes) == 0 || got.FullBytes[0] != 0x0c {
+			t.Errorf("attribute %d's value TLV starts with % x, want a 0x0c UTF8String tag byte:\n% x", i, got.FullBytes, der)
+		}
 	}
 }
 
 func TestEncodeDERHonorsExplicitStringType(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		stringType StringType
-		wantTag    byte
+		stringType  StringType
+		wantTag     int
+		wantTagByte byte
 	}{
-		{StringTypeUTF8, 0x0c},
-		{StringTypePrintable, 0x13},
-		{StringTypeIA5, 0x16},
+		{StringTypeUTF8, asn1.TagUTF8String, 0x0c},
+		{StringTypePrintable, asn1.TagPrintableString, 0x13},
+		{StringTypeIA5, asn1.TagIA5String, 0x16},
 	} {
-		oid, err := DNAttributeOID("commonName")
-		if err != nil {
-			t.Fatalf("DNAttributeOID: %v", err)
-		}
-		s := Subject{Attributes: []Attribute{{OID: oid, Value: "value", StringType: tc.stringType}}}
+		s := Subject{Attributes: []Attribute{
+			{OID: mustDNOID(t, "commonName"), Value: "value", StringType: tc.stringType},
+		}}
 		der, err := s.EncodeDER()
 		if err != nil {
 			t.Errorf("EncodeDER(%s): %v", tc.stringType, err)
 			continue
 		}
-		if bytes.IndexByte(der, tc.wantTag) == -1 {
-			t.Errorf("string type %s did not produce tag 0x%02x:\n% x", tc.stringType, tc.wantTag, der)
+		values := attributeValues(t, der)
+		if len(values) != 1 {
+			t.Errorf("%s: DN holds %d attribute values, want 1", tc.stringType, len(values))
+			continue
+		}
+		got := values[0]
+		if got.Tag != tc.wantTag || got.Class != asn1.ClassUniversal || got.IsCompound {
+			t.Errorf("string type %s encoded with class %d tag %d (compound %v), want universal primitive tag %d:\n% x",
+				tc.stringType, got.Class, got.Tag, got.IsCompound, tc.wantTag, der)
+		}
+		// And the tag byte really is the first byte of that value's TLV, not
+		// merely a byte somewhere in the DN.
+		if len(got.FullBytes) == 0 || got.FullBytes[0] != tc.wantTagByte {
+			t.Errorf("string type %s: value TLV starts with % x, want tag byte 0x%02x:\n% x", tc.stringType, got.FullBytes, tc.wantTagByte, der)
 		}
 	}
+}
+
+// attributeValues returns every DN attribute value's raw TLV, in wire order, so
+// a test can assert on a tag at the position the tag actually occupies.
+func attributeValues(t *testing.T, der []byte) []asn1.RawValue {
+	t.Helper()
+	var seq rawRDNSequence
+	rest, err := asn1.Unmarshal(der, &seq)
+	if err != nil {
+		t.Fatalf("emitted DN does not unmarshal as an RDNSequence: %v", err)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("%d trailing bytes after the emitted RDNSequence", len(rest))
+	}
+	var values []asn1.RawValue
+	for _, rdn := range seq {
+		for _, atv := range rdn {
+			values = append(values, atv.Value)
+		}
+	}
+	return values
 }
 
 // TestEncodeDERBMPAndT61UseCorrectUniversalTags pins the two string types the
