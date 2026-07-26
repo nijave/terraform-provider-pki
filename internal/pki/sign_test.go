@@ -655,13 +655,9 @@ func TestParseCertificateChainPEM(t *testing.T) {
 		t.Error("chain order was not preserved; leaf-adjacent must come first")
 	}
 	for label, in := range map[string][]byte{
-		"empty":        nil,
-		"not pem":      []byte("hello"),
-		"key in chain": EncodeCertificatePEM(root.Raw),
+		"empty":   nil,
+		"not pem": []byte("hello"),
 	} {
-		if label == "key in chain" {
-			continue // covered below with a real key block
-		}
 		if _, err := ParseCertificateChainPEM(in); err == nil {
 			t.Errorf("ParseCertificateChainPEM(%s) returned nil error, want an error", label)
 		}
