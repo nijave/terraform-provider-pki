@@ -4,8 +4,11 @@ package pki
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"math/big"
 	"strings"
 	"testing"
@@ -57,6 +60,30 @@ func desiredForCA(t *testing.T, ca *x509.Certificate) CertTemplate {
 		BasicConstraints: &BasicConstraints{CA: true, Critical: true},
 		KeyUsage:         DefaultCAKeyUsagePtr(),
 	}
+}
+
+// driftFields joins a drift slice's fields in reported order, so a test can
+// assert on the whole set at once rather than one entry at a time.
+func driftFields(drift []Drift) string {
+	fields := make([]string, 0, len(drift))
+	for _, d := range drift {
+		fields = append(fields, d.Field)
+	}
+	return strings.Join(fields, ",")
+}
+
+// selfSign issues tmpl as a self-signed certificate and parses it back.
+func selfSign(t *testing.T, tmpl CertTemplate, key crypto.Signer) *x509.Certificate {
+	t.Helper()
+	certPEM, err := CreateCertificate(tmpl, PublicKeyOf(key), nil, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	cert, err := ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatePEM: %v", err)
+	}
+	return cert
 }
 
 // TestCompareCertificateNoDriftOnAnUnchangedCertificate is the property that
@@ -454,9 +481,10 @@ func TestCompareCertificateSelfSignedIssuerCheck(t *testing.T) {
 
 // TestCompareCertificateNilCAOnACASignedCertificateIsDrift is what stops
 // TestCompareCertificateSelfSignedIssuerCheck from passing vacuously: that test
-// asserts no drift, so the nil-CA branch could be a no-op and it would still be
-// green. A CA-signed leaf compared with no CA is not self-signed, and the
-// self-signature check has to say so.
+// asserts no drift, so the nil-CA path could be a no-op and it would still be
+// green. A CA-signed leaf compared with no CA is not self-signed on either
+// count -- its issuer DN is not its subject DN, and its own key does not verify
+// its signature -- and both halves of the nil-CA path have to say so.
 func TestCompareCertificateNilCAOnACASignedCertificateIsDrift(t *testing.T) {
 	t.Parallel()
 	leaf, key, _ := testLeaf(t)
@@ -466,8 +494,226 @@ func TestCompareCertificateNilCAOnACASignedCertificateIsDrift(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompareCertificate: %v", err)
 	}
-	if len(drift) != 1 || drift[0].Field != "signature" {
-		t.Fatalf("drift = %v, want exactly one entry for \"signature\"", drift)
+	if got := driftFields(drift); got != "issuer,signature" {
+		t.Fatalf("drift = %v (fields %q), want entries for \"issuer\" and \"signature\"", drift, got)
+	}
+}
+
+// TestCompareCertificateSelfSignedNonCAReportsNoDrift covers the first
+// non-converging false positive that x509.CheckSignatureFrom would produce.
+//
+// It enforces RFC 5280's issuer constraints before verifying any cryptography,
+// so a self-signed certificate whose basicConstraints says ca = false fails it
+// with "parent certificate cannot sign this kind of certificate" -- reported as
+// signature drift on a certificate that matches its template byte for byte. The
+// replacement would carry the same basicConstraints and drift again on the next
+// plan, forever. ca is user-settable per spec section 6.3, so this is reachable
+// from ordinary HCL.
+func TestCompareCertificateSelfSignedNonCAReportsNoDrift(t *testing.T) {
+	t.Parallel()
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	tmpl := CertTemplate{
+		Subject:          NamedSubject{CommonName: "self-signed-non-ca"}.Expand(),
+		Serial:           big.NewInt(1),
+		NotBefore:        time.Now().Add(-time.Hour).Truncate(time.Second),
+		NotAfter:         time.Now().Add(time.Hour).Truncate(time.Second),
+		BasicConstraints: &BasicConstraints{CA: false, Critical: true},
+		KeyUsage:         DefaultLeafKeyUsagePtr(),
+	}
+	cert := selfSign(t, tmpl, key)
+
+	drift, err := CompareCertificate(CompareInput{
+		Desired: tmpl, DesiredPublicKey: PublicKeyOf(key), Actual: cert, CA: nil,
+	})
+	if err != nil {
+		t.Fatalf("CompareCertificate: %v", err)
+	}
+	if len(drift) != 0 {
+		t.Fatalf("a self-signed non-CA reported drift against its own template: %v", drift)
+	}
+}
+
+// TestCompareCertificateSelfSignedCAWithoutKeyCertSignReportsNoDrift covers the
+// second one. x509.CheckSignatureFrom also rejects an issuer whose keyUsage
+// omits keyCertSign, so a CA configured with only crlSign would drift forever
+// against a template it reproduces exactly. key_usage is user-settable per spec
+// section 6.3.
+func TestCompareCertificateSelfSignedCAWithoutKeyCertSignReportsNoDrift(t *testing.T) {
+	t.Parallel()
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	tmpl := CertTemplate{
+		Subject:          NamedSubject{CommonName: "crl-only-ca"}.Expand(),
+		Serial:           big.NewInt(1),
+		NotBefore:        time.Now().Add(-time.Hour).Truncate(time.Second),
+		NotAfter:         time.Now().Add(time.Hour).Truncate(time.Second),
+		BasicConstraints: &BasicConstraints{CA: true, Critical: true},
+		KeyUsage:         &KeyUsage{Usages: []string{"crlSign"}, Critical: true},
+	}
+	cert := selfSign(t, tmpl, key)
+
+	drift, err := CompareCertificate(CompareInput{
+		Desired: tmpl, DesiredPublicKey: PublicKeyOf(key), Actual: cert, CA: nil,
+	})
+	if err != nil {
+		t.Fatalf("CompareCertificate: %v", err)
+	}
+	if len(drift) != 0 {
+		t.Fatalf("a CA without keyCertSign reported drift against its own template: %v", drift)
+	}
+}
+
+// TestCompareCertificateAcceptsASHA1SignedChain is the SHA-1 half of the
+// "unverifiable is not drift" requirement, and it lands better than an error:
+// after the move off x509.CheckSignatureFrom, an adopted SHA-1 chain reports
+// nothing at all.
+//
+// Certificate.CheckSignature passes allowSHA1 = true to crypto/x509's internal
+// checkSignature, while CheckSignatureFrom passes false -- so the same
+// certificate that CheckSignatureFrom rejects with
+// "x509: cannot verify signature: insecure algorithm SHA1-RSA" verifies cleanly
+// through CheckSignature. No drift and no error is the correct outcome, since
+// nothing about the certificate's content has changed; forcing even one reissue
+// here would be one device re-enrollment for byte-identical content.
+//
+// sign.go refuses SHA-1 at issuance, so the fixture is built with crypto/x509
+// directly.
+func TestCompareCertificateAcceptsASHA1SignedChain(t *testing.T) {
+	t.Parallel()
+	caKey, err := GenerateKey(KeyParams{Algorithm: AlgorithmRSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	ca := selfSign(t, CertTemplate{
+		Subject:          NamedSubject{CommonName: "sha1-era-ca", Organization: "homelab"}.Expand(),
+		Serial:           big.NewInt(1),
+		NotBefore:        time.Now().Add(-time.Hour).Truncate(time.Second),
+		NotAfter:         time.Now().Add(24 * time.Hour).Truncate(time.Second),
+		BasicConstraints: &BasicConstraints{CA: true, Critical: true},
+		KeyUsage:         DefaultCAKeyUsagePtr(),
+	}, caKey)
+
+	leafKey, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	desired := CertTemplate{
+		Subject:          NamedSubject{CommonName: "adopted-sha1-leaf"}.Expand(),
+		Serial:           big.NewInt(2),
+		NotBefore:        time.Now().Add(-time.Hour).Truncate(time.Second),
+		NotAfter:         time.Now().Add(24 * time.Hour).Truncate(time.Second),
+		BasicConstraints: &BasicConstraints{CA: false, Critical: true},
+		KeyUsage:         DefaultLeafKeyUsagePtr(),
+	}
+	rawSubject, err := desired.Subject.EncodeDER()
+	if err != nil {
+		t.Fatalf("EncodeDER: %v", err)
+	}
+	exts, err := desired.Extensions(PublicKeyOf(leafKey))
+	if err != nil {
+		t.Fatalf("Extensions: %v", err)
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber:       desired.Serial,
+		RawSubject:         rawSubject,
+		NotBefore:          desired.NotBefore,
+		NotAfter:           desired.NotAfter,
+		SignatureAlgorithm: x509.SHA1WithRSA,
+		ExtraExtensions:    exts,
+	}, ca, PublicKeyOf(leafKey), caKey)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate: %v", err)
+	}
+	if leaf.SignatureAlgorithm != x509.SHA1WithRSA {
+		t.Fatalf("fixture signature algorithm is %v, want %v; this test would prove nothing",
+			leaf.SignatureAlgorithm, x509.SHA1WithRSA)
+	}
+
+	drift, err := CompareCertificate(CompareInput{
+		Desired: desired, DesiredPublicKey: PublicKeyOf(leafKey), Actual: leaf, CA: ca,
+	})
+	if err != nil {
+		t.Fatalf("CompareCertificate on a SHA-1 chain: %v", err)
+	}
+	if len(drift) != 0 {
+		t.Fatalf("a SHA-1 signed chain reported drift on unchanged content: %v", drift)
+	}
+}
+
+// TestCompareCertificateReportsAnUnverifiableSignatureAsAnError is the other
+// half: a signature whose algorithm crypto/x509 refuses outright is an error,
+// not drift, following the same rule an EncodeDER failure gets. Reporting it as
+// drift would force a reissue -- one device re-enrollment -- for content that is
+// byte-identical.
+//
+// MD5 is the reachable trigger: checkSignature returns InsecureAlgorithmError
+// for it unconditionally, with no allowSHA1-style exemption.
+func TestCompareCertificateReportsAnUnverifiableSignatureAsAnError(t *testing.T) {
+	t.Parallel()
+	// crypto/x509 will not sign with MD5 ("x509: signing with MD5 is not
+	// supported"), so the fixture is made by rewriting the signature algorithm
+	// OID of a real SHA-256 certificate. sha256WithRSAEncryption
+	// (1.2.840.113549.1.1.11) and md5WithRSAEncryption (1.2.840.113549.1.1.4)
+	// encode to the same nine bytes but for the last, so the substitution is
+	// length-preserving; both copies are rewritten -- the TBSCertificate's and
+	// the outer one -- leaving the certificate internally consistent. The
+	// signature no longer matches, which is immaterial: MD5 is refused before
+	// any hashing happens, and that refusal is the whole subject of this test.
+	caKey, err := GenerateKey(KeyParams{Algorithm: AlgorithmRSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	desired := CertTemplate{
+		Subject:          NamedSubject{CommonName: "md5-era-ca", Organization: "homelab"}.Expand(),
+		Serial:           big.NewInt(1),
+		NotBefore:        time.Now().Add(-time.Hour).Truncate(time.Second),
+		NotAfter:         time.Now().Add(24 * time.Hour).Truncate(time.Second),
+		BasicConstraints: &BasicConstraints{CA: true, Critical: true},
+		KeyUsage:         DefaultCAKeyUsagePtr(),
+	}
+	certPEM, err := CreateCertificate(desired, PublicKeyOf(caKey), nil, caKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		t.Fatal("pem.Decode returned no block")
+	}
+
+	sha256WithRSA := []byte{0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b}
+	md5WithRSA := []byte{0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x04}
+	if n := bytes.Count(block.Bytes, sha256WithRSA); n != 2 {
+		t.Fatalf("found the sha256WithRSAEncryption OID %d times, want 2; the fixture would prove nothing", n)
+	}
+	cert, err := x509.ParseCertificate(bytes.ReplaceAll(block.Bytes, sha256WithRSA, md5WithRSA))
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate of the patched DER: %v", err)
+	}
+	if cert.SignatureAlgorithm != x509.MD5WithRSA {
+		t.Fatalf("fixture signature algorithm is %v, want %v; this test would prove nothing",
+			cert.SignatureAlgorithm, x509.MD5WithRSA)
+	}
+
+	drift, err := CompareCertificate(CompareInput{
+		Desired: desired, DesiredPublicKey: PublicKeyOf(caKey), Actual: cert, CA: nil,
+	})
+	if err == nil {
+		t.Fatalf("an unverifiable signature returned drift %v and a nil error, want an error", drift)
+	}
+	if len(drift) != 0 {
+		t.Errorf("drift = %v, want no drift alongside the error", drift)
+	}
+	if !strings.Contains(err.Error(), "MD5") {
+		t.Errorf("err = %v, want it to name the algorithm that could not be verified", err)
 	}
 }
 

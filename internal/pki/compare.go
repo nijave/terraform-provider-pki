@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -64,11 +65,12 @@ type CompareInput struct {
 // extensions, issuer, signature -- so a plan explanation reads the same way
 // twice. Nothing here iterates a map.
 //
-// A missing Actual or DesiredPublicKey is an error rather than drift, and so is
-// a desired subject that cannot be encoded: see the checks below for why each
-// distinction matters. The rule throughout is that an input this function
-// cannot evaluate is reported as such, never as a difference, because a
-// difference means a replacement and a replacement means re-enrolling a device.
+// A missing Actual or DesiredPublicKey is an error rather than drift, and so are
+// a desired subject that cannot be encoded and a signature whose algorithm
+// crypto/x509 refuses to verify: see the checks below for why each distinction
+// matters. The rule throughout is that an input this function cannot evaluate is
+// reported as such, never as a difference, because a difference means a
+// replacement and a replacement means re-enrolling a device.
 func CompareCertificate(in CompareInput) ([]Drift, error) {
 	if in.Actual == nil {
 		// A caller with no certificate to compare has a bug, not a diff.
@@ -165,7 +167,11 @@ func CompareCertificate(in CompareInput) ([]Drift, error) {
 	}
 	drift = append(drift, compareExtensions(desiredExts, in.Actual.Extensions)...)
 
-	drift = append(drift, compareIssuer(in)...)
+	issuerDrift, err := compareIssuer(in)
+	if err != nil {
+		return nil, err
+	}
+	drift = append(drift, issuerDrift...)
 
 	return drift, nil
 }
@@ -244,44 +250,76 @@ func compareExtensions(desired, actual []pkix.Extension) []Drift {
 	return drift
 }
 
-// compareIssuer checks the certificate against the configured CA: its issuer DN
-// and its signature. A nil CA means the certificate is expected to be
-// self-signed, so the signature is checked against the certificate itself --
-// which is a real check, not a formality: a CA-signed certificate compared with
-// no CA fails it, as it should.
-func compareIssuer(in CompareInput) []Drift {
-	if in.CA == nil {
-		if err := in.Actual.CheckSignatureFrom(in.Actual); err != nil {
-			return []Drift{{
-				Field: "signature",
-				Want:  "a valid self-signature",
-				Got:   err.Error(),
-			}}
-		}
-		return nil
+// compareIssuer checks the certificate against the configured CA: its issuer DN,
+// and the cryptography of its signature.
+//
+// It deliberately does NOT use x509.CheckSignatureFrom, which enforces issuer
+// *constraints* -- the basicConstraints cA bit and the keyCertSign key usage --
+// before verifying anything cryptographic, and so fails for reasons that have
+// nothing to do with whether the signature matches. Both constraints are
+// user-settable on pki_certificate_authority (spec section 6.3), so two ordinary
+// configurations reach it: a self-signed certificate with ca = false, and a
+// self-signed CA whose key_usage omits keyCertSign. Either would report
+// signature drift while matching its template byte for byte, and neither
+// converges -- the replacement is constrained identically and drifts again on the
+// next plan. An endless replacement loop for a 20-year CA is the worst outcome
+// this file exists to prevent. Whether a certificate is fit to *be* a CA is a
+// validation question, not a drift question.
+//
+// "Self-signed" is therefore structural here: the issuer DN equals the subject
+// DN, and the certificate's own key verifies its signature.
+//
+// The DN is compared as DER in its own right, because signature verification
+// never looks at names: a second CA holding the same key under a different DN
+// would otherwise pass unnoticed. And the signature is checked as well as the
+// DN, because two CAs can share a DN and hold different keys, which the DN
+// comparison cannot see.
+func compareIssuer(in CompareInput) ([]Drift, error) {
+	// A nil CA means the certificate is expected to be self-signed, so it is its
+	// own issuer and its own signer.
+	signer := in.CA
+	if signer == nil {
+		signer = in.Actual
 	}
 
 	var drift []Drift
-	// The DN is compared as DER rather than through CheckSignatureFrom, which
-	// never looks at names: a second CA holding the same key under a different
-	// DN would otherwise pass unnoticed.
-	if !bytes.Equal(in.CA.RawSubject, in.Actual.RawIssuer) {
+	if !bytes.Equal(signer.RawSubject, in.Actual.RawIssuer) {
 		drift = append(drift, Drift{
 			Field: "issuer",
-			Want:  describeRawDN(in.CA.RawSubject, in.CA.Subject),
+			Want:  describeRawDN(signer.RawSubject, signer.Subject),
 			Got:   describeRawDN(in.Actual.RawIssuer, in.Actual.Issuer),
 		})
 	}
-	// And the signature is checked as well as the DN, because two CAs can share
-	// a DN and hold different keys, which the DN comparison cannot see.
-	if err := in.Actual.CheckSignatureFrom(in.CA); err != nil {
-		drift = append(drift, Drift{
-			Field: "signature",
-			Want:  "a signature verifiable with the configured CA certificate",
-			Got:   err.Error(),
-		})
+
+	// CheckSignature verifies the cryptography and nothing else. It is called on
+	// the issuer, whose public key is the one that signed Actual.
+	err := signer.CheckSignature(in.Actual.SignatureAlgorithm, in.Actual.RawTBSCertificate, in.Actual.Signature)
+	if err == nil {
+		return drift, nil
 	}
-	return drift
+
+	// A signature this package cannot evaluate is an error, not a diff -- the
+	// same rule EncodeDER gets above. crypto/x509 refuses MD5 outright
+	// (checkSignature returns InsecureAlgorithmError before hashing anything), and
+	// an adopted certificate from an old issuer may well carry one. Reporting
+	// that as drift would force a reissue, and therefore a device re-enrollment,
+	// for content that is byte-identical; returning the error names the algorithm
+	// so the operator gets a real finding about the adopted material instead.
+	//
+	// SHA-1 does not reach here. Certificate.CheckSignature passes allowSHA1 =
+	// true, unlike CheckSignatureFrom, so an adopted SHA-1 chain verifies
+	// normally and reports nothing at all -- which is the right answer, since
+	// nothing about its content has changed.
+	var insecure x509.InsecureAlgorithmError
+	if errors.As(err, &insecure) {
+		return nil, fmt.Errorf("the certificate's signature cannot be verified: %w", err)
+	}
+
+	want := "a signature verifiable with the configured CA certificate"
+	if in.CA == nil {
+		want = "a valid self-signature"
+	}
+	return append(drift, Drift{Field: "signature", Want: want, Got: err.Error()}), nil
 }
 
 // extensionField names an extension in a Drift. The dotted OID is used so the
