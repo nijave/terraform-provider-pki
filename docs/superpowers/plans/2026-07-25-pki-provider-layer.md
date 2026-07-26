@@ -199,12 +199,12 @@ import (
 	"github.com/nijave/terraform-provider-pki/internal/provider"
 )
 
-// Generate the documentation. Run from the tools module so tfplugindocs and its
-// dependency graph stay out of this module's go.sum:
-//
-//	make docs
-//
-//go:generate echo "run 'make docs' -- generation lives in the tools module"
+// Documentation is generated from the tools module, which keeps tfplugindocs'
+// dependency graph out of this module's go.sum. There is deliberately no
+// //go:generate directive here: `go generate ./...` at the repo root does not
+// descend into a nested module, so the directive would either be a no-op or
+// duplicate the tools module's work. `make docs` is the entry point, and CI
+// runs it followed by a git diff.
 
 var (
 	// version and commit are set by goreleaser's ldflags.
@@ -5390,7 +5390,7 @@ Keep the `{{ .SchemaMarkdown }}` and example blocks the default template provide
 
 - [ ] **Step 2: Fix the generate wiring**
 
-Task 1 left `main.go` with a placeholder `//go:generate echo`. Replace it now that the tools module exists:
+Task 1 already wrote the correct comment in `main.go` explaining that generation lives in the tools module and why there is no `//go:generate` directive. Verify it is still accurate and matches this:
 
 ```go
 // Documentation is generated from the tools module, which keeps tfplugindocs'
