@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -275,6 +276,58 @@ func TestNameConstraintsRejectsBadInput(t *testing.T) {
 	} {
 		if _, err := nc.Extension(); err == nil {
 			t.Errorf("Extension(%s) returned nil error, want an error", label)
+		}
+	}
+}
+
+// TestNameConstraintsRejectsIPv4MappedIPv6CIDR covers the one CIDR form that
+// cannot round-trip, and so would show as a diff that never converges.
+//
+// "::ffff:10.0.0.0/104" encodes as a 32-byte IPv6 subtree, but net.IPNet.String()
+// collapses 4-in-6 when rendering it back, giving "10.0.0.0/8", which re-encodes
+// as an 8-byte IPv4 subtree. Encode -> parse -> encode therefore changes the
+// bytes, and a configuration written in the mapped form would replan forever.
+// Rejecting it at encode time, naming the plain form to write instead, is the
+// only outcome that converges.
+func TestNameConstraintsRejectsIPv4MappedIPv6CIDR(t *testing.T) {
+	t.Parallel()
+	_, err := NameConstraints{PermittedIPRanges: []string{"::ffff:10.0.0.0/104"}, Critical: true}.Extension()
+	if err == nil {
+		t.Fatal("Extension accepted an IPv4-mapped IPv6 CIDR, which does not round-trip")
+	}
+	// The operator has to be told what to write instead, not merely that this is
+	// wrong.
+	if !strings.Contains(err.Error(), "10.0.0.0/8") {
+		t.Errorf("error = %q, want it to name the plain IPv4 form 10.0.0.0/8", err)
+	}
+	if _, err := (NameConstraints{ExcludedIPRanges: []string{"::ffff:192.168.1.0/120"}, Critical: true}).Extension(); err == nil {
+		t.Fatal("Extension accepted an IPv4-mapped IPv6 CIDR in the excluded subtrees")
+	}
+
+	// Every other form is idempotent under encode -> parse -> encode and must
+	// stay accepted: the check is on 4-in-6 specifically, not on IPv6.
+	for _, cidr := range []string{"10.0.0.0/8", "fd00::/8", "0.0.0.0/0", "::/0"} {
+		ext, err := NameConstraints{PermittedIPRanges: []string{cidr}, Critical: true}.Extension()
+		if err != nil {
+			t.Errorf("Extension(%q): %v", cidr, err)
+			continue
+		}
+		back, err := ParseNameConstraints(ext)
+		if err != nil {
+			t.Errorf("ParseNameConstraints(%q): %v", cidr, err)
+			continue
+		}
+		if len(back.PermittedIPRanges) != 1 || back.PermittedIPRanges[0] != cidr {
+			t.Errorf("%q round-tripped to %v, want [%s]", cidr, back.PermittedIPRanges, cidr)
+			continue
+		}
+		again, err := back.Extension()
+		if err != nil {
+			t.Errorf("re-encoding %q: %v", cidr, err)
+			continue
+		}
+		if !bytes.Equal(again.Value, ext.Value) {
+			t.Errorf("%q re-encodes to different bytes, so it would show a perpetual diff", cidr)
 		}
 	}
 }

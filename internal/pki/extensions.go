@@ -323,7 +323,9 @@ func ParseExtKeyUsage(ext pkix.Extension) (ExtKeyUsage, error) {
 //
 // IP ranges are CIDR strings; the other three are the GeneralName forms
 // described in RFC 5280 4.2.1.10, where a leading dot on a DNS name or URI
-// constrains subdomains.
+// constrains subdomains. An IPv4-mapped IPv6 CIDR such as "::ffff:10.0.0.0/104"
+// is rejected in favour of the plain IPv4 form, for the reason ipRangeBytes
+// gives.
 type NameConstraints struct {
 	PermittedDNSDomains   []string
 	ExcludedDNSDomains    []string
@@ -441,10 +443,25 @@ func subtreeOf(tag int, bytes []byte) generalSubtree {
 // net.ParseCIDR rejects a bare address, so "10.0.0.1" is an error rather than
 // a silent /32. The masked network address is used, so host bits in the
 // configured value are normalized away rather than written to the certificate.
+//
+// An IPv4-mapped IPv6 CIDR is rejected because it is the one form that cannot
+// round-trip. "::ffff:10.0.0.0/104" encodes here as a 32-byte IPv6 subtree, but
+// ipRangeString renders it back through net.IPNet.String(), which collapses
+// 4-in-6 to "10.0.0.0/8" -- and that re-encodes as an 8-byte IPv4 subtree. The
+// bytes therefore change across encode -> parse -> encode, which for this
+// provider means a plan that never converges. Plain IPv4 and plain IPv6 forms,
+// including "0.0.0.0/0" and "::/0", are all idempotent.
 func ipRangeBytes(cidr string) ([]byte, error) {
 	_, network, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return nil, fmt.Errorf("parsing CIDR: %w", err)
+	}
+	if len(network.IP) == net.IPv6len && network.IP.To4() != nil {
+		// The mask is at least /96 whenever To4 still succeeds after masking --
+		// a shorter prefix zeroes the 0xffff marker and To4 returns nil -- so
+		// the last four mask bytes are the equivalent IPv4 mask.
+		plain := net.IPNet{IP: network.IP.To4(), Mask: net.IPMask(network.Mask[12:])}
+		return nil, fmt.Errorf("IPv4-mapped IPv6 CIDR does not round-trip through the iPAddress encoding; write it as %s", plain.String())
 	}
 	if len(network.IP) != len(network.Mask) {
 		return nil, fmt.Errorf("address is %d bytes but mask is %d", len(network.IP), len(network.Mask))
