@@ -4,7 +4,9 @@ package pki
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"strings"
 	"testing"
@@ -266,6 +268,152 @@ func TestEncodeBundleRejectsAPasswordOnUnencryptableFormats(t *testing.T) {
 	} {
 		if _, err := EncodeBundle(tc.in); err != nil {
 			t.Errorf("EncodeBundle(%s) without a password: %v", tc.format, err)
+		}
+	}
+}
+
+// TestEncodeBundleErrorsNameAttributesWithoutEchoingKeys pins both halves of this
+// file's error discipline at once, over every rejected input EncodeBundle has.
+//
+// The naming half: a bundle error surfaces in a `tofu plan` diagnostic with no
+// stack trace and no line number, so "requires a certificate" leaves the operator
+// choosing between certificate_pem, private_key_pem and chain_pem by guesswork.
+// TestEncodeBundleRejectsAPasswordOnUnencryptableFormats already held the password
+// errors to this standard; the missing-certificate and key-mismatch errors were
+// the ones that did not name anything, which is what this test closes.
+//
+// The no-echo half is the harder constraint and the reason the two are asserted
+// together rather than in separate tests: the natural way to make an error more
+// helpful is to show the value that was wrong, and for private_key_pem that would
+// write key material into a plan log. Every case below therefore carries a real
+// key, and the error is checked against that key's PEM, its base64 body, and its
+// raw DER. Splitting the two assertions would let a future "helpful" error pass
+// the naming test while leaking.
+func TestEncodeBundleErrorsNameAttributesWithoutEchoingKeys(t *testing.T) {
+	t.Parallel()
+	leaf, leafKey, ca := testLeaf(t)
+	otherKey, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	for label, tc := range map[string]struct {
+		in   BundleInput
+		want []string
+	}{
+		"nothing to encode": {
+			BundleInput{Format: FormatPEM},
+			[]string{"certificate_pem", "private_key_pem", "chain_pem"},
+		},
+		"unknown format": {
+			BundleInput{Format: "pkcs11", Certificate: leaf},
+			[]string{"format"},
+		},
+		// encodeDER checks for a missing certificate before it checks for an
+		// unencodable private key, so these two inputs reach different branches
+		// and both are listed.
+		"der without a certificate": {
+			BundleInput{Format: FormatDER, PrivateKey: leafKey},
+			[]string{"certificate_pem"},
+		},
+		"der with a key": {
+			BundleInput{Format: FormatDER, Certificate: leaf, PrivateKey: leafKey},
+			[]string{"private_key_pem"},
+		},
+		"der with a chain": {
+			BundleInput{Format: FormatDER, Certificate: leaf, Chain: []*x509.Certificate{ca}},
+			[]string{"chain_pem"},
+		},
+		"pkcs7 with a key": {
+			BundleInput{Format: FormatPKCS7, Certificate: leaf, PrivateKey: leafKey},
+			[]string{"private_key_pem"},
+		},
+		"pkcs12 key without a certificate": {
+			BundleInput{Format: FormatPKCS12, PrivateKey: leafKey, Password: testPassword},
+			[]string{"certificate_pem", "private_key_pem"},
+		},
+		"pkcs12 mismatched key": {
+			BundleInput{Format: FormatPKCS12, Certificate: leaf, PrivateKey: otherKey, Password: testPassword},
+			[]string{"certificate_pem", "private_key_pem"},
+		},
+		"pkcs12 without a password": {
+			BundleInput{Format: FormatPKCS12, Certificate: leaf, PrivateKey: leafKey},
+			[]string{"password_wo", "pkcs12_encoding"},
+		},
+		"jks key without a certificate": {
+			BundleInput{Format: FormatJKS, PrivateKey: leafKey, Password: testPassword},
+			[]string{"certificate_pem", "private_key_pem"},
+		},
+		"jks mismatched key": {
+			BundleInput{Format: FormatJKS, Certificate: leaf, PrivateKey: otherKey, Password: testPassword},
+			[]string{"certificate_pem", "private_key_pem"},
+		},
+		"jks short password": {
+			BundleInput{Format: FormatJKS, Certificate: leaf, PrivateKey: leafKey, Password: "12345"},
+			[]string{"password_wo"},
+		},
+	} {
+		out, err := EncodeBundle(tc.in)
+		if err == nil {
+			t.Errorf("EncodeBundle(%s) returned %d bytes and no error", label, len(out))
+			continue
+		}
+		msg := err.Error()
+		for _, want := range tc.want {
+			if !strings.Contains(msg, want) {
+				t.Errorf("EncodeBundle(%s) error = %q, want it to name %q", label, msg, want)
+			}
+		}
+		assertNoKeyMaterial(t, label, msg, leafKey, otherKey)
+	}
+}
+
+// assertNoKeyMaterial fails when msg contains any encoding of any of the given
+// keys.
+//
+// Both PEM encodings are checked, and both matter: EncodePrivateKeyPEM emits SEC1
+// for an ECDSA key while EncodePrivateKeyPKCS8DER emits PKCS#8, so their base64
+// bodies share no long substring and checking one would miss a leak of the other.
+// Each body is then checked in fixed-length slices rather than whole, because a
+// message that quoted a single wrapped line of a key -- or truncated it, the way
+// hexPreview in compare.go deliberately does for extension values -- would still
+// be a leak, and comparing whole bodies would not see it.
+func assertNoKeyMaterial(t *testing.T, label, msg string, keys ...crypto.Signer) {
+	t.Helper()
+	for i, key := range keys {
+		pkcs8, err := EncodePrivateKeyPKCS8DER(key)
+		if err != nil {
+			t.Fatalf("EncodePrivateKeyPKCS8DER: %v", err)
+		}
+		keyPEM, err := EncodePrivateKeyPEM(key)
+		if err != nil {
+			t.Fatalf("EncodePrivateKeyPEM: %v", err)
+		}
+		nativeBlock, _ := pem.Decode(keyPEM)
+		if nativeBlock == nil {
+			t.Fatalf("EncodePrivateKeyPEM did not produce a PEM block, so this test would check nothing")
+		}
+
+		for form, der := range map[string][]byte{"PKCS#8": pkcs8, nativeBlock.Type: nativeBlock.Bytes} {
+			if strings.Contains(msg, string(der)) {
+				t.Errorf("EncodeBundle(%s) error echoes key %d's raw %s DER: %q", label, i, form, msg)
+			}
+			b64 := base64.StdEncoding.EncodeToString(der)
+			// Every 16-character window, stepped one character at a time -- not
+			// every 16th window. A stride equal to the window length only catches
+			// a leak that happens to be aligned to it: measured during this
+			// change, an error echoing 32 characters starting mid-line contained
+			// no whole 24-aligned run and slipped past a strided check. 16 base64
+			// characters is 12 bytes of key, far past any chance of a
+			// coincidental match, and the whole loop is a few hundred substring
+			// searches over a one-line message.
+			const window = 16
+			for start := 0; start+window <= len(b64); start++ {
+				if strings.Contains(msg, b64[start:start+window]) {
+					t.Errorf("EncodeBundle(%s) error echoes key %d's %s base64 body at offset %d: %q", label, i, form, start, msg)
+					break
+				}
+			}
 		}
 	}
 }

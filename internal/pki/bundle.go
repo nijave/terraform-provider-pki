@@ -128,9 +128,20 @@ type BundleInput struct {
 // An input with nothing to encode is rejected: every field is individually
 // optional, but a bundle encoding nothing is never meaningful, regardless of
 // format.
+//
+// Every error this file returns names the schema attribute the operator has to
+// edit -- certificate_pem, private_key_pem, chain_pem, format, pkcs12_encoding,
+// password_wo -- rather than only the internal field. A bundle error is read in
+// a `tofu plan` diagnostic with no stack trace and no line number attached to
+// it, so an error that says only "requires a certificate" leaves the operator
+// guessing which of three certificate-shaped attributes it meant. None of them
+// ever includes an attribute *value*: private_key_pem is the whole problem this
+// package's error discipline exists for, and there is nothing an operator gains
+// from seeing key bytes echoed into a log that a device-facing attacker does not
+// gain more from. See TestEncodeBundleErrorsNameAttributesWithoutEchoingKeys.
 func EncodeBundle(in BundleInput) ([]byte, error) {
 	if in.Certificate == nil && in.PrivateKey == nil && len(in.Chain) == 0 {
-		return nil, fmt.Errorf("bundle has nothing to encode: certificate, private key, and chain are all absent")
+		return nil, fmt.Errorf("bundle has nothing to encode: set at least one of certificate_pem, private_key_pem, or chain_pem")
 	}
 
 	switch in.Format {
@@ -145,8 +156,21 @@ func EncodeBundle(in BundleInput) ([]byte, error) {
 	case FormatJKS:
 		return encodeJKS(in)
 	default:
-		return nil, fmt.Errorf("unknown bundle format %q", in.Format)
+		return nil, fmt.Errorf("unknown bundle format %q: set format to one of %v", in.Format, Formats())
 	}
+}
+
+// formatsCarrying renders a "choose format ..." fragment for an error, listing
+// the formats that can hold whatever the caller asked the current format to
+// hold. It exists so the two data-loss messages below (a private key or a chain
+// handed to a format with nowhere to put it) name the alternatives rather than
+// only the refusal, and so that list stays in one place per capability.
+func formatsCarrying(fs ...Format) string {
+	quoted := make([]string, len(fs))
+	for i, f := range fs {
+		quoted[i] = fmt.Sprintf("%q", f)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 // rejectPassword refuses a non-empty Password for a format that cannot encrypt
@@ -204,13 +228,15 @@ func encodeDER(in BundleInput) ([]byte, error) {
 		return nil, err
 	}
 	if in.Certificate == nil {
-		return nil, fmt.Errorf("der bundle requires a certificate")
+		return nil, fmt.Errorf("der bundle requires a certificate: set certificate_pem")
 	}
 	if in.PrivateKey != nil {
-		return nil, fmt.Errorf("der bundle cannot carry a private key")
+		return nil, fmt.Errorf("der bundle cannot carry a private key: clear private_key_pem, or choose format %s",
+			formatsCarrying(FormatPEM, FormatPKCS12, FormatJKS))
 	}
 	if len(in.Chain) != 0 {
-		return nil, fmt.Errorf("der bundle cannot carry a chain")
+		return nil, fmt.Errorf("der bundle cannot carry a chain: clear chain_pem, or choose format %s",
+			formatsCarrying(FormatPEM, FormatPKCS7, FormatPKCS12, FormatJKS))
 	}
 	return in.Certificate.Raw, nil
 }
@@ -232,7 +258,8 @@ func encodePKCS7(in BundleInput) ([]byte, error) {
 		return nil, err
 	}
 	if in.PrivateKey != nil {
-		return nil, fmt.Errorf("pkcs7 bundle cannot carry a private key")
+		return nil, fmt.Errorf("pkcs7 bundle cannot carry a private key: clear private_key_pem, or choose format %s",
+			formatsCarrying(FormatPEM, FormatPKCS12, FormatJKS))
 	}
 
 	var der bytes.Buffer
@@ -304,10 +331,10 @@ func encodePKCS12(in BundleInput) ([]byte, error) {
 		return encodePKCS12TrustStore(encoder, in)
 	}
 	if in.Certificate == nil {
-		return nil, fmt.Errorf("pkcs12 bundle with a private key requires a certificate: a keystore entry pairs the key with one specific certificate")
+		return nil, fmt.Errorf("pkcs12 bundle with a private key requires a certificate: set certificate_pem, or clear private_key_pem to build a truststore -- a keystore entry pairs the key with one specific certificate")
 	}
 	if !PublicKeysEqual(PublicKeyOf(in.PrivateKey), in.Certificate.PublicKey) {
-		return nil, fmt.Errorf("pkcs12 bundle private key does not match the certificate's public key")
+		return nil, fmt.Errorf("pkcs12 bundle private key does not match the certificate's public key: point private_key_pem and certificate_pem at the same device's key pair")
 	}
 
 	// go-pkcs12 accepts a crypto.Signer for RSA, ECDSA, and Ed25519 alike, so
@@ -424,10 +451,10 @@ func trustStoreAliases(friendlyName string, certs []*x509.Certificate) []string 
 // protection, which is exactly why its path is held to full determinism.
 func encodeJKS(in BundleInput) ([]byte, error) {
 	if len(in.Password) < 6 {
-		return nil, fmt.Errorf("jks bundle requires a password of at least 6 characters")
+		return nil, fmt.Errorf("jks bundle requires a password of at least 6 characters: set password_wo to a longer value")
 	}
 	if in.PrivateKey != nil && in.Certificate == nil {
-		return nil, fmt.Errorf("jks bundle with a private key requires a certificate: a keystore entry pairs the key with one specific certificate")
+		return nil, fmt.Errorf("jks bundle with a private key requires a certificate: set certificate_pem, or clear private_key_pem to build a truststore -- a keystore entry pairs the key with one specific certificate")
 	}
 
 	// creationTime is a fixed value derived from the input, never time.Now():
@@ -447,7 +474,7 @@ func encodeJKS(in BundleInput) ([]byte, error) {
 		// PrivateKey alone to be set, which is exactly the case that guard
 		// catches first. Kept anyway so this function stays correct if that
 		// ordering ever changes.
-		return nil, fmt.Errorf("jks bundle requires a certificate or a chain entry")
+		return nil, fmt.Errorf("jks bundle requires a certificate or a chain entry: set certificate_pem or chain_pem")
 	}
 
 	// WithOrderedAliases makes Aliases() -- and therefore Store()'s entry
@@ -463,7 +490,7 @@ func encodeJKS(in BundleInput) ([]byte, error) {
 
 	if in.PrivateKey != nil {
 		if !PublicKeysEqual(PublicKeyOf(in.PrivateKey), in.Certificate.PublicKey) {
-			return nil, fmt.Errorf("jks bundle private key does not match the certificate's public key")
+			return nil, fmt.Errorf("jks bundle private key does not match the certificate's public key: point private_key_pem and certificate_pem at the same device's key pair")
 		}
 		keyDER, err := EncodePrivateKeyPKCS8DER(in.PrivateKey)
 		if err != nil {
