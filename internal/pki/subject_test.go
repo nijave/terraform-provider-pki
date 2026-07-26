@@ -115,6 +115,35 @@ func TestNamedSubjectExpandAppendsExtraAttributes(t *testing.T) {
 	}
 }
 
+// TestMustDNAttributeOIDPanicsOnAnUnknownName pins Expand's failure mode for a
+// name literal that does not resolve.
+//
+// Expand used to drop such an attribute and carry on, so a typo in one of its
+// literals produced a DN quietly missing a field -- a wrong certificate, and one
+// that only the attribute-count assertion in
+// TestNamedSubjectExpandCanonicalOrder could have noticed. Expand has no error
+// to return, so the loud failure is a panic; it is unreachable from any
+// configuration, because every name Expand passes is a literal in subject.go
+// looked up in a hardcoded table.
+func TestMustDNAttributeOIDPanicsOnAnUnknownName(t *testing.T) {
+	t.Parallel()
+	if got := mustDNAttributeOID("commonName"); !got.Equal(asn1.ObjectIdentifier{2, 5, 4, 3}) {
+		t.Errorf("mustDNAttributeOID(\"commonName\") = %v, want 2.5.4.3", got)
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Error("mustDNAttributeOID on an unresolvable name returned normally; a typo in one of Expand's name literals would silently drop an attribute")
+			return
+		}
+		if msg, ok := r.(string); !ok || !strings.Contains(msg, "commonNam") {
+			t.Errorf("panic value = %v, want a message naming the unresolvable attribute", r)
+		}
+	}()
+	mustDNAttributeOID("commonNam") // the typo the old silent drop would have swallowed
+}
+
 // TestExpandCannotReproduceEnginePyOrder documents the exact limitation that
 // forces the ordered form to exist (spec section 5.1). engine.py emits
 // displayName between UID and GN; the canonical order cannot, because

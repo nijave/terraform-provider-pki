@@ -121,15 +121,7 @@ func (n NamedSubject) Expand() Subject {
 		if value == "" {
 			return
 		}
-		oid, err := DNAttributeOID(name)
-		if err != nil {
-			// Unreachable: every name passed below is a literal key of the
-			// dn_attributes table, and TestNamedSubjectExpandCanonicalOrder
-			// resolves all of them. Dropping the attribute rather than
-			// panicking keeps Expand total.
-			return
-		}
-		s.Attributes = append(s.Attributes, Attribute{OID: oid, Value: value})
+		s.Attributes = append(s.Attributes, Attribute{OID: mustDNAttributeOID(name), Value: value})
 	}
 
 	add("commonName", n.CommonName)
@@ -152,6 +144,30 @@ func (n NamedSubject) Expand() Subject {
 
 	s.Attributes = append(s.Attributes, n.ExtraAttributes...)
 	return s
+}
+
+// mustDNAttributeOID resolves a dn_attributes name that the caller has written
+// as a literal, and panics if it does not resolve.
+//
+// Expand cannot return an error -- it is used in expression position throughout
+// the provider -- and it used to swallow an unresolvable name by dropping the
+// attribute. That made a typo in one of its name literals produce a DN silently
+// missing a field, which is drift on every certificate built from it, caught
+// only by the attribute-count assertion in
+// TestNamedSubjectExpandCanonicalOrder; a typo inside the OU or street loop
+// would still have satisfied every per-attribute check.
+//
+// No configuration can reach this panic: every argument is a compile-time
+// literal in this file and the table it is looked up in is hardcoded, so an
+// unresolvable name is a bug in this file that fires on the first test run
+// rather than anything a user can send. That is the trade -- a loud failure at
+// the one place a silent one would be a wrong certificate.
+func mustDNAttributeOID(name string) asn1.ObjectIdentifier {
+	oid, err := DNAttributeOID(name)
+	if err != nil {
+		panic(fmt.Sprintf("pki: %q is not a dn_attributes name: %v", name, err))
+	}
+	return oid
 }
 
 // EncodeDER encodes the subject as a DER RDNSequence, the form that goes into
