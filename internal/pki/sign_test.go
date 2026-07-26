@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"math/big"
+	"slices"
 	"testing"
 	"time"
 )
@@ -338,6 +340,117 @@ func TestCreateCertificateExtensionOrderIsStable(t *testing.T) {
 			t.Errorf("extension %d = %s, want %s", i, got, oid)
 		}
 	}
+}
+
+// TestIssuedExtensionOrderMatchesBothDocumentedShapes pins the two orders
+// CreateCertificate's doc comment promises, neither of which had a test.
+//
+// TestCreateCertificateExtensionOrderIsStable pins what Extensions() returns.
+// What an *issued* certificate carries is a different list, and it is the one
+// that matters: authorityKeyIdentifier comes FIRST for a CA-signed certificate
+// (crypto/x509 builds its own extensions ahead of the template's
+// ExtraExtensions, and AKI is the only one it still builds here, since Extensions()
+// supplies every OID its convenience fields guard), while a self-signed
+// certificate has no AKI at all and so carries exactly Extensions()' order.
+//
+// Both halves are derived from crypto/x509 internals rather than from anything
+// this package controls -- x509.go's buildCertExtensions, and the
+// bytes.Equal(asn1Issuer, asn1Subject) test that suppresses the AKI. A toolchain
+// change to either would otherwise surface as unexplained certificate drift in
+// Task 14's comparison and in the golden tests, both of which reason about
+// position. It should surface here instead.
+func TestIssuedExtensionOrderMatchesBothDocumentedShapes(t *testing.T) {
+	t.Parallel()
+	ca, caKey := testCA(t, nil, nil, "order-ca")
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	pub := PublicKeyOf(key)
+
+	// Every extension kind this package builds, so a reordering anywhere in the
+	// list is visible rather than hidden behind a short list.
+	tmpl := CertTemplate{
+		Subject:          NamedSubject{CommonName: "order-probe"}.Expand(),
+		SAN:              SAN{DNSNames: []string{"order.example"}},
+		Serial:           big.NewInt(0x4001),
+		NotBefore:        time.Now().Add(-time.Hour),
+		NotAfter:         time.Now().Add(time.Hour),
+		BasicConstraints: &BasicConstraints{CA: true, Critical: true},
+		KeyUsage:         &KeyUsage{Usages: []string{"keyCertSign", "crlSign"}, Critical: true},
+		ExtKeyUsage:      &ExtKeyUsage{Usages: []string{"clientAuth"}},
+		NameConstraints:  &NameConstraints{PermittedDNSDomains: []string{".example"}, Critical: true},
+		ExtraExtensions: []ExtraExtension{
+			{OID: mustOID(t, "1.3.6.1.4.1.99999.1"), Value: []byte{0x05, 0x00}},
+			{OID: mustOID(t, "1.3.6.1.4.1.99999.2"), Value: []byte{0x05, 0x00}},
+		},
+	}
+
+	exts, err := tmpl.Extensions(pub)
+	if err != nil {
+		t.Fatalf("Extensions: %v", err)
+	}
+	fromTemplate := extensionOIDs(exts)
+
+	// The template's own order is pinned absolutely here as well as compared
+	// against below. Comparing an issued certificate only against a freshly
+	// computed Extensions() would let a reordering *inside* Extensions() move both
+	// sides together and stay green: verified by swapping basicConstraints and
+	// keyUsage there, which this list catches and the comparisons alone do not.
+	wantFromTemplate := []string{
+		"2.5.29.19", // basicConstraints
+		"2.5.29.15", // keyUsage
+		"2.5.29.37", // extendedKeyUsage
+		"2.5.29.17", // subjectAltName
+		"2.5.29.30", // nameConstraints
+		"2.5.29.14", // subjectKeyIdentifier
+		"1.3.6.1.4.1.99999.1",
+		"1.3.6.1.4.1.99999.2",
+	}
+	if !slices.Equal(fromTemplate, wantFromTemplate) {
+		t.Fatalf("Extensions() order = %v,\n                 want %v", fromTemplate, wantFromTemplate)
+	}
+
+	// Half one: CA-signed. authorityKeyIdentifier first, then Extensions()' list
+	// verbatim.
+	caSignedPEM, err := CreateCertificate(tmpl, pub, ca, caKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate (CA-signed): %v", err)
+	}
+	caSigned, err := ParseCertificatePEM(caSignedPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatePEM (CA-signed): %v", err)
+	}
+	wantCASigned := append([]string{FormatOID(oidAuthorityKeyID)}, fromTemplate...)
+	if got := extensionOIDs(caSigned.Extensions); !slices.Equal(got, wantCASigned) {
+		t.Errorf("CA-signed extension order = %v,\n                        want %v", got, wantCASigned)
+	}
+
+	// Half two: self-signed. No authorityKeyIdentifier, so exactly Extensions()'
+	// list.
+	selfSignedPEM, err := CreateCertificate(tmpl, pub, nil, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate (self-signed): %v", err)
+	}
+	selfSigned, err := ParseCertificatePEM(selfSignedPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatePEM (self-signed): %v", err)
+	}
+	if got := extensionOIDs(selfSigned.Extensions); !slices.Equal(got, fromTemplate) {
+		t.Errorf("self-signed extension order = %v,\n                          want %v", got, fromTemplate)
+	}
+	if _, ok := FindExtension(selfSigned.Extensions, oidAuthorityKeyID); ok {
+		t.Error("self-signed certificate carries an authorityKeyIdentifier; crypto/x509 omits it when issuer and subject DNs are equal, and the documented order depends on that")
+	}
+}
+
+// extensionOIDs renders an extension list as dotted OIDs, in order.
+func extensionOIDs(exts []pkix.Extension) []string {
+	oids := make([]string, 0, len(exts))
+	for _, ext := range exts {
+		oids = append(oids, FormatOID(ext.Id))
+	}
+	return oids
 }
 
 func TestCreateCertificateRejectsBadTemplates(t *testing.T) {
