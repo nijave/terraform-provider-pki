@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -358,6 +359,206 @@ func TestExtraExtension(t *testing.T) {
 	}
 }
 
+// TestExtraExtensionRejectsStructurallyImpossibleOIDs covers the arcs an OID
+// cannot have, which "at least two arcs" does not.
+//
+// Every rejected case below is one encoding/asn1 either refuses outright or --
+// worse -- encodes as a *different* OID than the one written, and all of them are
+// reachable from configuration because an extra_extension OID is whatever the
+// operator typed. Catching them here reports the block and the value; letting
+// them through surfaces encoding/asn1's "invalid object identifier" from inside
+// x509.CreateCertificate, or nothing at all.
+//
+// The legal cases matter just as much: arc 2 has no 40-limit, so 2.999.x -- the
+// arc reserved for examples, and the one an operator experiments with -- must
+// keep working, as must the boundary values 0.39 and 1.39.
+func TestExtraExtensionRejectsStructurallyImpossibleOIDs(t *testing.T) {
+	t.Parallel()
+	value := []byte{0x05, 0x00} // DER NULL, a valid extnValue
+
+	for label, oid := range map[string]asn1.ObjectIdentifier{
+		"first arc 3":           {3, 1},
+		"first arc 5":           {5, 99},
+		"first arc 40":          {40, 1},
+		"second arc 40 under 0": {0, 40},
+		"second arc 40 under 1": {1, 40},
+		"second arc 99 under 1": {1, 99},
+		"negative first arc":    {-1, 2},
+		"negative second arc":   {1, -2},
+		"negative later arc":    {1, 3, 6, -1},
+		"one arc":               {2},
+		"no arcs":               {},
+	} {
+		if _, err := (ExtraExtension{OID: oid, Value: value}).Extension(); err == nil {
+			t.Errorf("Extension(%s, %v) returned nil error, want a structural OID error", label, oid)
+		}
+	}
+
+	// Each rejected shape is rejected because encoding/asn1 cannot faithfully
+	// carry it, not because this package invented a rule. Two distinct failures
+	// are demonstrated: an outright marshal error, and a silent change of value.
+	if _, err := asn1.Marshal(asn1.ObjectIdentifier{5, 99}); err == nil {
+		t.Error("encoding/asn1 marshalled 5.99; the structural check would then be this package's own invention")
+	}
+	if _, err := asn1.Marshal(asn1.ObjectIdentifier{1, 40}); err == nil {
+		t.Error("encoding/asn1 marshalled 1.40; the second-arc ceiling would then be this package's own invention")
+	}
+	// A negative arc is the dangerous one: encoding/asn1 marshals it happily and
+	// the bytes decode as a different OID entirely, so an unchecked config would
+	// ship a certificate carrying an extension nobody asked for.
+	der, err := asn1.Marshal(asn1.ObjectIdentifier{1, -2})
+	if err != nil {
+		t.Fatalf("Marshal(1.-2): %v", err)
+	}
+	var back asn1.ObjectIdentifier
+	if _, err := asn1.Unmarshal(der, &back); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if FormatOID(back) == "1.-2" {
+		t.Error("1.-2 round-tripped unchanged; the negative-arc check has no hazard to prevent")
+	}
+
+	// Legal OIDs must still pass, and must still reach a real certificate: a
+	// check that over-rejects would make arc 2 unusable, which is where every
+	// private and example OID lives.
+	for label, oid := range map[string]asn1.ObjectIdentifier{
+		"example arc 2.999":      {2, 999, 1},
+		"arc 2 second arc 48":    {2, 48},
+		"arc 2 large second arc": {2, 12345},
+		"boundary 0.39":          {0, 39},
+		"boundary 1.39":          {1, 39},
+		"private enterprise":     {1, 3, 6, 1, 4, 1, 99999, 1},
+		"a real extension OID":   {1, 3, 6, 1, 5, 5, 7, 1, 24},
+	} {
+		ext, err := (ExtraExtension{OID: oid, Value: value}).Extension()
+		if err != nil {
+			t.Errorf("Extension(%s, %v): %v", label, oid, err)
+			continue
+		}
+		cert := selfSignedWith(t, ext)
+		got, ok := FindExtension(cert.Extensions, oid)
+		if !ok {
+			t.Errorf("%s: certificate does not carry extension %s", label, FormatOID(oid))
+			continue
+		}
+		if !bytes.Equal(got.Value, value) {
+			t.Errorf("%s: extension value = % x, want % x", label, got.Value, value)
+		}
+	}
+}
+
+// TestKeyUsageBoundIsDerivedFromTheTable pins that maxKeyUsageBit comes from
+// oids.go's key_usages table rather than from a hand-written constant.
+//
+// The bound decides how far ParseKeyUsage scans, so a usage added to the table
+// above it would encode and then vanish on import. A constant cannot be tested
+// against that future; the derivation can, by running it over a table holding a
+// bit this package has never seen.
+func TestKeyUsageBoundIsDerivedFromTheTable(t *testing.T) {
+	t.Parallel()
+
+	// The derivation follows a table it has never seen, including past the
+	// one-octet boundary a hand-maintained 8 would sit on.
+	for want, table := range map[int]map[string]string{
+		16: {"digitalSignature": "0", "hypotheticalUsage": "16"},
+		9:  {"decipherOnly": "8", "hypotheticalUsage": "9"},
+		0:  {"digitalSignature": "0"},
+		31: {"a": "31", "b": "2"},
+	} {
+		if got := highestKeyUsageBit(table); got != want {
+			t.Errorf("highestKeyUsageBit(%v) = %d, want %d", table, got, want)
+		}
+	}
+
+	// And the real table yields the bound the rest of the package uses.
+	if got := highestKeyUsageBit(keyUsages); got != maxKeyUsageBit {
+		t.Errorf("maxKeyUsageBit = %d, but the key_usages table's highest bit is %d", maxKeyUsageBit, got)
+	}
+	// 8 is decipherOnly, the highest RFC 5280 4.2.1.3 assigns today. This is the
+	// value the encoding tests' expected bytes are written against, so it is
+	// pinned rather than left implicit.
+	if maxKeyUsageBit != 8 {
+		t.Errorf("maxKeyUsageBit = %d, want 8 (decipherOnly)", maxKeyUsageBit)
+	}
+}
+
+// TestKeyUsagesTableHoldsOnlyBitPositions rules out the one input
+// highestKeyUsageBit has to skip. A row whose value is not a non-negative
+// decimal integer contributes no bit and is unusable through KeyUsageBit too, so
+// it would be a usage the schema advertises and the encoder refuses.
+func TestKeyUsagesTableHoldsOnlyBitPositions(t *testing.T) {
+	t.Parallel()
+	for name, position := range keyUsages {
+		bit, err := strconv.Atoi(position)
+		if err != nil {
+			t.Errorf("key usage %q has value %q, which is not a decimal bit position: %v", name, position, err)
+			continue
+		}
+		if bit < 0 {
+			t.Errorf("key usage %q has bit position %d, which cannot be encoded", name, bit)
+		}
+		if got, err := KeyUsageBit(name); err != nil || got != bit {
+			t.Errorf("KeyUsageBit(%q) = %d, %v; want %d, nil", name, got, err, bit)
+		}
+	}
+}
+
+// TestParseKeyUsageDistinguishesNoBitsFromUnrepresentableBits covers the two
+// ways a keyUsage extension can yield no usages, which used to report the same
+// misleading "no bits are set".
+//
+// A certificate setting only bit 9 HAS bits set; they were dropped because this
+// encoder's vocabulary stops at maxKeyUsageBit. An operator told "no bits are
+// set" about that certificate would go looking for a missing extension instead of
+// an unsupported usage.
+func TestParseKeyUsageDistinguishesNoBitsFromUnrepresentableBits(t *testing.T) {
+	t.Parallel()
+
+	// Bit 9 alone: two octets, the second holding 0x40, BitLength 10.
+	onlyBitNine, err := asn1.Marshal(asn1.BitString{Bytes: []byte{0x00, 0x40}, BitLength: 10})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	_, err = ParseKeyUsage(pkix.Extension{Id: oidKeyUsage, Value: onlyBitNine})
+	if err == nil {
+		t.Fatal("ParseKeyUsage accepted a keyUsage naming no representable usage")
+	}
+	if strings.Contains(err.Error(), "no bits are set") {
+		t.Errorf("error = %q, but bits WERE set; the message must not send the operator looking for a missing extension", err)
+	}
+	if !strings.Contains(err.Error(), "9") {
+		t.Errorf("error = %q, want it to name bit 9, the usage that could not be represented", err)
+	}
+
+	// All-zero bits: nothing was named at all, and that is what the message says.
+	allZero, err := asn1.Marshal(asn1.BitString{Bytes: []byte{0x00, 0x00}, BitLength: 16})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	_, err = ParseKeyUsage(pkix.Extension{Id: oidKeyUsage, Value: allZero})
+	if err == nil {
+		t.Fatal("ParseKeyUsage accepted a keyUsage with no bits set")
+	}
+	if !strings.Contains(err.Error(), "no bits are set") {
+		t.Errorf("error = %q, want it to report that no bits are set", err)
+	}
+
+	// A usage above the bound alongside a named one is imported, not rejected:
+	// the extra bit is ignored and the real usage survives. This is what makes
+	// the rejection above specifically about naming *nothing*.
+	mixed, err := asn1.Marshal(asn1.BitString{Bytes: []byte{0x80, 0x40}, BitLength: 10})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	ku, err := ParseKeyUsage(pkix.Extension{Id: oidKeyUsage, Value: mixed})
+	if err != nil {
+		t.Fatalf("ParseKeyUsage (bit 0 plus bit 9): %v", err)
+	}
+	if len(ku.Usages) != 1 || ku.Usages[0] != "digitalSignature" {
+		t.Errorf("parsed usages = %v, want [digitalSignature]", ku.Usages)
+	}
+}
+
 func TestDefaultKeyUsages(t *testing.T) {
 	t.Parallel()
 	ca := DefaultCAKeyUsage()
@@ -476,16 +677,48 @@ func TestKeyUsageEncodesMinimalBitString(t *testing.T) {
 	}
 }
 
+// TestKeyUsageRejectsAllZeroBits ties the rejection to two stated requirements
+// rather than to taste.
+//
+// The first is RFC 5280 4.2.1.3: "When the keyUsage extension appears in a
+// certificate, at least one of the bits MUST be set to 1." An all-zero keyUsage
+// is therefore not a certificate this provider should claim to understand.
+//
+// The second is internal and is what makes returning one actively wrong:
+// KeyUsage.Extension refuses an empty Usages list, so a KeyUsage parsed out of an
+// all-zero extension could not be encoded back. Every parse in this package feeds
+// a comparison against a re-encoded template, so a value that parses but cannot
+// re-encode is a permanent, unfixable diff. The test asserts that asymmetry
+// directly instead of only asserting the rejection.
 func TestKeyUsageRejectsAllZeroBits(t *testing.T) {
 	t.Parallel()
-	// RFC 5280 4.2.1.3 requires at least one bit; an empty KeyUsage could not be
-	// re-encoded, so it is rejected rather than returned.
-	value, err := asn1.Marshal(asn1.BitString{Bytes: []byte{0x00}, BitLength: 8})
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
+
+	// Every shape an all-zero keyUsage can take: one octet, two octets, and the
+	// empty BIT STRING openssl emits for `keyUsage = ` with no names.
+	for label, bs := range map[string]asn1.BitString{
+		"one zero octet":  {Bytes: []byte{0x00}, BitLength: 8},
+		"two zero octets": {Bytes: []byte{0x00, 0x00}, BitLength: 16},
+		"empty":           {Bytes: nil, BitLength: 0},
+	} {
+		value, err := asn1.Marshal(bs)
+		if err != nil {
+			t.Fatalf("Marshal(%s): %v", label, err)
+		}
+		got, err := ParseKeyUsage(pkix.Extension{Id: oidKeyUsage, Value: value})
+		if err == nil {
+			t.Errorf("ParseKeyUsage(%s) accepted a keyUsage with no bits set, returning %+v", label, got)
+			continue
+		}
+		if !strings.Contains(err.Error(), "no bits are set") {
+			t.Errorf("ParseKeyUsage(%s) error = %q, want it to say no bits are set", label, err)
+		}
 	}
-	if _, err := ParseKeyUsage(pkix.Extension{Id: oidKeyUsage, Value: value}); err == nil {
-		t.Error("ParseKeyUsage accepted a keyUsage with no bits set")
+
+	// The asymmetry that makes acceptance impossible: were ParseKeyUsage to
+	// return the empty KeyUsage instead of erroring, this is the call the caller
+	// would then make, and it fails.
+	if _, err := (KeyUsage{Critical: true}).Extension(); err == nil {
+		t.Error("KeyUsage with no usages encodes successfully; accepting an all-zero keyUsage on parse would then be harmless, and this test would be arbitrary")
 	}
 }
 

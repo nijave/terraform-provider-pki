@@ -10,6 +10,7 @@ import (
 	"encoding/asn1"
 	"fmt"
 	"net"
+	"strconv"
 )
 
 // Extension OIDs this file builds and parses. They duplicate entries in the
@@ -29,8 +30,42 @@ var (
 	oidExtKeyUsage      = asn1.ObjectIdentifier{2, 5, 29, 37}
 )
 
-// maxKeyUsageBit is the highest bit RFC 5280 4.2.1.3 assigns (decipherOnly).
-const maxKeyUsageBit = 8
+// maxKeyUsageBit is the highest bit the key_usages table in oids.go assigns:
+// 8, decipherOnly, the highest RFC 5280 4.2.1.3 defines today.
+//
+// It is derived from that table rather than written here as a constant, because
+// a hand-maintained bound is a coupling that can drift silently. The bound is
+// what ParseKeyUsage scans up to, so a usage added to oids.go at bit 9 or above
+// with the bound left at 8 would encode correctly and then parse back as "no
+// bits are set" -- a usage that disappears on import. Deriving it means adding a
+// row to the table is the whole change.
+var maxKeyUsageBit = highestKeyUsageBit(keyUsages)
+
+// highestKeyUsageBit returns the highest bit position in a key_usages-shaped
+// table, whose values are decimal bit positions as strings (see keyUsages in
+// oids.go for why that shape).
+//
+// It takes the table as a parameter rather than reading the package-level map so
+// the derivation itself is testable against a table with a bit this package has
+// never seen; see TestKeyUsageBoundIsDerivedFromTheTable.
+//
+// An unparsable value cannot contribute a bit and is skipped: KeyUsageBit
+// rejects that name too, so such a row is unusable in both directions rather
+// than half-working. TestKeyUsagesTableHoldsOnlyBitPositions rules the case out
+// for the real table.
+func highestKeyUsageBit(table map[string]string) int {
+	highest := 0
+	for _, position := range table {
+		bit, err := strconv.Atoi(position)
+		if err != nil || bit < 0 {
+			continue
+		}
+		if bit > highest {
+			highest = bit
+		}
+	}
+	return highest
+}
 
 // BasicConstraints is the basicConstraints extension (RFC 5280 4.2.1.9).
 //
@@ -163,12 +198,17 @@ func (ku KeyUsage) Extension() (pkix.Extension, error) {
 		}
 	}
 
-	bytes := make([]byte, maxKeyUsageBit/8+1)
+	// The buffer is sized from the highest bit actually requested, not from
+	// maxKeyUsageBit: sizing it from the bound would put every write one table
+	// change away from an index out of range, while sizing it from the data makes
+	// the write safe for any bit the table may ever name. It is also already the
+	// minimal length DER wants, so no reslicing is needed afterwards.
+	octets := make([]byte, highest/8+1)
 	for bit := range seen {
-		bytes[bit/8] |= 0x80 >> (bit % 8)
+		octets[bit/8] |= 0x80 >> (bit % 8)
 	}
 
-	bs := asn1.BitString{Bytes: bytes[:highest/8+1], BitLength: highest + 1}
+	bs := asn1.BitString{Bytes: octets, BitLength: highest + 1}
 	value, err := asn1.Marshal(bs)
 	if err != nil {
 		return pkix.Extension{}, fmt.Errorf("marshaling keyUsage: %w", err)
@@ -180,10 +220,18 @@ func (ku KeyUsage) Extension() (pkix.Extension, error) {
 // order so the result is canonical regardless of how the extension was
 // written.
 //
-// Bits above decipherOnly are ignored: RFC 5280 assigns none, and a
-// certificate that sets one is better imported than rejected. A keyUsage with
-// no bits set at all is rejected, because RFC 5280 4.2.1.3 requires at least
-// one and an empty KeyUsage cannot be re-encoded.
+// Bits above maxKeyUsageBit are ignored when at least one named bit is also
+// set: RFC 5280 assigns none, and a certificate that carries an extra bit
+// alongside real usages is better imported than rejected.
+//
+// A keyUsage this function can name nothing from is rejected, because RFC 5280
+// 4.2.1.3 requires at least one usage and a KeyUsage holding none cannot be
+// re-encoded -- KeyUsage.Extension refuses an empty Usages list, so returning
+// one would produce a value this package cannot round-trip. The two ways to get
+// there are reported differently: a BIT STRING with no bits set at all names no
+// usage, while one setting only bits above maxKeyUsageBit names usages this
+// encoder has no vocabulary for, and only the second tells the operator that
+// something was in the certificate and could not be represented.
 func ParseKeyUsage(ext pkix.Extension) (KeyUsage, error) {
 	if !ext.Id.Equal(oidKeyUsage) {
 		return KeyUsage{}, fmt.Errorf("extension OID %s is not keyUsage (2.5.29.15)", FormatOID(ext.Id))
@@ -210,9 +258,29 @@ func ParseKeyUsage(ext pkix.Extension) (KeyUsage, error) {
 		usages = append(usages, name)
 	}
 	if len(usages) == 0 {
+		if unnamed := setBitsAbove(bs, maxKeyUsageBit); len(unnamed) > 0 {
+			return KeyUsage{}, fmt.Errorf("parsing keyUsage: the only bits set are %v, and RFC 5280 4.2.1.3 assigns no key usage above bit %d, so this extension names no usage this provider can represent",
+				unnamed, maxKeyUsageBit)
+		}
 		return KeyUsage{}, fmt.Errorf("parsing keyUsage: no bits are set")
 	}
 	return KeyUsage{Usages: usages, Critical: ext.Critical}, nil
+}
+
+// setBitsAbove lists the positions of the bits set in bs above position max, so
+// ParseKeyUsage can say which unrepresentable usages a certificate asked for
+// rather than only that it asked for something.
+//
+// The scan is bounded by BitLength, which for a parsed extension is bounded by
+// the extension's own DER length.
+func setBitsAbove(bs asn1.BitString, max int) []int {
+	var bits []int
+	for bit := max + 1; bit < bs.BitLength; bit++ {
+		if bs.At(bit) == 1 {
+			bits = append(bits, bit)
+		}
+	}
+	return bits
 }
 
 // DefaultCAKeyUsage is the key usage applied to a CA certificate when
@@ -430,8 +498,14 @@ func generalSubtrees(dns, email, ipRanges, uris []string) ([]generalSubtree, err
 	return subtrees, nil
 }
 
-func subtreeOf(tag int, bytes []byte) generalSubtree {
-	return generalSubtree{Base: asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: tag, Bytes: bytes}}
+// subtreeOf wraps an already-encoded GeneralName body as a GeneralSubtree.
+//
+// The parameter is named der rather than bytes so it does not shadow the stdlib
+// package of that name; nothing here needs bytes today, but a function that
+// cannot call bytes.Equal without first being renamed is a small trap left for
+// the next reader.
+func subtreeOf(tag int, der []byte) generalSubtree {
+	return generalSubtree{Base: asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: tag, Bytes: der}}
 }
 
 // ipRangeBytes encodes a CIDR as an iPAddress GeneralName inside a
@@ -559,13 +633,47 @@ type ExtraExtension struct {
 // round-tripping it through a parser this provider does not have would be the
 // one thing this type exists to avoid.
 func (e ExtraExtension) Extension() (pkix.Extension, error) {
-	if len(e.OID) < 2 {
-		return pkix.Extension{}, fmt.Errorf("extra extension OID must have at least two arcs, got %d", len(e.OID))
+	if err := validateOIDStructure(e.OID); err != nil {
+		return pkix.Extension{}, fmt.Errorf("extra extension OID %q: %w", FormatOID(e.OID), err)
 	}
 	if len(e.Value) == 0 {
 		return pkix.Extension{}, fmt.Errorf("extra extension %s has an empty value", FormatOID(e.OID))
 	}
 	return pkix.Extension{Id: e.OID, Critical: e.Critical, Value: e.Value}, nil
+}
+
+// validateOIDStructure applies the structural rules ASN.1 places on an object
+// identifier, which are stricter than "two or more non-negative arcs".
+//
+// X.690 8.19.4 encodes the first two arcs together as a single subidentifier,
+// 40*arc1 + arc2. That is only reversible because arc1 is restricted to 0, 1 or
+// 2 and, when it is 0 or 1, arc2 is restricted to 0..39. Arc 2 (joint-iso-itu-t)
+// deliberately has no such ceiling -- it absorbs every encoded value from 80
+// upwards -- so 2.999.x is a legal OID and must keep passing. It is in fact the
+// arc reserved for examples (RFC 3061 style "2.999" placeholders), which is
+// exactly the kind of value an operator writes in an extra_extension block while
+// testing.
+//
+// Checking here turns a config-level mistake into a config-level error. Without
+// it, an OID like 5.99 or 1.40 sails through and fails later inside
+// x509.CreateCertificate as encoding/asn1's "invalid object identifier", which
+// names neither the extension nor the attribute the operator wrote.
+func validateOIDStructure(oid asn1.ObjectIdentifier) error {
+	if len(oid) < 2 {
+		return fmt.Errorf("must have at least two arcs, got %d", len(oid))
+	}
+	for i, arc := range oid {
+		if arc < 0 {
+			return fmt.Errorf("arc %d is %d; an OID arc cannot be negative", i, arc)
+		}
+	}
+	if oid[0] > 2 {
+		return fmt.Errorf("first arc is %d; ASN.1 allows only 0, 1 or 2", oid[0])
+	}
+	if oid[0] < 2 && oid[1] > 39 {
+		return fmt.Errorf("second arc is %d; under first arc %d ASN.1 allows only 0 through 39", oid[1], oid[0])
+	}
+	return nil
 }
 
 // subjectPublicKeyInfo is the SubjectPublicKeyInfo shape needed to reach the
