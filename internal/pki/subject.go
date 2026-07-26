@@ -286,6 +286,14 @@ type rawAttributeTypeAndValue struct {
 // pkix.RelativeDistinguishedNameSET is named for the same reason.
 type rawRelativeDistinguishedNameSET []rawAttributeTypeAndValue
 
+// The other half of that invariant, which is just as easy to trip over: this
+// name must NOT end in "SET". An RDNSequence is a SEQUENCE OF, so a name like
+// rawRDNSequenceSET would make encoding/asn1 demand a SET (tag 0x31) where the
+// DN carries a SEQUENCE (tag 0x30), and every parse would fail with
+// "asn1: structure error: tags don't match". The two rules are the same
+// getUniversalType suffix test read in opposite directions, so a rename here in
+// either direction breaks the parse -- one of the two spellings for each type is
+// the only one that works.
 type rawRDNSequence []rawRelativeDistinguishedNameSET
 
 // ParseSubjectDER parses a DER RDNSequence into an ordered Subject, preserving
