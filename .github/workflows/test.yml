@@ -48,6 +48,18 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
       - run: go mod download
+      # keytool ships with a JDK, and ubuntu-latest happens to preinstall one
+      # today. That is a property of the runner image, not a guarantee, and the
+      # assertion below would turn its removal into a hard CI failure rather
+      # than a silent loss of coverage -- correct, but it would block the repo
+      # on someone else's image change. Provision the JDK explicitly so keytool
+      # is ours, and keep the assertion as the backstop for openssl (which the
+      # image does guarantee) and for a setup-java that succeeds without
+      # putting keytool on PATH.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
       # internal/pki cross-validates its output against openssl and keytool, and
       # each of those tests skips itself when the tool is absent. That is right
       # for a contributor who does not have them and wrong for CI: with both off
