@@ -23,6 +23,11 @@ func TestParseDuration(t *testing.T) {
 		{"90m", 90 * time.Minute},
 		{"1h30m", 90 * time.Minute},
 		{"1s", time.Second},
+		// The largest value each suffix can represent, pinned so the rejection
+		// boundary is described from both sides. time.Duration is an int64
+		// nanosecond count; one more of either unit overflows and is rejected.
+		{"292y", 292 * 365 * day},
+		{"106751d", 106751 * day},
 	} {
 		got, err := ParseDuration(tc.in)
 		if err != nil {
@@ -78,6 +83,19 @@ func TestParseDurationRejectsGarbage(t *testing.T) {
 		"175320",   // no unit
 		"175320hh", // doubled unit
 		"1Y",       // uppercase suffix is not accepted
+		// Oversized values. time.Duration is an int64 nanosecond count, so the
+		// suffix path can overflow where the Go-syntax path cannot: before this
+		// was checked, "600y" silently became 15 years, "800y" became 215 years,
+		// and "213504d" became 25 minutes -- a wrong certificate lifetime with no
+		// diagnostic anywhere. The Go-syntax path has always rejected the
+		// equivalent ("9999999999999h"), so both branches now agree.
+		"600y",                 // wrapped to 15.06 years
+		"800y",                 // wrapped to 215.06 years
+		"213504d",              // wrapped to 25m26s
+		"293y",                 // one past the representable ceiling
+		"106752d",              // one past the representable ceiling
+		"2562048h",             // Go syntax overflows too, and already errored
+		"9999999999999999999y", // beyond int64 entirely, so Atoi rejects it
 	} {
 		if _, err := ParseDuration(bad); err == nil {
 			t.Errorf("ParseDuration(%q) returned nil error, want an error", bad)

@@ -4,6 +4,7 @@ package pki
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"time"
@@ -28,7 +29,9 @@ var suffixPattern = regexp.MustCompile(`^([0-9]+)([dy])$`)
 // straight through, so "175320h" from a cfssl signing profile parses unchanged.
 //
 // Zero and negative durations are rejected: every caller uses the result as a
-// certificate or CRL lifetime, and neither is meaningful at or below zero.
+// certificate or CRL lifetime, and neither is meaningful at or below zero. So
+// is a count too large for time.Duration's int64 nanoseconds, which tops out at
+// 292y or 106751d; the alternative is a silently wrapped, far shorter lifetime.
 func ParseDuration(s string) (time.Duration, error) {
 	if m := suffixPattern.FindStringSubmatch(s); m != nil {
 		n, err := strconv.Atoi(m[1])
@@ -38,6 +41,17 @@ func ParseDuration(s string) (time.Duration, error) {
 		unit := day
 		if m[2] == "y" {
 			unit = 365 * day
+		}
+		// time.Duration is an int64 count of nanoseconds, so the multiplication
+		// below can overflow -- and unlike time.ParseDuration, which reports
+		// overflow, a wrapped product is a perfectly plausible-looking duration.
+		// "600y" wrapped to 15 years and "213504d" to 25 minutes, either of which
+		// would issue a certificate with a lifetime nobody asked for and no
+		// diagnostic anywhere. The ceiling is checked before multiplying rather
+		// than inferred from the result, so the error can name it: 292y or
+		// 106751d.
+		if max := int64(math.MaxInt64) / int64(unit); int64(n) > max {
+			return 0, fmt.Errorf("invalid duration %q: too large to represent; the maximum is %d%s", s, max, m[2])
 		}
 		d := time.Duration(n) * unit
 		if d <= 0 {
