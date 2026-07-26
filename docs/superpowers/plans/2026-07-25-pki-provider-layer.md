@@ -353,6 +353,8 @@ func TestProviderSchema(t *testing.T) {
 
 Using package `provider_test` rather than `provider` is deliberate: it forces the tests to exercise only the exported surface, the same way OpenTofu does.
 
+**Also add a repo-wide SPDX header test here.** `internal/pki/boundary_test.go`'s header check resolves `os.ReadDir(".")` to its own package directory, so it guards nothing outside `internal/pki` — and every file the remaining fifteen tasks add lands outside it. Walk the module root with `filepath.WalkDir`, skipping `.git`, `.claude`, and `.superpowers`, and assert every `.go` file begins with `// SPDX-License-Identifier: GPL-3.0-or-later`. Carry the same `checked == 0` guard the `internal/pki` version has, so a wrong root path fails the test instead of silently passing it. Leave `internal/pki`'s own copy in place; the overlap is harmless and it belongs with that package's self-enforcement.
+
 - [ ] **Step 6: Add the Makefile targets**
 
 Modify `GNUmakefile`: point `testacc` at `tofu` explicitly and add a `docs` target that runs generation from the tools module.
