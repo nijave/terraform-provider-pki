@@ -63,7 +63,9 @@ func (p *pkiProvider) Resources(_ context.Context) []func() resource.Resource {
 }
 
 func (p *pkiProvider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{}
+	return []func() datasource.DataSource{
+		NewOIDsDataSource,
+	}
 }
 
 func (p *pkiProvider) Functions(_ context.Context) []func() function.Function {

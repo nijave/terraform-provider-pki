@@ -70,18 +70,19 @@ func testAccPreCheck(t *testing.T) {
 // resource and data source added in a later task is validated by it
 // automatically, because it walks whatever the provider registers.
 //
-// The config below is deliberately just the empty provider block. The design
-// this test was drafted against also references `data "pki_oids" "check" {}`,
-// but that data source does not exist until Task 3 adds it; Task 3's brief
-// restores the reference. Until then, the bare provider block is already a
-// valid plan-only step and exercises the same schema-validation path.
+// The `data "pki_oids" "check" {}` line exercises the pki_oids schema Task 3
+// adds; Task 1 deferred it because that data source did not exist yet.
 func TestProviderSchema(t *testing.T) {
 	t.Parallel()
 	resource.Test(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{{
-			Config:   `provider "pki" {}`,
+			Config: `
+provider "pki" {}
+
+data "pki_oids" "check" {}
+`,
 			PlanOnly: true,
 		}},
 	})
