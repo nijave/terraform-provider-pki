@@ -580,6 +580,69 @@ func TestDefaultKeyUsages(t *testing.T) {
 	}
 }
 
+// TestDefaultKeyUsagePointersCarryTheDefaults pins the two Ptr helpers'
+// contents, not merely that they return something.
+//
+// Both exist for CertTemplate.KeyUsage, which is a pointer so that "not
+// configured" stays distinguishable from "configured empty" -- and nil is the
+// legal way to say "not configured". So `return nil` is a body that compiles,
+// issues certificates, and silently drops the keyUsage extension from every CA
+// and every leaf the provider creates with a default. Asserting non-nilness alone
+// would not catch a helper returning the *other* default either, which is the
+// mistake a copy-paste actually makes.
+func TestDefaultKeyUsagePointersCarryTheDefaults(t *testing.T) {
+	t.Parallel()
+
+	ca := DefaultCAKeyUsagePtr()
+	if ca == nil {
+		t.Fatal("DefaultCAKeyUsagePtr returned nil; a nil KeyUsage means no keyUsage extension at all")
+	}
+	if !ca.Critical {
+		t.Error("the default CA key usage is not critical")
+	}
+	if !slices.Equal(ca.Usages, []string{"keyCertSign", "crlSign"}) {
+		t.Errorf("DefaultCAKeyUsagePtr usages = %v, want [keyCertSign crlSign]", ca.Usages)
+	}
+
+	leaf := DefaultLeafKeyUsagePtr()
+	if leaf == nil {
+		t.Fatal("DefaultLeafKeyUsagePtr returned nil; a nil KeyUsage means no keyUsage extension at all")
+	}
+	if !leaf.Critical {
+		t.Error("the default leaf key usage is not critical")
+	}
+	if !slices.Equal(leaf.Usages, []string{"digitalSignature", "keyEncipherment"}) {
+		t.Errorf("DefaultLeafKeyUsagePtr usages = %v, want [digitalSignature keyEncipherment]", leaf.Usages)
+	}
+
+	// Each pointer must agree with its value-returning twin, so the two cannot
+	// drift into disagreeing about what the default is.
+	if !slices.Equal(ca.Usages, DefaultCAKeyUsage().Usages) || ca.Critical != DefaultCAKeyUsage().Critical {
+		t.Errorf("DefaultCAKeyUsagePtr = %+v, DefaultCAKeyUsage = %+v", *ca, DefaultCAKeyUsage())
+	}
+	if !slices.Equal(leaf.Usages, DefaultLeafKeyUsage().Usages) || leaf.Critical != DefaultLeafKeyUsage().Critical {
+		t.Errorf("DefaultLeafKeyUsagePtr = %+v, DefaultLeafKeyUsage = %+v", *leaf, DefaultLeafKeyUsage())
+	}
+
+	// A fresh pointer per call, not a shared package-level value: a caller that
+	// edited the returned KeyUsage would otherwise change the default for every
+	// later resource in the same process.
+	if ca == DefaultCAKeyUsagePtr() {
+		t.Error("DefaultCAKeyUsagePtr returns the same pointer twice; a caller could mutate the package's default")
+	}
+	if leaf == DefaultLeafKeyUsagePtr() {
+		t.Error("DefaultLeafKeyUsagePtr returns the same pointer twice; a caller could mutate the package's default")
+	}
+
+	// The defaults must be encodable: a default that fails Extension() would
+	// break every resource that relies on it.
+	for label, ku := range map[string]*KeyUsage{"ca": ca, "leaf": leaf} {
+		if _, err := ku.Extension(); err != nil {
+			t.Errorf("%s default does not encode: %v", label, err)
+		}
+	}
+}
+
 // TestSubjectKeyIDExtension pins the RFC 5280 method 1 computation: the SHA-1
 // of the subjectPublicKey BIT STRING contents. engine.py asks openssl for
 // "subjectKeyIdentifier = hash", which is the same algorithm, so an imported
