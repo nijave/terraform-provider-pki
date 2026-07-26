@@ -115,6 +115,53 @@ func TestTablesAreBidirectional(t *testing.T) {
 	}
 }
 
+// TestTablesReturnsFreshCopies pins that a caller cannot reach into the tables
+// this package looks up its own answers in.
+//
+// copyMap used to run inside the sync.OnceValue, so the memoized value held the
+// copies and every caller shared them. Mutating the result of one Tables() call
+// was therefore permanent and global: Tables()[0].ByName["POISON"] = "1.2.3"
+// made OIDByName("POISON") answer 1.2.3 for the rest of the process, deleting an
+// entry made a real extension unresolvable, and swapping two slice elements
+// broke the stable group order the doc comment promises. Tables() is exported
+// for schema generation in Plan 2, so a caller iterating and rewriting what it
+// gets back is entirely plausible.
+func TestTablesReturnsFreshCopies(t *testing.T) {
+	t.Parallel()
+	first := Tables()
+	first[0].ByName["POISON"] = "1.2.3"
+	first[0].ByOID["1.2.3"] = "POISON"
+	delete(first[1].ByName, "keyUsage")
+	first[0], first[1] = first[1], first[0]
+
+	second := Tables()
+	if _, ok := second[0].ByName["POISON"]; ok {
+		t.Error("a name added to one Tables() result is visible in the next")
+	}
+	if _, ok := second[0].ByOID["1.2.3"]; ok {
+		t.Error("an OID added to one Tables() result is visible in the next")
+	}
+	if _, ok := second[1].ByName["keyUsage"]; !ok {
+		t.Error("an entry deleted from one Tables() result is missing from the next")
+	}
+	if second[0].Name != "dn_attributes" || second[1].Name != "extensions" {
+		t.Errorf("group order after a caller reordered its own slice = %q, %q; want dn_attributes, extensions",
+			second[0].Name, second[1].Name)
+	}
+
+	// The package's own lookups must be unaffected too, which is the half that
+	// turns a caller's local edit into a wrong answer for everyone.
+	if oid, err := OIDByName("POISON"); err == nil {
+		t.Errorf("OIDByName(\"POISON\") = %q, want an error; a caller's edit reached the lookup tables", oid)
+	}
+	if name, err := NameByOID("1.2.3"); err == nil {
+		t.Errorf("NameByOID(\"1.2.3\") = %q, want an error; a caller's edit reached the lookup tables", name)
+	}
+	if oid, err := OIDByName("keyUsage"); err != nil || oid != "2.5.29.15" {
+		t.Errorf("OIDByName(\"keyUsage\") = %q, %v; want 2.5.29.15 and no error", oid, err)
+	}
+}
+
 // TestSignatureAlgorithmTableIsNotBijective documents the one place the
 // name-to-OID mapping is genuinely many-to-one, so nobody "fixes" it by
 // inventing OID arcs that do not exist.

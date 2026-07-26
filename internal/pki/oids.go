@@ -185,24 +185,51 @@ func invert(m map[string]string) map[string]string {
 	return r
 }
 
+// tables is the package's own copy of the five groups: the maps in it are the
+// package-level maps above and the reverse maps built once from them, so nothing
+// here may ever be handed to a caller. Tables() copies before returning, and
+// lookupTables is internal and read-only.
+//
+// The inversion is memoized rather than recomputed because OIDByName and
+// NameByOID run once per configured attribute.
+var tables = sync.OnceValue(func() []Table {
+	return []Table{
+		{Name: "dn_attributes", ByName: dnAttributes, ByOID: invert(dnAttributes)},
+		{Name: "extensions", ByName: extensions, ByOID: invert(extensions)},
+		{Name: "extended_key_usages", ByName: extendedKeyUsages, ByOID: invert(extendedKeyUsages)},
+		{Name: "key_usages", ByName: keyUsages, ByOID: invert(keyUsages)},
+		{Name: "signature_algorithms", ByName: signatureAlgorithms, ByOID: invert(signatureAlgorithms)},
+	}
+})
+
 // Tables returns the five hardcoded name<->OID groups, in a stable order:
 // dn_attributes, extensions, extended_key_usages, key_usages,
 // signature_algorithms.
-var Tables = sync.OnceValue(func() []Table {
-	return []Table{
-		{Name: "dn_attributes", ByName: copyMap(dnAttributes), ByOID: invert(dnAttributes)},
-		{Name: "extensions", ByName: copyMap(extensions), ByOID: invert(extensions)},
-		{Name: "extended_key_usages", ByName: copyMap(extendedKeyUsages), ByOID: invert(extendedKeyUsages)},
-		{Name: "key_usages", ByName: copyMap(keyUsages), ByOID: invert(keyUsages)},
-		{Name: "signature_algorithms", ByName: copyMap(signatureAlgorithms), ByOID: invert(signatureAlgorithms)},
+//
+// Every call returns a fresh slice holding fresh maps. The copy is made here
+// rather than inside the memoized value on purpose: copying once at memoization
+// time would hand every caller the same maps, and those maps are the ones
+// OIDByName and NameByOID read, so a caller editing what it got back would
+// silently change the package's answers for the rest of the process and could
+// reorder the groups this comment promises are stable.
+// See TestTablesReturnsFreshCopies.
+func Tables() []Table {
+	memo := tables()
+	out := make([]Table, len(memo))
+	for i, tbl := range memo {
+		out[i] = Table{Name: tbl.Name, ByName: copyMap(tbl.ByName), ByOID: copyMap(tbl.ByOID)}
 	}
-})
+	return out
+}
 
 // lookupTables are the three groups searched by OIDByName and NameByOID, in
 // order. key_usages has no OIDs, and signature_algorithms adds nothing to
 // this terse lookup path.
+//
+// It reads the memoized tables directly rather than going through Tables(),
+// which would copy five groups' worth of maps on every single lookup.
 func lookupTables() []Table {
-	all := Tables()
+	all := tables()
 	return []Table{all[0], all[1], all[2]}
 }
 
