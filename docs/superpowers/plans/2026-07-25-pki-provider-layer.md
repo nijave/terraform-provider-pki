@@ -319,6 +319,17 @@ func testAccPreCheck(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("TF_ACC_TERRAFORM_PATH=%q is not usable: %v", path, err)
 	}
+	// Without this, terraform-plugin-testing pairs its default host
+	// registry.terraform.io with the legacy "-" namespace it registers for
+	// reattach, and OpenTofu refuses the combination with a message about
+	// provider address parsing that says nothing about the real cause. Fail
+	// here instead, where the message can name the fix.
+	if os.Getenv("TF_ACC_PROVIDER_HOST") == "" {
+		t.Fatal("TF_ACC_PROVIDER_HOST is not set. Run `make testacc`, which sets it to " +
+			"registry.opentofu.org. Without it terraform-plugin-testing pairs its default " +
+			"registry.terraform.io host with the legacy \"-\" namespace, and OpenTofu rejects " +
+			"that pairing before the provider is ever reached.")
+	}
 }
 
 // TestProviderSchema is a unit test -- no TF_ACC required -- that catches a
@@ -5516,6 +5527,14 @@ Append to `.github/workflows/test.yml`:
           # already present at this path, so the harness drives OpenTofu
           # directly and never downloads Terraform.
           TF_ACC_TERRAFORM_PATH: tofu
+          # Required, not optional. terraform-plugin-testing defaults its
+          # reattach host to registry.terraform.io while still registering the
+          # legacy "-" namespace as a reattach candidate, and OpenTofu's address
+          # parser rejects that pairing outright: `The legacy provider namespace
+          # "-" can be used only with hostname registry.opentofu.org`. Without
+          # this, EVERY acceptance test fails before it reaches the provider.
+          # Measured during Task 1; the Makefile's testacc target sets it too.
+          TF_ACC_PROVIDER_HOST: registry.opentofu.org
         run: go test -v -cover -timeout 20m ./internal/provider/
 ```
 
