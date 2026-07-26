@@ -212,6 +212,55 @@ func TestEncodeBundlePKCS7IsReadableByOpenSSL(t *testing.T) {
 	}
 }
 
+// TestEncodeBundleRejectsAPasswordOnUnencryptableFormats is the one silent-drop
+// case in this file with a security consequence, and the only one that used to
+// pass. pem, der, and pkcs7 have nowhere to put a password: pem emitted a
+// plaintext PRIVATE KEY block while the operator had asked for encryption, and
+// der and pkcs7 discarded the request outright. Every other silently-dropped
+// combination here is already an error by name, so this one is too.
+func TestEncodeBundleRejectsAPasswordOnUnencryptableFormats(t *testing.T) {
+	t.Parallel()
+	leaf, leafKey, ca := testLeaf(t)
+
+	for _, tc := range []struct {
+		format Format
+		in     BundleInput
+	}{
+		{FormatPEM, BundleInput{Format: FormatPEM, Certificate: leaf, PrivateKey: leafKey, Password: testPassword}},
+		{FormatDER, BundleInput{Format: FormatDER, Certificate: leaf, Password: testPassword}},
+		{FormatPKCS7, BundleInput{Format: FormatPKCS7, Certificate: leaf, Chain: []*x509.Certificate{ca}, Password: testPassword}},
+	} {
+		t.Run(string(tc.format), func(t *testing.T) {
+			t.Parallel()
+			out, err := EncodeBundle(tc.in)
+			if err == nil {
+				t.Fatalf("EncodeBundle(%s) with a password returned %d bytes and no error; the password was silently dropped",
+					tc.format, len(out))
+			}
+			// The message has to name the attribute to clear, the way
+			// pkcs12_encoding "passwordless" does.
+			if !strings.Contains(err.Error(), "password_wo") {
+				t.Errorf("error = %q, want it to name password_wo", err)
+			}
+		})
+	}
+
+	// The same inputs without a password are still accepted: this is a check on
+	// the password, not a new restriction on the formats.
+	for _, tc := range []struct {
+		format Format
+		in     BundleInput
+	}{
+		{FormatPEM, BundleInput{Format: FormatPEM, Certificate: leaf, PrivateKey: leafKey}},
+		{FormatDER, BundleInput{Format: FormatDER, Certificate: leaf}},
+		{FormatPKCS7, BundleInput{Format: FormatPKCS7, Certificate: leaf, Chain: []*x509.Certificate{ca}}},
+	} {
+		if _, err := EncodeBundle(tc.in); err != nil {
+			t.Errorf("EncodeBundle(%s) without a password: %v", tc.format, err)
+		}
+	}
+}
+
 func TestFormatIsText(t *testing.T) {
 	t.Parallel()
 	// Spec section 6.6: content is set for text formats and null for binary

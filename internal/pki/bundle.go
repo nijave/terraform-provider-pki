@@ -99,7 +99,15 @@ var pkcs12Encoders = map[PKCS12Encoding]*pkcs12.Encoder{
 // certificate, and pkcs7 as produced here is a degenerate certs-only
 // structure; supplying a private key to either is an error rather than a
 // silent omission, because silently dropping a key produces a bundle that
-// looks complete and is not.
+// looks complete and is not. Password is the same kind of rule and the sharpest
+// of them: only pkcs12 and jks can encrypt, so a non-empty Password with pem,
+// der, or pkcs7 is an error rather than a plaintext bundle the operator believes
+// is encrypted.
+//
+// FriendlyName is the one field that IS silently ignored, by pem, der, and
+// pkcs7, all three of which have nowhere to record an alias. It is metadata --
+// the operator sees a missing name, not a missing protection -- so the
+// asymmetry with Password is deliberate.
 type BundleInput struct {
 	Format         Format
 	Certificate    *x509.Certificate
@@ -141,11 +149,35 @@ func EncodeBundle(in BundleInput) ([]byte, error) {
 	}
 }
 
+// rejectPassword refuses a non-empty Password for a format that cannot encrypt
+// anything. Only pkcs12 and jks can, and for them a password is required rather
+// than merely allowed, so this is the whole of the rule for the other three.
+//
+// It is an error rather than a no-op because the failure mode is asymmetric: a
+// dropped FriendlyName costs the operator an alias they will notice, while a
+// dropped password means a key they believe is encrypted is sitting in state and
+// in a Secret in the clear.
+func rejectPassword(in BundleInput, f Format) error {
+	if in.Password == "" {
+		return nil
+	}
+	return fmt.Errorf("%s bundle cannot be encrypted: clear password_wo, or choose format %q or %q", f, FormatPKCS12, FormatJKS)
+}
+
 // encodePEM concatenates, in order: the certificate, each chain entry
 // (leaf-adjacent first), then the private key. That order is a compatibility
 // promise, not an implementation detail: a consumer that reads only the first
 // PEM block must get the end-entity certificate.
+//
+// A password is an error rather than a silent omission, and it is the one
+// silent omission in this file with a security consequence: this encoder writes
+// an unencrypted PRIVATE KEY block, so accepting a password would hand the
+// operator a plaintext key while they believed they had asked for encryption.
 func encodePEM(in BundleInput) ([]byte, error) {
+	if err := rejectPassword(in, FormatPEM); err != nil {
+		return nil, err
+	}
+
 	var buf bytes.Buffer
 	if in.Certificate != nil {
 		buf.Write(EncodeCertificatePEM(in.Certificate.Raw))
@@ -168,6 +200,9 @@ func encodePEM(in BundleInput) ([]byte, error) {
 // either, and quietly dropping them would produce a bundle that looks
 // complete and is missing half its contents.
 func encodeDER(in BundleInput) ([]byte, error) {
+	if err := rejectPassword(in, FormatDER); err != nil {
+		return nil, err
+	}
 	if in.Certificate == nil {
 		return nil, fmt.Errorf("der bundle requires a certificate")
 	}
@@ -193,6 +228,9 @@ func encodeDER(in BundleInput) ([]byte, error) {
 // chain, not a single certificate and not a slice, as verified against
 // smallstep/pkcs7 v0.2.2 by round-tripping two certificates through it.
 func encodePKCS7(in BundleInput) ([]byte, error) {
+	if err := rejectPassword(in, FormatPKCS7); err != nil {
+		return nil, err
+	}
 	if in.PrivateKey != nil {
 		return nil, fmt.Errorf("pkcs7 bundle cannot carry a private key")
 	}
