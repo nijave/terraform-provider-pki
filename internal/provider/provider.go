@@ -59,7 +59,9 @@ func (p *pkiProvider) Configure(_ context.Context, _ provider.ConfigureRequest, 
 }
 
 func (p *pkiProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{}
+	return []func() resource.Resource{
+		NewPrivateKeyResource,
+	}
 }
 
 func (p *pkiProvider) DataSources(_ context.Context) []func() datasource.DataSource {
