@@ -16,7 +16,16 @@
 
 Every task's requirements implicitly include this section.
 
-- **Module path:** `github.com/nijave/terraform-provider-pki`. Go directive `go 1.25`.
+- **Module path:** `github.com/nijave/terraform-provider-pki`. Go directive `go 1.25.8`.
+  **Plan defect, corrected 2026-07-26.** This constraint originally said `go 1.25`,
+  which is not buildable once Plan 2's acceptance-test harness lands. Go requires the
+  main module's `go` directive to be greater than or equal to every dependency's, and
+  `hashicorp/hc-install`, `hashicorp/terraform-exec` and
+  `hashicorp/terraform-plugin-testing v1.16.0` all declare `go 1.25.8`. With `go 1.25`
+  every go command fails with `go: updates to go.mod needed`; a `toolchain` line does
+  not help. Measured directly. `1.25.8` is the lowest the module graph allows, so
+  honoring the original constraint literally would have meant dropping the acceptance-test
+  harness. Do not "correct" this back to a two-component version.
 - **License: GPLv3.** `LICENSE` holds the full GPL-3.0 text. Every `.go` file starts with the two-line header `// SPDX-License-Identifier: GPL-3.0-or-later` followed by a blank line before `package`. Every dependency must be GPLv3-compatible; the audited set is MPL-2.0, BSD-3-Clause, and MIT only (spec §13). Adding a dependency outside that set requires re-auditing §13 first.
 - **Nothing under BUSL-1.1 may be linked in** (spec §13). Terraform CLI is BUSL since 1.6; OpenTofu (MPL-2.0) is the test platform.
 - **`internal/pki` imports zero Terraform packages.** No `github.com/hashicorp/terraform-plugin-*` import may appear anywhere under `internal/pki`. Task 16 enforces this with a test.
@@ -91,7 +100,7 @@ go get github.com/pavlo-v-chernykh/keystore-go/v4@v4.5.0
 go get golang.org/x/crypto@latest
 ```
 
-The resulting `go.mod` must contain the `go 1.25` directive and these four requires. Do not add `terraform-plugin-*` dependencies in this plan — they arrive in Plan 2 and would break the Task 16 boundary test if imported here.
+The resulting `go.mod` must contain the `go 1.25.8` directive (see the Global Constraints note — `go 1.25` is unbuildable once Plan 2's test harness lands) and these four requires. Do not add `terraform-plugin-*` dependencies in this plan — they arrive in Plan 2 and would break the Task 16 boundary test if imported here.
 
 License check for the record (spec §13): go-pkcs12 is BSD-3-Clause, smallstep/pkcs7 is MIT, keystore-go/v4 is MIT, `golang.org/x/crypto` is BSD-3-Clause. All four are GPLv3-compatible.
 
