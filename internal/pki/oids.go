@@ -185,14 +185,11 @@ func invert(m map[string]string) map[string]string {
 	return r
 }
 
-// tables is the package's own copy of the five groups: the maps in it are the
-// package-level maps above and the reverse maps built once from them, so nothing
-// here may ever be handed to a caller. Tables() copies before returning, and
-// lookupTables is internal and read-only.
-//
-// The inversion is memoized rather than recomputed because OIDByName and
-// NameByOID run once per configured attribute.
-var tables = sync.OnceValue(func() []Table {
+// buildTables assembles the package's own copy of the five groups: the maps in
+// it are the package-level maps above and the reverse maps built once from them,
+// so nothing here may ever be handed to a caller. Tables() copies before
+// returning, and lookupTables is internal and read-only.
+func buildTables() []Table {
 	return []Table{
 		{Name: "dn_attributes", ByName: dnAttributes, ByOID: invert(dnAttributes)},
 		{Name: "extensions", ByName: extensions, ByOID: invert(extensions)},
@@ -200,7 +197,16 @@ var tables = sync.OnceValue(func() []Table {
 		{Name: "key_usages", ByName: keyUsages, ByOID: invert(keyUsages)},
 		{Name: "signature_algorithms", ByName: signatureAlgorithms, ByOID: invert(signatureAlgorithms)},
 	}
-})
+}
+
+// tables is the memo cell for buildTables. The inversion is memoized rather
+// than recomputed because OIDByName and NameByOID run once per configured
+// attribute.
+//
+// Memoization needs process-wide state, so this one has to be a var; the logic
+// lives in the buildTables function declaration above rather than in a function
+// literal here, and every name this package exposes is a func declaration.
+var tables = sync.OnceValue(buildTables)
 
 // Tables returns the five hardcoded name<->OID groups, in a stable order:
 // dn_attributes, extensions, extended_key_usages, key_usages,
@@ -344,6 +350,19 @@ func SignatureAlgorithmByName(name string) (x509.SignatureAlgorithm, error) {
 
 // SignatureAlgorithmName reverse-looks-up the table's name for a, via
 // a.String(), so the two directions cannot drift.
+//
+// The map lookup is what rejects an unsupported algorithm, and it is safe to
+// rely on for that even though it never enumerates what it refuses.
+// x509.SignatureAlgorithm.String() scans Go's own signatureAlgorithmDetails
+// table and, for any value not in it, returns strconv.Itoa(int(algo)) -- a bare
+// decimal string, not a name. Every key of signatureAlgorithmValues starts with
+// a letter, so a decimal string cannot collide with one, and an unsupported
+// algorithm therefore always misses the map.
+//
+// x509.UnknownSignatureAlgorithm (0) and the deliberately omitted MD5, SHA-1,
+// and DSA constants take a different route to the same place: those do have
+// names in Go's table, but this package's table has no entry under them.
+// TestSignatureAlgorithmNameRejectsUnsupported pins both halves.
 func SignatureAlgorithmName(a x509.SignatureAlgorithm) (string, error) {
 	name := a.String()
 	if _, ok := signatureAlgorithmValues[name]; !ok {

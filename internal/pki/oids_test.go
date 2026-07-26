@@ -5,6 +5,7 @@ package pki
 import (
 	"crypto/x509"
 	"encoding/asn1"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -332,5 +333,44 @@ func TestSignatureAlgorithmNames(t *testing.T) {
 	}
 	if _, err := SignatureAlgorithmByName("MD5-RSA"); err == nil {
 		t.Fatal("SignatureAlgorithmByName(\"MD5-RSA\") returned nil error; MD5 must not be offered")
+	}
+}
+
+// TestSignatureAlgorithmNameRejectsUnsupported pins the non-obvious mechanism
+// SignatureAlgorithmName's error path leans on: it never enumerates the
+// algorithms it refuses, it just asks x509.SignatureAlgorithm.String() for a
+// name and looks that name up.
+//
+// The two assertions after the loop are the load-bearing ones, and they are why
+// a value Go has no name for cannot slip through. String() falls back to
+// strconv.Itoa for anything missing from Go's signatureAlgorithmDetails table,
+// so an unknown value stringifies to bare decimal digits; no key of this
+// package's table is all digits, so the two sets cannot intersect. If a future
+// Go release changes that fallback, or the table gains a numeric-looking key,
+// this test says so rather than letting a refused algorithm through.
+func TestSignatureAlgorithmNameRejectsUnsupported(t *testing.T) {
+	t.Parallel()
+	for _, a := range []x509.SignatureAlgorithm{
+		x509.UnknownSignatureAlgorithm,
+		x509.MD5WithRSA,
+		x509.SHA1WithRSA,
+		x509.ECDSAWithSHA1,
+		x509.DSAWithSHA1,
+		x509.DSAWithSHA256,
+		x509.SignatureAlgorithm(9999),
+	} {
+		if name, err := SignatureAlgorithmName(a); err == nil {
+			t.Errorf("SignatureAlgorithmName(%v) = %q, want an error; that algorithm is deliberately not offered", a, name)
+		}
+	}
+
+	if got := x509.SignatureAlgorithm(9999).String(); got != "9999" {
+		t.Errorf("x509.SignatureAlgorithm(9999).String() = %q, want the decimal %q; SignatureAlgorithmName's error path depends on unnamed values stringifying to digits",
+			got, "9999")
+	}
+	for name := range signatureAlgorithmValues {
+		if _, err := strconv.Atoi(name); err == nil {
+			t.Errorf("signature algorithm name %q is all digits, so an unnamed x509.SignatureAlgorithm could collide with it", name)
+		}
 	}
 }
