@@ -28,6 +28,24 @@ import (
 // subjectAltName) and nothing else. Regenerating the fixtures under an openssl
 // that adds a seventh extension by default must fail here loudly rather than
 // silently widen what the test covers.
+//
+// If you are reading this because that failure just happened, it is telling you
+// the fixture changed, not that this list is wrong, and the message names the OIDs
+// that appeared or vanished. The question to answer is whether this package should
+// emit the new extension too: an openssl default that CertTemplate has no
+// equivalent for is a real gap in the provider, and this test is how you find out
+// about it, which is the entire reason the set is pinned rather than derived from
+// the fixture.
+//
+// So there are two correct responses, and adding the OID to this list is not one
+// of them on its own -- the guard immediately below the first one requires our
+// certificate to carry the same number of extensions, so a seventh entry here
+// fails again with "our certificate carries 6 extensions, want 7" until the
+// provider emits it too. Either teach CertTemplate to produce the extension and
+// then add the OID here, or regenerate the fixture with the extension suppressed
+// and leave this list alone. Both keep the pinned set and the compared set
+// identical, which is the property that stops the loops below from passing over
+// something they never looked at.
 var goldenExtensionOIDs = []string{
 	"2.5.29.14", // subjectKeyIdentifier
 	"2.5.29.15", // keyUsage
@@ -46,6 +64,25 @@ var goldenExtensionOIDs = []string{
 // provider is a drop-in replacement for the Python issuer before the migration
 // spec cuts anything over. See testdata/README.md for how leaf.crt was
 // generated.
+//
+// The identity below is not invented. Every value was checked against the
+// reference deployment's own config.hcl -- k8s-manifests/vmubtkube-a/homelab-pki
+// -- on 2026-07-26, field by field, and all of them match: users.nick.identity's
+// surname Venenga, given_name Nick, display_name "Nick V", organization homelab
+// and uid nick; primary_email nick@venenga.com followed by
+// additional_email_addresses ["nijave@gmail.com"] as the SAN rfc822Names, in that
+// order; ekus ["clientAuth"]; and nick-ipad present in users.nick.devices.
+//
+// Two of them are absences rather than values, and both are load-bearing.
+// common_name is commented out there, which is what makes the CN the per-device
+// default <device>.ha.apps.somemissing.info rather than a shared per-user name --
+// so nick-ipad.ha.apps.somemissing.info below is derived, not configured, and a
+// config.hcl that uncommented common_name would make this fixture wrong in a way
+// no assertion here would notice. organizational_units is commented out too,
+// which is why the DN has six attributes and no OU.
+//
+// Anyone re-checking this should compare against that file rather than trusting
+// this comment, since it is a copy of state that lives in another repository.
 func TestGoldenMatchesThePythonIssuer(t *testing.T) {
 	t.Parallel()
 
