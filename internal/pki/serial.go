@@ -33,7 +33,12 @@ func NormalizeSerial(s string) string {
 // all-zero input parses to zero.
 func ParseSerial(s string) (*big.Int, error) {
 	norm := NormalizeSerial(s)
-	// Validate that norm contains only valid hex digits (no minus signs or other chars)
+	// This loop is not redundant with the ok below, however much it looks it:
+	// big.Int.SetString("-1", 16) returns -1 with ok == true, so without it a
+	// negative serial would parse successfully and reach a certificate template
+	// that RFC 5280 4.1.2.2 says must carry a positive integer. NormalizeSerial
+	// does not strip a leading minus either -- it only lowercases, trims spaces,
+	// and drops an "0x" prefix -- so this is the only thing rejecting it.
 	for _, c := range norm {
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
 			return nil, fmt.Errorf("invalid serial number %q: want a hexadecimal string, optionally prefixed with 0x", s)

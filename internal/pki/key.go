@@ -147,9 +147,9 @@ func DescribeKey(k crypto.Signer) (KeyParams, error) {
 }
 
 // ParsePrivateKeyPEM decodes the first PEM block in b and parses it as a
-// private key, accepting PKCS#1, SEC1, and PKCS#8 (in that order; order
-// matters only for speed, since the three encodings are mutually
-// unparseable). This is the path CA keys take on the way in: a
+// private key, accepting PKCS#8, PKCS#1, and SEC1 (in that order, matching the
+// attempts below; order matters only for speed, since the three encodings are
+// mutually unparseable). This is the path CA keys take on the way in: a
 // Bitwarden-delivered Secret can hold any of these forms and the provider must
 // not care which.
 //
