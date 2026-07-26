@@ -114,6 +114,33 @@ type nameConstraintsModel struct {
 	Critical              types.Bool `tfsdk:"critical"`
 }
 
+// nameConstraintsCriticalFieldName is the one nameConstraintsModel field that is
+// not a subtree list.
+const nameConstraintsCriticalFieldName = "critical"
+
+// nameConstraintsListNames lists the tfsdk names of name_constraints' eight
+// subtree lists, in declaration order, for the emptiness rule and for the
+// diagnostic that has to name all eight.
+//
+// Derived from nameConstraintsModel rather than written out for the same reason
+// namedSubjectFieldNames is: a ninth list added to the model and the schema but
+// missed in a hand-written copy here would be silently exempt from the "at least
+// one entry" rule, so a block constraining only that list would be rejected as
+// empty. TestNameConstraintsListNamesMatchTheBlock pins the derivation against
+// the schema.
+var nameConstraintsListNames = func() []string {
+	t := reflect.TypeOf(nameConstraintsModel{})
+	names := make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		tag := t.Field(i).Tag.Get("tfsdk")
+		if tag == "" || tag == nameConstraintsCriticalFieldName {
+			continue
+		}
+		names = append(names, tag)
+	}
+	return names
+}()
+
 // extraExtensionModel is one extra_extension block: an OID plus the raw DER of
 // the extension's extnValue, base64-encoded because HCL has no byte type.
 type extraExtensionModel struct {
@@ -278,6 +305,26 @@ func attributesToPKI(models []attributeModel, base path.Path) ([]pki.Attribute, 
 // block whose for_each is empty (measured against OpenTofu 1.12 and framework
 // v1.19). It is about an explicitly written `organizational_units = []`, which
 // arrives as a known, zero-element list and says nothing about the subject.
+//
+// # Unknown counts as set, so do not reuse this where unknown should defer
+//
+// Every current caller asks the same question: which of the subject block's two
+// mutually exclusive forms did the configuration use, and does a present block
+// name at least one of its lists. For those, an unknown value is already a
+// complete answer -- `common_name = var.cn` selects the named form whatever the
+// variable turns out to hold, and no resolution of it can change that -- so
+// treating unknown as set is what turns the mistake into a plan-time error
+// rather than an apply-time one.
+//
+// A check whose verdict *would* change once the value resolves must not use
+// isSet. "This list must have at least one element" is such a check: an unknown
+// list has no elements to count yet, and answering it now either rejects a
+// configuration that resolves fine or accepts one that resolves to nothing.
+// Those checks have to return early on unknown and let apply decide, which is
+// exactly what every stock terraform-plugin-framework-validators validator does
+// (each one skips null and unknown before looking at the value) and why the
+// emptiness rules in schema_common.go are expressed with those rather than with
+// isSet.
 func isSet(v attr.Value) bool {
 	if v == nil || v.IsNull() {
 		return false

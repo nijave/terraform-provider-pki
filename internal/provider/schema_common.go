@@ -6,6 +6,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
@@ -39,10 +40,17 @@ func criticalAttribute(defaultValue bool, description string) schema.BoolAttribu
 // stringListAttribute builds an optional list-of-strings attribute. A list, not
 // a set: entry order is preserved in the encoded extension, so a set would
 // discard information the certificate carries.
-func stringListAttribute(description string) schema.ListAttribute {
+//
+// The variadic validators are for rules internal/pki also enforces at encode
+// time. Duplicating one there and here is deliberate: the schema copy reports it
+// at plan time against the exact attribute, and internal/pki's copy keeps
+// holding for callers that never pass through a schema (import, and its own
+// tests).
+func stringListAttribute(description string, validators ...validator.List) schema.ListAttribute {
 	return schema.ListAttribute{
 		Optional:            true,
 		ElementType:         types.StringType,
+		Validators:          validators,
 		MarkdownDescription: description,
 	}
 }
@@ -236,6 +244,105 @@ func (v subjectFormsValidator) ValidateObject(_ context.Context, req validator.O
 			"given. Remove one of the two forms.")
 }
 
+// nonEmptyBlockValidator refuses a block that is present but leaves every one of
+// its list attributes empty: `key_usage {}`, `extended_key_usage {}`, and a
+// `name_constraints` block with nothing in any of its eight lists.
+//
+// internal/pki already refuses all three at encode time -- "key usage has no
+// usages", "name constraints has no entries" -- but that happens during apply,
+// and the diagnostic carries no attribute path, so the operator gets a resource
+// error with no line to look at. Here it lands at plan time against the
+// attribute the operator has to edit.
+//
+// A stock listvalidator on the list itself cannot express the null half of this
+// rule, which is the half `key_usage {}` needs. listvalidator.SizeAtLeast(1) is
+// on `usages` as well, but it skips null, as every stock validator does, and an
+// attribute the block leaves out arrives null rather than empty. It therefore
+// covers only the explicitly written `usages = []` -- which this validator also
+// catches, since an empty collection counts as unset; measured against OpenTofu
+// 1.12, the block-level diagnostic is the one reported when both apply.
+//
+// listvalidator.IsRequired() does fire on null, and is exactly wrong here: the
+// framework runs a single-nested block's nested attribute validators even when
+// the block itself is absent (fwserver's BlockValidate descends into
+// BlockNestingModeSingle unconditionally, unlike nested *attributes*, which it
+// skips on a null parent). Adding it to `usages` and planning a configuration
+// with no key_usage block at all produced "Block key_usage.usages must have a
+// configuration value as the provider has marked it as required" -- measured
+// against OpenTofu 1.12 and framework v1.19, and the reason
+// TestAccSharedBlocksAcceptEveryBlockOnceAndOmitted plans a resource with every
+// optional block left out.
+//
+// objectvalidator.AtLeastOneOf is not usable either: it returns immediately when
+// the value it is attached to is non-null, which for a block validator is
+// exactly the case that needs checking. Attaching the list-level form to all
+// eight name_constraints lists would work but emit eight identical diagnostics
+// for one mistake, the same failure mode subjectFormsValidator was hand-written
+// to avoid.
+type nonEmptyBlockValidator struct {
+	// lists names the block's list attributes, at least one of which must have
+	// an entry.
+	//
+	// A name the block does not actually have is skipped, so a wrong name here
+	// fails closed: the rule then reports every present block as empty rather
+	// than quietly exempting one list from it. That is the safer direction, but
+	// it is still wrong, which is what TestNameConstraintsListNamesMatchTheBlock
+	// is for -- the eight name_constraints names are derived from the model, and
+	// the derivation has to keep matching the schema.
+	lists []string
+	// pointAt is the attribute the diagnostic is attached to. Empty attaches it
+	// to the block itself, which is the honest path when the rule spans several
+	// attributes and no single one of them is at fault.
+	pointAt string
+	summary string
+	detail  string
+}
+
+var _ validator.Object = nonEmptyBlockValidator{}
+
+func (v nonEmptyBlockValidator) Description(ctx context.Context) string {
+	return v.MarkdownDescription(ctx)
+}
+
+func (v nonEmptyBlockValidator) MarkdownDescription(_ context.Context) string {
+	return "the block must have at least one entry across " + strings.Join(v.lists, ", ")
+}
+
+func (v nonEmptyBlockValidator) ValidateObject(_ context.Context, req validator.ObjectRequest, resp *validator.ObjectResponse) {
+	// A block the configuration omits arrives as a null object, and the
+	// framework calls this validator for it anyway. Absence is not the mistake
+	// this validator is looking for.
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+
+	attrs := req.ConfigValue.Attributes()
+	for _, name := range v.lists {
+		value, ok := attrs[name]
+		if !ok || value == nil {
+			continue
+		}
+		// Defer on unknown rather than guessing, which is what every stock
+		// validator does ("delay validation until all involved attributes have
+		// a known value"). An unknown list may resolve to a non-empty one, and
+		// a plan-time error over it would reject a configuration that applies
+		// cleanly. isSet is not the predicate to reach for here; see its own
+		// comment on why it reports unknown as set.
+		if value.IsUnknown() {
+			return
+		}
+		if isSet(value) {
+			return
+		}
+	}
+
+	p := req.Path
+	if v.pointAt != "" {
+		p = p.AtName(v.pointAt)
+	}
+	resp.Diagnostics.AddAttributeError(p, v.summary, v.detail)
+}
+
 // sanBlock returns the `san` block: the subjectAltName extension in the four
 // GeneralName types this provider represents.
 func sanBlock() schema.Block {
@@ -316,12 +423,22 @@ func keyUsageBlock() schema.Block {
 			"representable and does not affect the encoding; state always holds them in RFC 5280 " +
 			"bit order. Omitting the block applies the resource's documented default rather than " +
 			"emitting no extension.",
+		Validators: []validator.Object{nonEmptyBlockValidator{
+			lists:   []string{"usages"},
+			pointAt: "usages",
+			summary: "Missing key usages",
+			detail: "A `key_usage` block must name at least one usage: RFC 5280 4.2.1.3 has no " +
+				"encoding for a `keyUsage` extension with no bits set. Omit the block entirely " +
+				"to apply this resource's documented default instead.",
+		}},
 		Attributes: map[string]schema.Attribute{
 			"usages": stringListAttribute(
-				"Key usage names, such as `digitalSignature`, `keyEncipherment`, `keyCertSign`, " +
-					"and `crlSign`. The `pki_oids` data source's `key_usages` group lists every " +
-					"accepted name against its RFC 5280 bit position. Duplicates are rejected, and " +
-					"at least one usage is required."),
+				"Key usage names, such as `digitalSignature`, `keyEncipherment`, `keyCertSign`, "+
+					"and `crlSign`. The `pki_oids` data source's `key_usages` group lists every "+
+					"accepted name against its RFC 5280 bit position. Duplicates are rejected, and "+
+					"at least one usage is required.",
+				listvalidator.SizeAtLeast(1),
+				listvalidator.UniqueValues()),
 			"critical": criticalAttribute(true, "Defaults to `true`."),
 		},
 	}
@@ -334,12 +451,26 @@ func extendedKeyUsageBlock() schema.Block {
 			"Unlike `key_usage`, order **is** significant here: `extendedKeyUsage` is a " +
 			"`SEQUENCE OF`, so entries are encoded in the order given and read back in the order " +
 			"the certificate carries.",
+		Validators: []validator.Object{nonEmptyBlockValidator{
+			lists:   []string{"usages"},
+			pointAt: "usages",
+			summary: "Missing extended key usages",
+			detail: "An `extended_key_usage` block must name at least one purpose: " +
+				"`extendedKeyUsage` is a `SEQUENCE OF` with no valid empty form. Omit the block " +
+				"entirely to emit no `extendedKeyUsage` extension at all.",
+		}},
 		Attributes: map[string]schema.Attribute{
 			"usages": stringListAttribute(
-				"Extended key usage purposes, each either a friendly name such as `clientAuth` or " +
-					"a dotted OID such as `1.3.6.1.4.1.311.20.2.2`. The two spellings may be " +
-					"mixed, but naming the same purpose twice in either spelling is rejected as " +
-					"the duplicate it is."),
+				"Extended key usage purposes, each either a friendly name such as `clientAuth` or "+
+					"a dotted OID such as `1.3.6.1.4.1.311.20.2.2`. The two spellings may be "+
+					"mixed, but naming the same purpose twice in either spelling is rejected as "+
+					"the duplicate it is.",
+				listvalidator.SizeAtLeast(1),
+				// Only the same-spelling duplicate is catchable here. Naming one
+				// purpose by name and by OID is a duplicate too, and resolving
+				// the two spellings to compare them is what internal/pki's own
+				// check does after ExtKeyUsageOID.
+				listvalidator.UniqueValues()),
 			"critical": criticalAttribute(false, "Defaults to `false`."),
 		},
 	}
@@ -354,6 +485,14 @@ func nameConstraintsBlock() schema.Block {
 			"certificate.\n\n" +
 			"At least one entry across all eight lists is required: RFC 5280 forbids an empty " +
 			"`nameConstraints`, so a CA with nothing to constrain must omit the block entirely.",
+		Validators: []validator.Object{nonEmptyBlockValidator{
+			lists:   nameConstraintsListNames,
+			summary: "Empty name constraints",
+			detail: "A `name_constraints` block must have at least one entry across its eight " +
+				"lists (" + strings.Join(nameConstraintsListNames, ", ") + "). RFC 5280 4.2.1.10 " +
+				"requires at least one of the permitted and excluded subtree sets, so a CA with " +
+				"nothing to constrain must omit the block entirely rather than declare it empty.",
+		}},
 		Attributes: map[string]schema.Attribute{
 			"permitted_dns_domains": stringListAttribute(
 				"DNS name subtrees this CA may certify. A leading dot, as in " +
