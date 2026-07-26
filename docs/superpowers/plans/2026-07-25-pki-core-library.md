@@ -5507,7 +5507,8 @@ Spec §9's comparison, implemented against parsed DER. This is the library half 
   - `func (d Drift) String() string`
   - `type CompareInput struct { Desired CertTemplate; DesiredPublicKey crypto.PublicKey; Actual *x509.Certificate; CA *x509.Certificate }`
   - `func CompareCertificate(in CompareInput) ([]Drift, error)` — empty slice means no drift
-  - `func CompareValidity(actual *x509.Certificate, earlyRenewal time.Duration, now time.Time) (readyForRenewal bool)`
+  - `func CompareValidity(actual *x509.Certificate, earlyRenewal time.Duration, now time.Time) (readyForRenewal bool, err error)`
+    **Amended 2026-07-26 (minor-fix wave 3).** Originally returned only the bool. It took a pointer with no documented nil contract and panicked on nil, unlike every other precondition in `compare.go`, which returns an error. Now consistent: nil `actual` is a precondition error. Callers in Plan 2 (Tasks 8, 9 and 11 compute `ready_for_renewal`) must handle both returns.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5878,7 +5879,11 @@ func TestCompareValidity(t *testing.T) {
 		"inside the window":           {72 * time.Hour, true},
 		"longer than the lifetime":    {365 * 24 * time.Hour, true},
 	} {
-		if got := CompareValidity(&cert, tc.earlyRenewal, now); got != tc.want {
+		got, err := CompareValidity(&cert, tc.earlyRenewal, now)
+		if err != nil {
+			t.Fatalf("%s: CompareValidity: %v", label, err)
+		}
+		if got != tc.want {
 			t.Errorf("%s: CompareValidity = %v, want %v", label, got, tc.want)
 		}
 	}
@@ -5886,8 +5891,15 @@ func TestCompareValidity(t *testing.T) {
 	// An already-expired certificate is ready for renewal regardless.
 	expired := cert
 	expired.NotAfter = now.Add(-time.Hour)
-	if !CompareValidity(&expired, 0, now) {
+	if ready, err := CompareValidity(&expired, 0, now); err != nil {
+		t.Fatalf("CompareValidity on an expired certificate: %v", err)
+	} else if !ready {
 		t.Error("an expired certificate is not reported ready for renewal")
+	}
+
+	// A nil certificate is a precondition error, not a panic.
+	if _, err := CompareValidity(nil, 0, now); err == nil {
+		t.Error("CompareValidity(nil, ...) returned a nil error, want a precondition error")
 	}
 }
 ```
