@@ -365,10 +365,28 @@ func TestEncodeDERRejectsInvalidStringTypeAndValue(t *testing.T) {
 		"non-printable in printable": {Attributes: []Attribute{{OID: oid, Value: "a@b", StringType: StringTypePrintable}}},
 		"nil oid":                    {Attributes: []Attribute{{Value: "v"}}},
 		"empty value":                {Attributes: []Attribute{{OID: oid, Value: ""}}},
+		"empty ia5 value":            {Attributes: []Attribute{{OID: oid, Value: "", StringType: StringTypeIA5}}},
 	} {
 		if _, err := s.EncodeDER(); err == nil {
 			t.Errorf("EncodeDER(%s) returned nil error, want an error", label)
 		}
+	}
+
+	// An empty DN value is refused by EncodeDER, which knows which attribute it
+	// was, and not by the shared IA5 validator, which does not. That is why the
+	// DN path calls validateIA5Repertoire rather than validateIA5: if the
+	// emptiness check moved down into the shared validator, this message would
+	// degrade to a bare "value is empty" with no attribute named.
+	s := Subject{Attributes: []Attribute{
+		attr(t, "commonName", "cn"),
+		{OID: mustDNOID(t, "organization"), Value: "", StringType: StringTypeIA5},
+	}}
+	_, err = s.EncodeDER()
+	if err == nil {
+		t.Fatal("EncodeDER accepted an empty IA5 attribute value")
+	}
+	if !strings.Contains(err.Error(), "attribute 1") || !strings.Contains(err.Error(), "2.5.4.10") {
+		t.Errorf("error = %q, want one naming attribute 1 and its OID 2.5.4.10", err)
 	}
 }
 

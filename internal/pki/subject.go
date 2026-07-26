@@ -217,6 +217,41 @@ func (s Subject) EncodeDER() ([]byte, error) {
 	return asn1.Marshal(rdns)
 }
 
+// validateIA5Repertoire checks value against the repertoire IA5String can
+// encode, which is ASCII. It is the one definition of that rule, shared by every
+// place this package writes IA5 content: a DN attribute with StringTypeIA5 here,
+// and the dNSName, rfc822Name, and URI GeneralNames in san.go and
+// extensions.go, which reach it through validateIA5.
+//
+// It deliberately does not validate hostname or mailbox syntax beyond the
+// repertoire: the existing issuer did not either, and rejecting a name it has
+// already issued would block adoption.
+func validateIA5Repertoire(value string) error {
+	for _, r := range value {
+		if r > unicode.MaxASCII {
+			return fmt.Errorf("value contains non-ASCII %q, which IA5String cannot encode", r)
+		}
+	}
+	return nil
+}
+
+// validateIA5 is validateIA5Repertoire plus the one thing its callers genuinely
+// disagree about: whether an empty value is legal. It is not, for a GeneralName
+// -- nothing upstream of those rejects one, and an empty dNSName is a name that
+// matches nothing -- so san.go and extensions.go call this.
+//
+// A DN attribute goes to validateIA5Repertoire directly instead, because
+// EncodeDER has already refused an empty value with a message naming which
+// attribute it was; checking again here would only replace that message with a
+// vaguer one. Hence two entry points rather than one flattened rule: the
+// distinction stays where it belongs, and the repertoire is still defined once.
+func validateIA5(s string) error {
+	if s == "" {
+		return fmt.Errorf("value is empty")
+	}
+	return validateIA5Repertoire(s)
+}
+
 // encodeDirectoryString validates value against st's repertoire and returns the
 // content bytes wrapped in an asn1.RawValue carrying tag.
 //
@@ -246,10 +281,8 @@ func encodeDirectoryString(st StringType, tag int, value string) (asn1.RawValue,
 		content = []byte(value)
 
 	case StringTypeIA5:
-		for _, r := range value {
-			if r > unicode.MaxASCII {
-				return asn1.RawValue{}, fmt.Errorf("value contains non-ASCII %q, which IA5String cannot encode", r)
-			}
+		if err := validateIA5Repertoire(value); err != nil {
+			return asn1.RawValue{}, err
 		}
 		content = []byte(value)
 

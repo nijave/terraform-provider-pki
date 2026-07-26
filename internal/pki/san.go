@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"unicode"
 )
 
 // GeneralName context-specific tags from RFC 5280 4.2.1.6. otherName [0],
@@ -100,22 +99,6 @@ func (s SAN) Extension(subjectEmpty bool) (pkix.Extension, error) {
 		Critical: s.Critical || subjectEmpty,
 		Value:    value,
 	}, nil
-}
-
-// validateIA5 rejects the empty string and any rune above unicode.MaxASCII,
-// the repertoire IA5String can encode. It deliberately does not validate
-// hostname or mailbox syntax beyond that: the existing issuer did not either,
-// and rejecting a name it already issued would block adoption.
-func validateIA5(s string) error {
-	if s == "" {
-		return fmt.Errorf("value is empty")
-	}
-	for _, r := range s {
-		if r > unicode.MaxASCII {
-			return fmt.Errorf("value contains non-ASCII %q, which IA5String cannot encode", r)
-		}
-	}
-	return nil
 }
 
 // validateURI checks that s parses and is absolute (url.IsAbs), which is
