@@ -115,6 +115,63 @@ func TestEncodeJKSTrustedCertificateEntries(t *testing.T) {
 	}
 }
 
+// TestEncodeJKSTrustStoreFromChainOnly covers a supported provider config that
+// nothing else did: chain_pem set with no certificate_pem, i.e. a truststore
+// built entirely from the Chain. It works, and the surrounding tests all set
+// Certificate, so the creationTime fallback to Chain[0].NotBefore and the
+// alias derivation over a Certificate-less list were both unexercised.
+//
+// Determinism is asserted here rather than only in
+// TestEncodeJKSTrustStoreIsDeterministic because the truststore path is the one
+// held to full byte-determinism -- it has no password-gated secret shielding it
+// from re-encoding, so churn here churns the Kubernetes Secret -- and the
+// creationTime this input takes comes from a different branch.
+func TestEncodeJKSTrustStoreFromChainOnly(t *testing.T) {
+	t.Parallel()
+	root, rootKey := testCA(t, nil, nil, "root")
+	inter, _ := testCA(t, root, rootKey, "intermediate")
+	in := BundleInput{
+		Format: FormatJKS, Chain: []*x509.Certificate{inter, root},
+		Password: testPassword,
+	}
+
+	out, err := EncodeBundle(in)
+	if err != nil {
+		t.Fatalf("EncodeBundle: %v", err)
+	}
+	ks := keystore.New()
+	if err := ks.Load(bytes.NewReader(out), []byte(testPassword)); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	aliases := ks.Aliases()
+	if len(aliases) != 2 {
+		t.Fatalf("aliases = %v, want 2 entries, one per chain certificate", aliases)
+	}
+	for _, a := range aliases {
+		if !ks.IsTrustedCertificateEntry(a) {
+			t.Errorf("alias %q is not a trusted certificate entry", a)
+		}
+	}
+	// creationTime falls back to Chain[0].NotBefore when Certificate is absent;
+	// a time.Now() there would be invisible in the alias list and fatal to
+	// determinism.
+	entry, err := ks.GetTrustedCertificateEntry("intermediate")
+	if err != nil {
+		t.Fatalf("GetTrustedCertificateEntry: %v", err)
+	}
+	if !entry.CreationTime.Equal(inter.NotBefore) {
+		t.Errorf("creationTime = %v, want the first chain entry's notBefore %v", entry.CreationTime, inter.NotBefore)
+	}
+
+	second, err := EncodeBundle(in)
+	if err != nil {
+		t.Fatalf("EncodeBundle (second): %v", err)
+	}
+	if !bytes.Equal(out, second) {
+		t.Fatalf("two chain-only truststore encodes differ: %d bytes vs %d bytes", len(out), len(second))
+	}
+}
+
 func TestEncodeJKSRejectsBadInput(t *testing.T) {
 	t.Parallel()
 	leaf, key, _ := testLeaf(t)

@@ -98,8 +98,17 @@ func TestEncodeBundleRejectsEmptyInput(t *testing.T) {
 			t.Errorf("EncodeBundle(%s) with nothing to encode returned nil error, want an error", f)
 		}
 	}
-	if _, err := EncodeBundle(BundleInput{Format: "pkcs11"}); err == nil {
-		t.Error("EncodeBundle accepted an unknown format")
+	// The unknown format carries a certificate on purpose. Without one, the
+	// nothing-to-encode check above rejects the input first and the dispatch's
+	// own default branch is never reached, so an unknown format that fell through
+	// to pem instead of erroring would still look tested.
+	leaf, _, _ := testLeaf(t)
+	_, err := EncodeBundle(BundleInput{Format: "pkcs11", Certificate: leaf})
+	if err == nil {
+		t.Fatal("EncodeBundle accepted an unknown format")
+	}
+	if !strings.Contains(err.Error(), "unknown bundle format") {
+		t.Errorf("error = %q, want the dispatch's own unknown-format message", err)
 	}
 }
 
