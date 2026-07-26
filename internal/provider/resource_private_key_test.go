@@ -139,15 +139,23 @@ func TestAccPrivateKeyRejectsInvalidConfig(t *testing.T) {
 			// pki.GenerateKey's own rejection message, surfaced as an attribute
 			// error on ecdsa_curve; the config text alone ("ecdsa_curve" or
 			// "P256") would pass regardless of whether this code ran.
-			expect: regexp.MustCompile(`(?s)ecdsa_curve is not valid for algorithm RSA`),
+			//
+			// The echoed source line between the summary and the detail is the
+			// line the diagnostic's *path* selects, so requiring it in that
+			// position asserts the path too: an error attached to `algorithm`
+			// would echo `algorithm   = "RSA"` there instead.
+			expect: regexp.MustCompile(`(?s)Unable to generate private key.*` +
+				`ecdsa_curve = "P256".*ecdsa_curve is not valid for algorithm RSA`),
 		},
 		"bits on ed25519": {
 			config: `resource "pki_private_key" "test" {
   algorithm = "ED25519"
   rsa_bits  = 2048
 }`,
-			// Likewise pki.GenerateKey's message, not the config's own tokens.
-			expect: regexp.MustCompile(`(?s)rsa_bits is not valid for algorithm ED25519`),
+			// Likewise pki.GenerateKey's message, not the config's own tokens,
+			// with the path asserted the same way.
+			expect: regexp.MustCompile(`(?s)Unable to generate private key.*` +
+				`rsa_bits  = 2048.*rsa_bits is not valid for algorithm ED25519`),
 		},
 	} {
 		t.Run(label, func(t *testing.T) {

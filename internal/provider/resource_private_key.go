@@ -36,6 +36,12 @@ func NewPrivateKeyResource() resource.Resource {
 	return &privateKeyResource{}
 }
 
+// privateKeyErrorAttributes are the three attributes pki.GenerateKey and
+// pki.DescribeKey can name in a failure, all of them root attributes here. The
+// fallback at each call site is algorithm, which is what "unknown key algorithm"
+// is about and the attribute every other value depends on.
+var privateKeyErrorAttributes = rootPKIErrorAttributes("algorithm", "rsa_bits", "ecdsa_curve")
+
 // privateKeyResourceModel is pki_private_key's state model.
 type privateKeyResourceModel struct {
 	Algorithm                  types.String `tfsdk:"algorithm"`
@@ -237,17 +243,13 @@ func (r *privateKeyResource) Create(ctx context.Context, req resource.CreateRequ
 	key, err := pki.GenerateKey(params)
 	if err != nil {
 		// pki.GenerateKey rejects an algorithm/parameter mismatch (e.g.
-		// ecdsa_curve set alongside algorithm = "RSA") with a message naming
-		// the offending field. Attach it to that field so the diagnostic
-		// points at the right attribute rather than a generic resource error.
-		attr := "algorithm"
-		switch {
-		case params.ECDSACurve != "" && params.Algorithm != pki.AlgorithmECDSA:
-			attr = "ecdsa_curve"
-		case params.RSABits != 0 && params.Algorithm != pki.AlgorithmRSA:
-			attr = "rsa_bits"
-		}
-		resp.Diagnostics.AddAttributeError(path.Root(attr), "Unable to generate private key", err.Error())
+		// ecdsa_curve set alongside algorithm = "RSA") with a message naming the
+		// offending field, so the message decides where the diagnostic lands.
+		// Re-deriving that here from the KeyParams just sent would be a second
+		// copy of internal/pki's validation rules, in different words; see
+		// diagnostics.go.
+		addPKIError(&resp.Diagnostics, err, "Unable to generate private key",
+			path.Root("algorithm"), privateKeyErrorAttributes)
 		return
 	}
 
