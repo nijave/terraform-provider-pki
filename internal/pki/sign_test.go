@@ -452,6 +452,79 @@ func TestCreateCertificateRejectsMismatchedSignatureAlgorithm(t *testing.T) {
 	}
 }
 
+// TestRequestedSignatureAlgorithmIsHonored covers the one branch of
+// resolveSignatureAlgorithm nothing else reached: `return requested, nil`.
+// Replacing that line with `return DefaultSignatureAlgorithm(signerKey)` left the
+// entire suite green, even though signature_algorithm is a user-facing attribute
+// on four provider resources -- an input that is silently ignored is exactly the
+// class of failure the rest of this file exists to rule out.
+//
+// Every algorithm here is compatible with its signing key and is deliberately
+// NOT that key's default: testCA's P-256 key defaults to ECDSA-SHA256, so only
+// honouring the request can produce SHA-384 or SHA-512. The default is asserted
+// alongside, so "honoured" is measured against something.
+func TestRequestedSignatureAlgorithmIsHonored(t *testing.T) {
+	t.Parallel()
+	ca, caKey := testCA(t, nil, nil, "ca") // ECDSA P-256
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	issue := func(alg x509.SignatureAlgorithm) *x509.Certificate {
+		t.Helper()
+		certPEM, err := CreateCertificate(CertTemplate{
+			Subject:            NamedSubject{CommonName: "cn"}.Expand(),
+			Serial:             big.NewInt(1),
+			NotBefore:          time.Now().Add(-time.Hour),
+			NotAfter:           time.Now().Add(time.Hour),
+			SignatureAlgorithm: alg,
+		}, PublicKeyOf(key), ca, caKey)
+		if err != nil {
+			t.Fatalf("CreateCertificate(%v): %v", alg, err)
+		}
+		cert, err := ParseCertificatePEM(certPEM)
+		if err != nil {
+			t.Fatalf("ParseCertificatePEM: %v", err)
+		}
+		return cert
+	}
+
+	if got := issue(x509.UnknownSignatureAlgorithm).SignatureAlgorithm; got != x509.ECDSAWithSHA256 {
+		t.Errorf("unrequested algorithm = %v, want the P-256 default ECDSA-SHA256", got)
+	}
+	for _, want := range []x509.SignatureAlgorithm{x509.ECDSAWithSHA384, x509.ECDSAWithSHA512} {
+		cert := issue(want)
+		if cert.SignatureAlgorithm != want {
+			t.Errorf("issued certificate is signed with %v, want the requested %v", cert.SignatureAlgorithm, want)
+		}
+		// The algorithm identifier must describe the signature that is actually
+		// there, not just appear in the certificate.
+		if err := cert.CheckSignatureFrom(ca); err != nil {
+			t.Errorf("certificate requesting %v does not verify against its CA: %v", want, err)
+		}
+	}
+
+	// The CSR path resolves the algorithm through the same function and is
+	// reached by a separate provider resource, so it gets its own assertion.
+	csrPEM, err := CreateCertRequest(key, CertRequestTemplate{
+		Subject:            NamedSubject{CommonName: "cn"}.Expand(),
+		SignatureAlgorithm: x509.ECDSAWithSHA384,
+	})
+	if err != nil {
+		t.Fatalf("CreateCertRequest: %v", err)
+	}
+	// ParseCertRequestPEM verifies the self-signature, so a request whose
+	// algorithm identifier disagreed with its signature would not get this far.
+	csr, err := ParseCertRequestPEM(csrPEM)
+	if err != nil {
+		t.Fatalf("ParseCertRequestPEM: %v", err)
+	}
+	if csr.SignatureAlgorithm != x509.ECDSAWithSHA384 {
+		t.Errorf("certificate request is signed with %v, want the requested ECDSA-SHA384", csr.SignatureAlgorithm)
+	}
+}
+
 func TestParseCertificateChainPEM(t *testing.T) {
 	t.Parallel()
 	root, rootKey := testCA(t, nil, nil, "root")

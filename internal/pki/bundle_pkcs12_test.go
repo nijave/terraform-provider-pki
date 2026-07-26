@@ -277,6 +277,58 @@ func TestEncodePKCS12WithoutKeyBuildsATrustStore(t *testing.T) {
 	}
 }
 
+// TestEncodePKCS12IsDeterministicWithPinnedRand is the PKCS#12 twin of
+// TestEncodeJKSKeyedBundleIsDeterministicWithPinnedRand, and the only test of
+// BundleInput.Rand on this path -- the field's doc comment cites PKCS#12 salt and
+// IV generation as its reason for existing, and encodePKCS12's WithRand call had
+// no coverage at all, so a dropped WithRand would have gone unnoticed here while
+// the jks equivalent stayed green.
+//
+// A PKCS#12 keystore is freshly salted on every encode in production, which is
+// correct and is why encodePKCS12 does not pin anything itself. With Rand pinned,
+// two encodes must be byte-identical; if they were not, something else in the
+// path would be nondeterministic.
+func TestEncodePKCS12IsDeterministicWithPinnedRand(t *testing.T) {
+	t.Parallel()
+	leaf, key, ca := testLeaf(t)
+	// Comfortably more than the salts and IVs go-pkcs12 draws for a keystore.
+	entropy := bytes.Repeat([]byte{0x42}, 4096)
+	in := BundleInput{
+		Format: FormatPKCS12, Certificate: leaf, PrivateKey: key,
+		Chain: []*x509.Certificate{ca}, Password: testPassword,
+	}
+
+	in.Rand = bytes.NewReader(entropy)
+	first, err := EncodeBundle(in)
+	if err != nil {
+		t.Fatalf("EncodeBundle (first): %v", err)
+	}
+	in.Rand = bytes.NewReader(entropy)
+	second, err := EncodeBundle(in)
+	if err != nil {
+		t.Fatalf("EncodeBundle (second): %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("two encodes with the same pinned rand differ: %d bytes vs %d bytes", len(first), len(second))
+	}
+
+	// Without a pinned Rand the salts differ, which is what makes the assertion
+	// above a statement about Rand rather than about the encoder being constant.
+	unpinned := in
+	unpinned.Rand = nil
+	a, err := EncodeBundle(unpinned)
+	if err != nil {
+		t.Fatalf("EncodeBundle (unpinned): %v", err)
+	}
+	b, err := EncodeBundle(unpinned)
+	if err != nil {
+		t.Fatalf("EncodeBundle (unpinned): %v", err)
+	}
+	if bytes.Equal(a, b) {
+		t.Error("two unpinned encodes are identical; the salt is not being drawn from crypto/rand")
+	}
+}
+
 func TestEncodePKCS12FriendlyName(t *testing.T) {
 	t.Parallel()
 	leaf, key, ca := testLeaf(t)
