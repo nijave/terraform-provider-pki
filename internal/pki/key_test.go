@@ -8,7 +8,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -245,6 +250,156 @@ func TestParsePrivateKeyPEMErrorDoesNotLeakKeyMaterial(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "c3VwZXJzZWNyZXQ") || strings.Contains(err.Error(), "supersecret") {
 		t.Fatalf("error message contains key material: %q", err.Error())
+	}
+}
+
+// TestParsePrivateKeyPEMErrorNeverEchoesRealKeyBytes is the audit behind the
+// wrapped error in ParsePrivateKeyPEM's total-failure path. That path reports
+// crypto/x509's PKCS#8 error verbatim, and this package's rule is that no error
+// may echo key material -- so the claim that x509's private-key parse errors are
+// purely structural has to be enforced, not assumed.
+//
+// It takes real generated keys, mangles them in every position and length a
+// corrupted secret realistically arrives in, and asserts the resulting message
+// shares no run of the input with it: 4 raw bytes, the same 4 bytes as hex, or 8
+// characters of the PEM body's base64. Those thresholds are short enough that an
+// error quoting so much as a fragment of the DER fails, and long enough that the
+// structural numbers x509 does report ("length:1213", offsets, tag numbers)
+// cannot collide by accident.
+func TestParsePrivateKeyPEMErrorNeverEchoesRealKeyBytes(t *testing.T) {
+	t.Parallel()
+	for _, alg := range []Algorithm{AlgorithmRSA, AlgorithmECDSA, AlgorithmED25519} {
+		k, err := GenerateKey(KeyParams{Algorithm: alg})
+		if err != nil {
+			t.Fatalf("GenerateKey(%s): %v", alg, err)
+		}
+		native, err := EncodePrivateKeyPEM(k)
+		if err != nil {
+			t.Fatalf("EncodePrivateKeyPEM(%s): %v", alg, err)
+		}
+		pkcs8, err := EncodePrivateKeyPKCS8PEM(k)
+		if err != nil {
+			t.Fatalf("EncodePrivateKeyPKCS8PEM(%s): %v", alg, err)
+		}
+
+		for _, encoded := range [][]byte{native, pkcs8} {
+			block, _ := pem.Decode(encoded)
+			if block == nil {
+				t.Fatalf("%s: encoded key is not PEM", alg)
+			}
+			for _, m := range manglings(block.Bytes) {
+				mangled := pem.EncodeToMemory(&pem.Block{Type: block.Type, Bytes: m.der})
+				_, err := ParsePrivateKeyPEM(mangled)
+				if err == nil {
+					// A few manglings land on a still-valid key (flipping a
+					// byte of an unused field, say). Nothing to audit.
+					continue
+				}
+				assertNoEcho(t, fmt.Sprintf("%s/%s/%s", alg, block.Type, m.name), m.der, err)
+			}
+		}
+	}
+}
+
+// TestParsePrivateKeyPEMUnknownAlgorithmErrorLeaksOnlyTheOID covers the single
+// crypto/x509 private-key error that does put something from the input in its
+// text: "PKCS#8 wrapping contained private key with unknown algorithm: <oid>".
+//
+// The input here is a real, intact RSA private key still sitting in the
+// privateKey OCTET STRING, with only the AlgorithmIdentifier OID replaced -- the
+// worst case for the claim that the echoed OID is public metadata and not key
+// material. If that reasoning is ever wrong, this is where it shows.
+func TestParsePrivateKeyPEMUnknownAlgorithmErrorLeaksOnlyTheOID(t *testing.T) {
+	t.Parallel()
+	k, err := GenerateKey(KeyParams{Algorithm: AlgorithmRSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	der, err := EncodePrivateKeyPKCS8DER(k)
+	if err != nil {
+		t.Fatalf("EncodePrivateKeyPKCS8DER: %v", err)
+	}
+
+	// The PKCS#8 PrivateKeyInfo prefix, enough to reach and rewrite the
+	// algorithm OID while leaving the wrapped key bytes untouched.
+	var info struct {
+		Version    int
+		Algo       pkix.AlgorithmIdentifier
+		PrivateKey []byte
+	}
+	if _, err := asn1.Unmarshal(der, &info); err != nil {
+		t.Fatalf("unmarshalling PKCS#8 PrivateKeyInfo: %v", err)
+	}
+	info.Algo.Algorithm = asn1.ObjectIdentifier{1, 2, 840, 99999, 31337}
+	rewritten, err := asn1.Marshal(info)
+	if err != nil {
+		t.Fatalf("re-marshalling PKCS#8 PrivateKeyInfo: %v", err)
+	}
+
+	encoded := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: rewritten})
+	_, err = ParsePrivateKeyPEM(encoded)
+	if err == nil {
+		t.Fatal("a PKCS#8 key with an unregistered algorithm OID parsed, want an error")
+	}
+	if !strings.Contains(err.Error(), "unknown algorithm") {
+		t.Fatalf("error = %q, want crypto/x509's unknown-algorithm error; this test no longer covers the path it was written for", err)
+	}
+	assertNoEcho(t, "pkcs8/unknown-algorithm", rewritten, err)
+}
+
+// mangling is one corruption of a DER-encoded key, named for test output.
+type mangling struct {
+	name string
+	der  []byte
+}
+
+// manglings returns the ways a private key realistically arrives corrupted:
+// truncated at various points (a clipped copy-paste), a single byte flipped at
+// the head, in the middle, and at the tail (a transcription slip), and trailing
+// garbage appended.
+func manglings(der []byte) []mangling {
+	out := []mangling{
+		{"empty", nil},
+		{"truncated-1", der[:len(der)-1]},
+		{"truncated-quarter", der[:len(der)/4]},
+		{"truncated-half", der[:len(der)/2]},
+		{"trailing-garbage", append(append([]byte{}, der...), 0xde, 0xad, 0xbe, 0xef)},
+	}
+	for _, i := range []int{0, 1, 2, len(der) / 3, len(der) / 2, (2 * len(der)) / 3, len(der) - 1} {
+		flipped := append([]byte{}, der...)
+		flipped[i] ^= 0xff
+		out = append(out, mangling{fmt.Sprintf("flip-%d", i), flipped})
+	}
+	return out
+}
+
+// assertNoEcho fails if err's text carries any recognizable run of der: the raw
+// bytes, the same bytes as hex, or the base64 a PEM body would carry them in.
+func assertNoEcho(t *testing.T, label string, der []byte, err error) {
+	t.Helper()
+	msg := err.Error()
+
+	const rawRun = 4
+	for i := 0; i+rawRun <= len(der); i++ {
+		window := der[i : i+rawRun]
+		if strings.Contains(msg, string(window)) {
+			t.Errorf("%s: error message echoes %d raw input bytes from offset %d (% x): %q", label, rawRun, i, window, msg)
+			return
+		}
+		if strings.Contains(msg, hex.EncodeToString(window)) {
+			t.Errorf("%s: error message echoes input bytes as hex from offset %d (%s): %q", label, i, hex.EncodeToString(window), msg)
+			return
+		}
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(der)
+	const b64Run = 8
+	for i := 0; i+b64Run <= len(b64); i++ {
+		window := b64[i : i+b64Run]
+		if strings.Contains(msg, window) {
+			t.Errorf("%s: error message echoes base64 of the input (%q): %q", label, window, msg)
+			return
+		}
 	}
 }
 

@@ -68,34 +68,26 @@ var curveNameFromGo = map[string]string{
 // GenerateKey generates a new private key according to p, applying the
 // defaults RSABits 2048 and ECDSACurve "P256" when those fields are zero.
 //
-// Validation happens before defaulting is applied to the fields that select
-// the algorithm's non-default parameters (RSABits for a non-RSA algorithm,
-// ECDSACurve for a non-ECDSA algorithm): those are rejected outright rather
-// than silently ignored, so a copy-pasted config block cannot quietly produce
-// a key with settings its author believes are in effect.
+// Within each case, validation happens before defaulting is applied to the
+// fields that select the algorithm's non-default parameters (RSABits for a
+// non-RSA algorithm, ECDSACurve for a non-ECDSA algorithm): those are rejected
+// outright rather than silently ignored, so a copy-pasted config block cannot
+// quietly produce a key with settings its author believes are in effect.
+//
+// This is deliberately one switch and not two. Validating in a first switch and
+// generating in a second one, both over p.Algorithm, forced a trailing return
+// after the second switch that no input could reach -- an unreachable branch
+// that no test could cover and that would silently absorb a future case added
+// to the first switch but forgotten in the second. With a single switch whose
+// default returns and whose every case returns, Go's terminating-statement rule
+// is satisfied without a trailing return, so unreachability is expressed by the
+// language rather than by a comment.
 func GenerateKey(p KeyParams) (crypto.Signer, error) {
 	switch p.Algorithm {
 	case AlgorithmRSA:
 		if p.ECDSACurve != "" {
 			return nil, fmt.Errorf("ecdsa_curve is not valid for algorithm %s", p.Algorithm)
 		}
-	case AlgorithmECDSA:
-		if p.RSABits != 0 {
-			return nil, fmt.Errorf("rsa_bits is not valid for algorithm %s", p.Algorithm)
-		}
-	case AlgorithmED25519:
-		if p.RSABits != 0 {
-			return nil, fmt.Errorf("rsa_bits is not valid for algorithm %s", p.Algorithm)
-		}
-		if p.ECDSACurve != "" {
-			return nil, fmt.Errorf("ecdsa_curve is not valid for algorithm %s", p.Algorithm)
-		}
-	default:
-		return nil, fmt.Errorf("unknown key algorithm %q", p.Algorithm)
-	}
-
-	switch p.Algorithm {
-	case AlgorithmRSA:
 		bits := p.RSABits
 		if bits == 0 {
 			bits = minRSABits
@@ -104,7 +96,11 @@ func GenerateKey(p KeyParams) (crypto.Signer, error) {
 			return nil, fmt.Errorf("rsa_bits %d is invalid: must be at least %d and a multiple of 8", bits, minRSABits)
 		}
 		return rsa.GenerateKey(rand.Reader, bits)
+
 	case AlgorithmECDSA:
+		if p.RSABits != 0 {
+			return nil, fmt.Errorf("rsa_bits is not valid for algorithm %s", p.Algorithm)
+		}
 		name := p.ECDSACurve
 		if name == "" {
 			name = "P256"
@@ -114,16 +110,23 @@ func GenerateKey(p KeyParams) (crypto.Signer, error) {
 			return nil, fmt.Errorf("unknown ecdsa curve %q", name)
 		}
 		return ecdsa.GenerateKey(curve, rand.Reader)
+
 	case AlgorithmED25519:
+		if p.RSABits != 0 {
+			return nil, fmt.Errorf("rsa_bits is not valid for algorithm %s", p.Algorithm)
+		}
+		if p.ECDSACurve != "" {
+			return nil, fmt.Errorf("ecdsa_curve is not valid for algorithm %s", p.Algorithm)
+		}
 		_, priv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			return nil, fmt.Errorf("generating ed25519 key: %w", err)
 		}
 		return priv, nil
-	}
 
-	// Unreachable: the switch above already rejected any other Algorithm.
-	return nil, fmt.Errorf("unknown key algorithm %q", p.Algorithm)
+	default:
+		return nil, fmt.Errorf("unknown key algorithm %q", p.Algorithm)
+	}
 }
 
 // DescribeKey is the inverse of GenerateKey, reconstructing the KeyParams a
@@ -155,14 +158,35 @@ func DescribeKey(k crypto.Signer) (KeyParams, error) {
 //
 // Errors never include the PEM block's bytes or the raw input, since this
 // function's errors surface as Terraform diagnostics that get printed to
-// consoles and CI logs.
+// consoles and CI logs. The total-failure message does wrap the PKCS#8
+// attempt's error, which is safe: crypto/x509's private-key parse errors are
+// structural, describing tags, lengths, offsets, and failed arithmetic
+// invariants ("asn1: syntax error: data truncated", "asn1: structure error:
+// tags don't match (16 vs {class:3 tag:15 length:1213 ...})", "crypto/rsa:
+// p * q != n"), and none of them quote input bytes. The one that echoes
+// anything from the input at all is "PKCS#8 wrapping contained private key with
+// unknown algorithm: <oid>", and an AlgorithmIdentifier OID is public metadata
+// sitting outside the privateKey OCTET STRING that holds the secret.
+//
+// That survey is not taken on trust: TestParsePrivateKeyPEMErrorNeverEchoesRealKeyBytes
+// mangles real keys of all three algorithms in every position and asserts the
+// message shares no run of the input, and
+// TestParsePrivateKeyPEMUnknownAlgorithmErrorLeaksOnlyTheOID covers the
+// unknown-algorithm case against an intact key.
+//
+// The PKCS#8 error is the one wrapped because it is the most informative of the
+// three for the failures that actually happen: an encrypted or truncated PEM, or
+// a block that is really a certificate, all fail PKCS#8 with a message naming
+// what was wrong structurally, while ParsePKCS1PrivateKey and ParseECPrivateKey
+// only report that the input was not their format.
 func ParsePrivateKeyPEM(b []byte) (crypto.Signer, error) {
 	block, _ := pem.Decode(b)
 	if block == nil {
 		return nil, fmt.Errorf("no PEM block found in private key input")
 	}
 
-	if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+	key, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if pkcs8Err == nil {
 		signer, ok := key.(crypto.Signer)
 		if !ok {
 			return nil, fmt.Errorf("parsed PKCS#8 key of type %T does not support signing", key)
@@ -175,7 +199,7 @@ func ParsePrivateKeyPEM(b []byte) (crypto.Signer, error) {
 	if key, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
 		return key, nil
 	}
-	return nil, fmt.Errorf("unable to parse private key: not valid PKCS#8, PKCS#1, or SEC1")
+	return nil, fmt.Errorf("unable to parse private key: not valid PKCS#8, PKCS#1, or SEC1: %w", pkcs8Err)
 }
 
 // ParsePublicKeyPEM decodes the first PEM block in b and parses it as a
