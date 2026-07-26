@@ -183,6 +183,124 @@ func TestBasicConstraintsModelPathLenNullHandling(t *testing.T) {
 	}
 }
 
+// TestBasicConstraintsFromPKIPathLenNullHandling is the import half of the same
+// distinction, and it is the half that matters most for adoption: a nil PathLen
+// rendered as path_len = 0 would write "this CA may not issue further CA
+// certificates" into the state of every imported CA that had no
+// pathLenConstraint at all, and the next apply would reissue it that way.
+func TestBasicConstraintsFromPKIPathLenNullHandling(t *testing.T) {
+	t.Parallel()
+	intPtr := func(n int) *int { return &n }
+
+	unset := basicConstraintsFromPKI(pki.BasicConstraints{CA: true, Critical: true})
+	if !unset.PathLen.IsNull() {
+		t.Errorf("a nil PathLen produced path_len = %v, want null", unset.PathLen)
+	}
+	if !unset.CA.ValueBool() || !unset.Critical.ValueBool() {
+		t.Errorf("ca/critical came back %v/%v, want true/true", unset.CA, unset.Critical)
+	}
+
+	for _, want := range []int64{0, 3} {
+		got := basicConstraintsFromPKI(pki.BasicConstraints{CA: true, PathLen: intPtr(int(want)), Critical: true})
+		if got.PathLen.IsNull() {
+			t.Errorf("PathLen %d produced a null path_len, want %d", want, want)
+			continue
+		}
+		if got.PathLen.ValueInt64() != want {
+			t.Errorf("PathLen %d produced path_len = %d", want, got.PathLen.ValueInt64())
+		}
+	}
+
+	// Round trip both directions, because each alone can be wrong in a way the
+	// other hides: absent, the boundary value 0, and an ordinary value.
+	for _, original := range []pki.BasicConstraints{
+		{CA: true, Critical: true},
+		{CA: true, PathLen: intPtr(0), Critical: true},
+		{CA: true, PathLen: intPtr(3), Critical: true},
+	} {
+		back, diags := basicConstraintsFromPKI(original).toPKI(path.Root("basic_constraints"))
+		if diags.HasError() {
+			t.Fatalf("toPKI: %v", diags.Errors())
+		}
+		switch {
+		case original.PathLen == nil && back.PathLen != nil:
+			t.Errorf("round trip turned an absent PathLen into %d", *back.PathLen)
+		case original.PathLen != nil && back.PathLen == nil:
+			t.Errorf("round trip turned PathLen %d into absent", *original.PathLen)
+		case original.PathLen != nil && *original.PathLen != *back.PathLen:
+			t.Errorf("round trip turned PathLen %d into %d", *original.PathLen, *back.PathLen)
+		}
+		if back.CA != original.CA || back.Critical != original.Critical {
+			t.Errorf("round trip produced ca=%t critical=%t, want ca=%t critical=%t",
+				back.CA, back.Critical, original.CA, original.Critical)
+		}
+	}
+}
+
+// TestSubjectFieldListsCoverTheWholeModel pins the claim the derivation makes:
+// that no subject field can be present in the model and the schema yet missing
+// from the named-form list. Adding a field to subjectModel and subjectBlock but
+// not to namedSubjectFieldNames would make it accepted alongside an `attribute`
+// block and then silently dropped, since the ordered branch is what runs.
+func TestSubjectFieldListsCoverTheWholeModel(t *testing.T) {
+	t.Parallel()
+	block := subjectBlock().(schema.SingleNestedBlock)
+
+	inSchema := make(map[string]bool, len(block.Attributes)+len(block.Blocks))
+	for name := range block.Attributes {
+		inSchema[name] = true
+	}
+	for name := range block.Blocks {
+		inSchema[name] = true
+	}
+
+	covered := map[string]bool{orderedSubjectFieldName: true}
+	for _, name := range namedSubjectFieldNames {
+		if covered[name] {
+			t.Errorf("%q appears twice in namedSubjectFieldNames", name)
+		}
+		covered[name] = true
+	}
+
+	for name := range inSchema {
+		if !covered[name] {
+			t.Errorf("subject schema has %q but namedSubjectFieldNames does not, so a config "+
+				"setting it alongside an `attribute` block would be accepted and then dropped", name)
+		}
+	}
+	for name := range covered {
+		if !inSchema[name] {
+			t.Errorf("namedSubjectFieldNames has %q but the subject schema does not", name)
+		}
+	}
+	if _, ok := subjectFieldIndex[orderedSubjectFieldName]; !ok {
+		t.Errorf("subjectFieldIndex is missing %q", orderedSubjectFieldName)
+	}
+}
+
+// TestSubjectModelFieldsAreAllRecognizedKinds closes fieldIsSet's default
+// branch. A field of some third kind would report "not set" forever, which is
+// the same silent drop the derivation exists to prevent.
+func TestSubjectModelFieldsAreAllRecognizedKinds(t *testing.T) {
+	t.Parallel()
+	attrValue := reflect.TypeOf((*attr.Value)(nil)).Elem()
+	blockSlice := reflect.TypeOf([]attributeModel(nil))
+
+	st := reflect.TypeOf(subjectModel{})
+	for i := 0; i < st.NumField(); i++ {
+		f := st.Field(i)
+		if f.Tag.Get("tfsdk") == "" {
+			t.Errorf("field %s has no tfsdk tag, so the derivation cannot see it", f.Name)
+			continue
+		}
+		if f.Type.Implements(attrValue) || f.Type == blockSlice {
+			continue
+		}
+		t.Errorf("field %s is a %s, which fieldIsSet does not recognize; it would always "+
+			"report unset", f.Name, f.Type)
+	}
+}
+
 func TestParseDurationAttr(t *testing.T) {
 	t.Parallel()
 	got, diags := parseDurationAttr(types.StringValue("175320h"), path.Root("validity"))
@@ -277,9 +395,9 @@ func TestSubjectFormsInUse(t *testing.T) {
 			wantNamed: true,
 		},
 		{
-			// A block collection with no blocks declared arrives as an empty
-			// list, not as null, which is why emptiness -- not nullness -- is
-			// what decides whether a form is in use.
+			// An absent block collection arrives as null, so this case uses an
+			// empty list only as the stricter input: isSet must report "not in
+			// use" for either shape.
 			name: "ordered only",
 			attrs: map[string]attr.Value{
 				"common_name": types.StringNull(),
@@ -319,6 +437,9 @@ func TestSubjectFormsInUse(t *testing.T) {
 			wantNamed: true,
 		},
 		{
+			// `organizational_units = []` written explicitly: a known,
+			// zero-element list. Measured against OpenTofu 1.12, this is the
+			// only way a zero-element collection reaches the provider.
 			name: "an empty named list does not count",
 			attrs: map[string]attr.Value{
 				"organizational_units": types.ListValueMust(types.StringType, nil),

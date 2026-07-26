@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -144,16 +145,37 @@ func subjectStringTypeNames() []string {
 	return names
 }
 
-// namedSubjectFieldNames lists every subject attribute and block that belongs
-// to the named form, which is every one of them except the ordered
-// "attribute" block. subjectFormsInUse and the block's documentation both read
-// it, so a field added to subjectModel cannot be forgotten in one place only.
-var namedSubjectFieldNames = []string{
-	"common_name", "country", "organization", "organizational_units",
-	"locality", "province", "street_addresses", "postal_code",
-	"serial_number", "surname", "given_name", "uid", "dn_qualifier",
-	"extra_attribute",
-}
+// orderedSubjectFieldName is the tfsdk name of the one subject field that
+// constitutes the ordered form. Every other field belongs to the named form.
+const orderedSubjectFieldName = "attribute"
+
+// subjectFieldIndex maps each subjectModel field's tfsdk name to its struct
+// field index, and namedSubjectFieldNames lists every one of those names except
+// the ordered form's, in declaration order.
+//
+// Both are derived from subjectModel by reflection rather than written out,
+// because a hand-maintained list is exactly the kind of thing that goes stale:
+// a named field added to the model and the schema but missed here would be
+// accepted alongside an `attribute` block by both the validator and the
+// converter, and then silently dropped, because the ordered branch is the one
+// that runs. TestSubjectFieldListsCoverTheWholeModel pins the derivation
+// against the schema block so neither can drift from the other.
+var subjectFieldIndex, namedSubjectFieldNames = func() (map[string]int, []string) {
+	t := reflect.TypeOf(subjectModel{})
+	index := make(map[string]int, t.NumField())
+	names := make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		tag := t.Field(i).Tag.Get("tfsdk")
+		if tag == "" {
+			continue
+		}
+		index[tag] = i
+		if tag != orderedSubjectFieldName {
+			names = append(names, tag)
+		}
+	}
+	return index, names
+}()
 
 // stringsFromList converts a types.List of strings to a []string, treating
 // null and unknown as absent rather than as an error: an optional list
@@ -233,10 +255,13 @@ func attributesToPKI(models []attributeModel, base path.Path) ([]pki.Attribute, 
 }
 
 // isSet reports whether a config value was written by the user: null means it
-// was not, and unknown means it was but its value is not resolved yet. An
-// empty collection counts as unset, which is what makes this usable on block
-// collections -- a block that appears zero times arrives as an empty list, not
-// as null.
+// was not, and unknown means it was but its value is not resolved yet.
+//
+// An empty collection also counts as unset. That is not about blocks -- a block
+// collection that appears zero times arrives as null, including a `dynamic`
+// block whose for_each is empty (measured against OpenTofu 1.12 and framework
+// v1.19). It is about an explicitly written `organizational_units = []`, which
+// arrives as a known, zero-element list and says nothing about the subject.
 func isSet(v attr.Value) bool {
 	if v == nil || v.IsNull() {
 		return false
@@ -261,7 +286,7 @@ func isSet(v attr.Value) bool {
 // a types.Object whose nested values may still be unknown, which reflecting
 // into the model would reject.
 func subjectFormsInUse(attrs map[string]attr.Value) (named, ordered bool) {
-	ordered = isSet(attrs["attribute"])
+	ordered = isSet(attrs[orderedSubjectFieldName])
 	for _, name := range namedSubjectFieldNames {
 		if isSet(attrs[name]) {
 			named = true
@@ -271,19 +296,38 @@ func subjectFormsInUse(attrs map[string]attr.Value) (named, ordered bool) {
 	return named, ordered
 }
 
-// namedFormInUse is subjectFormsInUse's named half, for a decoded model.
-func (m *subjectModel) namedFormInUse() bool {
-	named := []types.String{
-		m.CommonName, m.Country, m.Organization, m.Locality, m.Province,
-		m.PostalCode, m.SerialNumber, m.Surname, m.GivenName, m.UID,
-		m.DNQualifier,
+// fieldIsSet reports whether the model field carrying the given tfsdk name was
+// written in configuration. It reaches the field through subjectFieldIndex so
+// that adding a field to subjectModel needs no change here.
+//
+// A field of an unrecognized kind reports false, which would be a silent gap --
+// TestSubjectModelFieldsAreAllRecognizedKinds exists to make it impossible to
+// reach by asserting every subjectModel field is one of the two kinds handled.
+func (m *subjectModel) fieldIsSet(name string) bool {
+	i, ok := subjectFieldIndex[name]
+	if !ok {
+		return false
 	}
-	for _, s := range named {
-		if isSet(s) {
+	switch field := reflect.ValueOf(*m).Field(i).Interface().(type) {
+	case attr.Value:
+		return isSet(field)
+	case []attributeModel:
+		return len(field) > 0
+	default:
+		return false
+	}
+}
+
+// namedFormInUse is subjectFormsInUse's named half, for a decoded model. Both
+// walk namedSubjectFieldNames, so the converter and the schema-level validator
+// cannot disagree about which fields constitute the named form.
+func (m *subjectModel) namedFormInUse() bool {
+	for _, name := range namedSubjectFieldNames {
+		if m.fieldIsSet(name) {
 			return true
 		}
 	}
-	return isSet(m.OrganizationalUnits) || isSet(m.StreetAddresses) || len(m.ExtraAttributes) > 0
+	return false
 }
 
 // toPKI converts the subject block to an ordered pki.Subject.
@@ -357,9 +401,13 @@ func (m *subjectModel) toPKI(ctx context.Context, p path.Path) (pki.Subject, dia
 // default, so emitting it explicitly would make a hand-written config and
 // imported state differ cosmetically for no benefit.
 //
-// ExtraAttributes is an empty slice rather than nil so it converts to an empty
-// list: a block collection that appears zero times in config is an empty list,
-// and state holding null there would plan as a change on every run.
+// ExtraAttributes is an empty slice rather than nil, so it converts to an empty
+// list rather than a null one. Configuration that declares no `extra_attribute`
+// block actually sends null, not an empty list, so the two do not match
+// literally -- but Terraform treats a null and an empty block collection as the
+// same absence, and an ExpectEmptyPlan check against an imported certificate
+// confirmed no drift either way. Either representation works; this one is kept
+// because it makes len() the only emptiness test the code needs.
 func subjectFromPKI(s pki.Subject) subjectModel {
 	m := subjectModel{
 		CommonName:          types.StringNull(),

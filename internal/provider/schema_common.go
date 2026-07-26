@@ -189,9 +189,24 @@ func subjectBlock() schema.Block {
 // subjectFormsValidator refuses a subject block that mixes the named fields
 // with the ordered `attribute` form.
 //
-// It reads the raw attribute values rather than reflecting into subjectModel:
-// during validation a nested value may still be unknown, which decoding into
-// the model's []attributeModel would reject outright.
+// This is hand-written rather than assembled from
+// terraform-plugin-framework-validators' stringvalidator.ConflictsWith and
+// friends for one reason: it produces a single diagnostic naming both forms and
+// explaining the choice, where ConflictsWith on each of the fourteen named
+// fields would produce up to fourteen generic "Invalid Attribute Combination"
+// errors for one mistake. It also avoids a dependency the module does not
+// otherwise need.
+//
+// It is NOT because ConflictsWith would misbehave on the block collections.
+// An absent block collection arrives as null -- including a `dynamic` block
+// with an empty for_each, measured against OpenTofu 1.12 and framework v1.19 --
+// so ConflictsWith's null gate would work correctly here. Later tasks needing a
+// mutual-exclusivity or requires-together check should reach for the stock
+// validators first; they are sound for blocks.
+//
+// It reads the raw attribute values rather than reflecting into subjectModel
+// because during validation a nested value may still be unknown, which decoding
+// into the model's []attributeModel would reject outright.
 type subjectFormsValidator struct{}
 
 var _ validator.Object = subjectFormsValidator{}
