@@ -402,7 +402,17 @@ func extraExtensionBlock() schema.Block {
 				"oid": schema.StringAttribute{
 					Required: true,
 					MarkdownDescription: "Dotted-decimal OID of the extension, such as " +
-						"`1.3.6.1.5.5.7.1.24`. Must have at least two arcs.",
+						"`1.3.6.1.5.5.7.1.24`.\n\n" +
+						"It must be a structurally valid ASN.1 object identifier, which is stricter " +
+						"than \"two or more numbers separated by dots\": at least two arcs, a first " +
+						"arc of `0`, `1` or `2`, and — under a first arc of `0` or `1` only — a " +
+						"second arc no greater than `39`. X.690 encodes the first two arcs as the " +
+						"single subidentifier `40*first + second`, which is reversible only within " +
+						"those limits, so `5.99` and `1.40` are refused with a message naming the " +
+						"OID instead of failing later as `encoding/asn1`'s \"invalid object " +
+						"identifier\", which would name neither the extension nor this attribute. " +
+						"The `2` arc deliberately has no such ceiling, so the arc reserved for " +
+						"examples, `2.999.x`, is accepted.",
 				},
 				"value_base64": schema.StringAttribute{
 					Required: true,

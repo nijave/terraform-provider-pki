@@ -373,6 +373,55 @@ func TestSubjectModelRejectsUnknownStringType(t *testing.T) {
 	}
 }
 
+// TestExtraExtensionOIDStructuralRules pins the behavioural claim
+// extra_extension.oid's MarkdownDescription makes. The rules themselves live in
+// internal/pki -- first arc 0, 1 or 2; second arc under 40 when the first is 0
+// or 1; no ceiling at all under arc 2, so the example arc 2.999.x stays legal --
+// and nothing in this package would notice them loosening, leaving a description
+// that promises validation the provider no longer performs.
+//
+// The two stages are asserted separately because they fail in different places:
+// toPKI's ParseOID accepts anything with two or more numeric arcs, and the
+// structural refusal happens when the extension is encoded.
+func TestExtraExtensionOIDStructuralRules(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		oid            string
+		wantConvertErr bool
+		wantEncodeErr  bool
+	}{
+		{oid: "1.3.6.1.5.5.7.1.24"},
+		// The arc reserved for examples, which an operator testing an
+		// extra_extension block is likely to reach for.
+		{oid: "2.999.1"},
+		{oid: "0.39"},
+		{oid: "5.99", wantEncodeErr: true},
+		{oid: "1.40", wantEncodeErr: true},
+		{oid: "0.40", wantEncodeErr: true},
+		// A single arc never gets as far as the structural rules.
+		{oid: "2", wantConvertErr: true},
+	} {
+		t.Run(tt.oid, func(t *testing.T) {
+			t.Parallel()
+			m := &extraExtensionModel{
+				OID:         types.StringValue(tt.oid),
+				ValueBase64: types.StringValue("MAMCAQU="),
+				Critical:    types.BoolValue(false),
+			}
+			ext, diags := m.toPKI(path.Root("extra_extension").AtListIndex(0))
+			if got := diags.HasError(); got != tt.wantConvertErr {
+				t.Fatalf("toPKI HasError = %t, want %t (diagnostics: %v)", got, tt.wantConvertErr, diags)
+			}
+			if tt.wantConvertErr {
+				return
+			}
+			if _, err := ext.Extension(); (err != nil) != tt.wantEncodeErr {
+				t.Fatalf("Extension() error = %v, want an error: %t", err, tt.wantEncodeErr)
+			}
+		})
+	}
+}
+
 // TestSubjectFormsInUse pins the predicate the schema-level validator and the
 // converter share. It is a table rather than a validator test because building
 // the whole subject types.Object would prove only that the test and the schema
