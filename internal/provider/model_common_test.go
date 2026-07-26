@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/asn1"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -370,6 +371,54 @@ func TestSubjectModelRejectsUnknownStringType(t *testing.T) {
 	_, diags := m.toPKI(context.Background(), path.Root("subject"))
 	if !diags.HasError() {
 		t.Fatal("toPKI accepted an unknown string_type")
+	}
+}
+
+// TestSubjectStringTypeNames pins both halves of the ordering the generated
+// documentation and the "unknown string type" diagnostic share: the default
+// leads, and the remainder is alphabetical. It also pins the set, because the
+// list is assembled by skipping one key and a default that named a key the table
+// does not have would silently drop an accepted value from both the docs and the
+// diagnostic.
+func TestSubjectStringTypeNames(t *testing.T) {
+	t.Parallel()
+
+	if _, ok := subjectStringTypes[subjectStringTypeDefault]; !ok {
+		t.Fatalf("subjectStringTypeDefault %q is not a key of subjectStringTypes", subjectStringTypeDefault)
+	}
+	// The default the converter applies when string_type is omitted, spelled
+	// the way internal/pki spells it. subjectFromPKI relies on the same
+	// equality to leave string_type null for the default.
+	if got := subjectStringTypes[subjectStringTypeDefault]; got != pki.StringTypeUTF8 {
+		t.Errorf("subjectStringTypes[%q] = %q, want the utf8 default attributesToPKI applies",
+			subjectStringTypeDefault, got)
+	}
+
+	names := subjectStringTypeNames()
+	if len(names) != len(subjectStringTypes) {
+		t.Fatalf("subjectStringTypeNames returned %d names for %d accepted values: %v",
+			len(names), len(subjectStringTypes), names)
+	}
+	if names[0] != subjectStringTypeDefault {
+		t.Errorf("subjectStringTypeNames starts with %q, want the default %q first so a reader "+
+			"of the generated documentation sees which value applies when the attribute is omitted",
+			names[0], subjectStringTypeDefault)
+	}
+	rest := names[1:]
+	if !sort.StringsAreSorted(rest) {
+		t.Errorf("the names after the default are %v, want them alphabetical so the order is stable", rest)
+	}
+	for _, name := range names {
+		if _, ok := subjectStringTypes[name]; !ok {
+			t.Errorf("subjectStringTypeNames lists %q, which is not an accepted value", name)
+		}
+	}
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if seen[name] {
+			t.Errorf("%q appears twice in subjectStringTypeNames", name)
+		}
+		seen[name] = true
 	}
 }
 

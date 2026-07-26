@@ -133,16 +133,32 @@ var subjectStringTypes = map[string]pki.StringType{
 	"t61":       pki.StringTypeT61,
 }
 
+// subjectStringTypeDefault is the string_type an attribute gets when the
+// configuration omits it. It is a key of subjectStringTypes rather than a
+// separate spelling of the same thing, so the default cannot drift from the
+// table; TestSubjectStringTypeNames pins that.
+const subjectStringTypeDefault = "utf8"
+
 // subjectStringTypeNames lists the keys of subjectStringTypes in a stable
-// order, so a diagnostic and the generated documentation do not reorder
-// between runs the way a bare map range would.
+// order, so a diagnostic and the generated documentation do not reorder between
+// runs the way a bare map range would.
+//
+// The default comes first, then the rest alphabetically. Plain alphabetical
+// order buried `utf8` at the end of a five-item list in the generated
+// documentation, where a reader scanning the accepted values had no way to see
+// which one applies when the attribute is omitted -- and the same list is what
+// the "unknown string type" diagnostic prints, where leading with the default
+// is the more useful ordering too.
 func subjectStringTypeNames() []string {
 	names := make([]string, 0, len(subjectStringTypes))
 	for name := range subjectStringTypes {
+		if name == subjectStringTypeDefault {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	return names
+	return append([]string{subjectStringTypeDefault}, names...)
 }
 
 // orderedSubjectFieldName is the tfsdk name of the one subject field that
