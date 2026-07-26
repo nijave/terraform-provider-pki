@@ -5937,7 +5937,20 @@ type CompareInput struct {
 6. **Extensions**: build the desired list with `Desired.Extensions(in.DesiredPublicKey)` and index the actual certificate's `Extensions` by OID string.
 
    **Index by OID; never compare positionally.** `Extensions()` returns its documented order, but the order in an *issued* certificate is not the same: `x509.CreateCertificate` prepends the `authorityKeyIdentifier` it synthesizes from the parent. Measured directly — a template yielding `[2.5.29.19, 2.5.29.15, 2.5.29.37, 2.5.29.17, 2.5.29.14]` produces a certificate carrying `[2.5.29.35, 2.5.29.19, 2.5.29.15, 2.5.29.37, 2.5.29.17, 2.5.29.14]`. A positional comparison would report drift on every extension of every certificate. Task 9's implementer found this. For each desired extension, report drift when it is absent, when `Critical` differs, or when the DER value differs. Then report every actual extension not in the desired set — that catches a removed `extra_extension`, and the `authorityKeyIdentifier` Go adds must be excluded from that sweep since the template never contains it. Use the extension's dotted OID as `Field` so the message is unambiguous even for extensions the provider has no friendly name for; the SAN is the one exception, reported as `san` because that is the schema block a user would edit.
-7. **Issuer and signature**: when `CA` is non-nil, compare `CA.RawSubject` against `Actual.RawIssuer` (`Field: "issuer"`) and call `Actual.CheckSignatureFrom(in.CA)` (`Field: "signature"`). When `CA` is nil, call `Actual.CheckSignatureFrom(in.Actual)` to confirm it really is self-signed.
+7. **Issuer and signature**: when `CA` is non-nil, compare `CA.RawSubject` against `Actual.RawIssuer` (`Field: "issuer"`). When `CA` is nil, the certificate is expected to be self-signed, so compare `Actual.RawSubject` against `Actual.RawIssuer` instead.
+
+   **For the signature itself, do not use `CheckSignatureFrom`.** It enforces issuer *constraints* before verifying any cryptography, so it fails for reasons that have nothing to do with whether the signature matches — and two of those failures are reachable from ordinary configuration and **never converge**:
+
+   - A self-signed certificate with `basic_constraints { ca = false }` fails with `x509: invalid signature: parent certificate cannot sign this kind of certificate`, even when the certificate matches its template byte for byte.
+   - A self-signed CA whose `key_usage` omits `keyCertSign` fails the same way. Spec §6.3 makes both `basic_constraints` and `key_usage` user-settable on `pki_certificate_authority`, so both are expressible in HCL.
+
+   In each case the proposed replacement produces an identically-constrained certificate that drifts again on the next plan: an endless replacement loop for a CA, which for a 20-year certificate on a device is the worst outcome this comparison exists to prevent. Task 14's reviewer measured both.
+
+   Verify the cryptography only, with the issuer's public key over the signed bytes: `signer.CheckSignature(Actual.SignatureAlgorithm, Actual.RawTBSCertificate, Actual.Signature)`, where `signer` is `in.CA` when non-nil and `in.Actual` otherwise.
+
+   **And distinguish "the signature is wrong" from "the signature cannot be checked."** A cryptographically invalid signature is drift, reported as `Field: "signature"`. An `x509.InsecureAlgorithmError` — which is what an adopted SHA-1 chain produces, `x509: cannot verify signature: insecure algorithm SHA1-RSA` — is **not** drift: the content matches, and reporting drift would force one reissue and therefore one device re-enrollment for a certificate that is byte-identical. Return it as an error instead, naming the algorithm, so the operator sees a real finding about the adopted material rather than an unexplained replacement. That follows the same rule as the `EncodeDER` failure above: something the comparison cannot evaluate is an error, not a diff.
+
+   Add a test for each of the three: the `ca = false` self-signed case and the `keyCertSign`-less CA case must both report **no** drift, and a SHA-1 chain must return an error rather than drift.
 
 Render extension values as hex, truncated to 64 characters with an ellipsis, so a drift message stays readable in a plan.
 
