@@ -3,6 +3,7 @@
 package pki
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -25,6 +26,10 @@ const (
 	pemTypeCertificate = "CERTIFICATE"
 	pemTypeCertRequest = "CERTIFICATE REQUEST"
 )
+
+// pemBeginMarker is the literal that opens every PEM block (RFC 7468 3). It is
+// counted, not parsed: see ParseCertificateChainPEM for what the count is for.
+const pemBeginMarker = "-----BEGIN "
 
 // CertRequestTemplate describes a certificate signing request.
 //
@@ -423,6 +428,26 @@ func ParseCertificatePEM(b []byte) (*x509.Certificate, error) {
 // `cat`, or by a template that interpolated the wrong attribute -- from being
 // carried along into a certificate_chain_pem attribute, where it would be
 // written to state and to disk in the clear.
+//
+// Text that is not part of a PEM block is allowed anywhere: before the first
+// block, between blocks, and after the last. That is a deliberate choice rather
+// than laxness, because it is what real chain files look like. `openssl
+// crl2pkcs7 -nocrl -certfile chain.pem | openssl pkcs7 -print_certs` -- the
+// standard way to normalize a chain -- prefixes every block with
+// "subject=" and "issuer=" lines, `openssl s_client -showcerts` does the same,
+// and distribution CA bundles carry comments and certificate names between
+// blocks. Rejecting that would reject the files this provider exists to read.
+//
+// What is NOT allowed is a "-----BEGIN " marker that did not become one of the
+// blocks above. pem.Decode reports a malformed or truncated block by skipping
+// it and returning the next well-formed one, so without this check a chain
+// containing a corrupt certificate would parse as its intact certificates alone,
+// with the damaged one silently dropped -- and any caller that stored the input
+// bytes rather than re-encoding from the parsed certificates would carry the
+// dropped material along. Comparing the marker count against the number of
+// blocks decoded is what makes that impossible, at the cost of also rejecting
+// the (harmless, and vanishingly rare) case of prose that happens to contain the
+// marker text.
 func ParseCertificateChainPEM(b []byte) ([]*x509.Certificate, error) {
 	var certs []*x509.Certificate
 	rest := b
@@ -444,6 +469,10 @@ func ParseCertificateChainPEM(b []byte) ([]*x509.Certificate, error) {
 	}
 	if len(certs) == 0 {
 		return nil, fmt.Errorf("no %s PEM blocks found in certificate chain", pemTypeCertificate)
+	}
+	if markers := bytes.Count(b, []byte(pemBeginMarker)); markers != len(certs) {
+		return nil, fmt.Errorf("certificate chain opens %d PEM blocks but only %d decoded; a truncated or corrupt block would be dropped silently, so the whole chain is rejected",
+			markers, len(certs))
 	}
 	return certs, nil
 }
