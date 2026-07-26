@@ -28,7 +28,7 @@ func (f *oidFunction) Definition(_ context.Context, _ function.DefinitionRequest
 	resp.Definition = function.Definition{
 		Summary: "Look up the dotted OID for a well-known name.",
 		MarkdownDescription: "Returns the dotted object identifier for a well-known DN attribute, " +
-			"extension, or extended key usage name -- for example `oid(\"displayName\")` returns " +
+			"extension, or extended key usage name — for example `oid(\"displayName\")` returns " +
 			"`2.16.840.1.113730.3.1.241`.\n\n" +
 			"Errors on an unknown name rather than returning an empty string, so a typo fails at plan " +
 			"time instead of silently omitting a DN attribute.\n\n" +
@@ -71,7 +71,7 @@ func (f *oidNameFunction) Definition(_ context.Context, _ function.DefinitionReq
 	resp.Definition = function.Definition{
 		Summary: "Look up the well-known name for a dotted OID.",
 		MarkdownDescription: "Returns the friendly name for a dotted object identifier that is a well-known " +
-			"DN attribute, extension, or extended key usage -- for example `oid_name(\"2.5.4.4\")` returns " +
+			"DN attribute, extension, or extended key usage — for example `oid_name(\"2.5.4.4\")` returns " +
 			"`surname`.\n\n" +
 			"Errors on an unknown OID rather than returning an empty string, so a typo fails at plan time " +
 			"instead of silently omitting a DN attribute.\n\n" +

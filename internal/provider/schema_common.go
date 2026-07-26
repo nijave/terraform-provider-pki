@@ -114,7 +114,7 @@ func subjectBlock() schema.Block {
 			"The two forms may not be combined: setting any named field or `extra_attribute` block " +
 			"alongside an `attribute` block is an error.\n\n" +
 			"Drift is compared on the **encoded DN bytes**, not on the shape of the configuration, " +
-			"so any configuration that encodes to the same DN plans clean -- including a named-field " +
+			"so any configuration that encodes to the same DN plans clean — including a named-field " +
 			"configuration whose canonical order happens to match an ordered-form original.",
 		Validators: []validator.Object{subjectFormsValidator{}},
 		Attributes: map[string]schema.Attribute{
@@ -396,7 +396,7 @@ func extraExtensionBlock() schema.Block {
 			"Use this for anything the typed blocks above do not cover, including the " +
 			"`GeneralName` forms `san` omits. The provider neither parses nor re-encodes the " +
 			"value, so nothing is lost to a round trip through a parser this provider does not " +
-			"have -- and nothing is validated either.",
+			"have — and nothing is validated either.",
 		NestedObject: schema.NestedBlockObject{
 			Attributes: map[string]schema.Attribute{
 				"oid": schema.StringAttribute{

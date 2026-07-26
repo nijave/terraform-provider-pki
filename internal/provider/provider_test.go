@@ -3,9 +3,13 @@
 package provider_test
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -86,6 +90,59 @@ data "pki_oids" "check" {}
 			PlanOnly: true,
 		}},
 	})
+}
+
+// TestUserFacingStringsUseEmDashes pins the house style split that a cosmetic
+// review finding turned up: Go comments in this repository write a parenthetical
+// break as `--`, but user-facing text renders it, so it has to be a real em dash
+// there. `--` inside a MarkdownDescription reaches the registry documentation as
+// two literal hyphens.
+//
+// Scanning string literals rather than the raw file text is what separates the
+// two cases cleanly: a comment is not a literal, so the convention that applies
+// to comments cannot trip this test. And every user-facing string this package
+// produces -- MarkdownDescription, diagnostic summary, diagnostic detail -- is a
+// literal in one of these files, so the one rule covers all of them.
+//
+// Scoped to internal/provider. internal/pki has two error-message literals with
+// `--` in them and belongs to a different set of files.
+func TestUserFacingStringsUseEmDashes(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parsing the package source: %v", err)
+	}
+
+	checked := 0
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				lit, ok := n.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				value, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					// A raw string literal that will not unquote is not
+					// something this test can read; skip it rather than fail.
+					return true
+				}
+				checked++
+				if strings.Contains(value, " -- ") {
+					t.Errorf("%s: string literal contains \" -- \"; user-facing text renders it "+
+						"literally, so use an em dash (—) instead", fset.Position(lit.Pos()))
+				}
+				return true
+			})
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no string literals were checked; the test is not doing what it claims")
+	}
 }
 
 // TestEveryGoFileHasTheSPDXHeader guards the whole module, not just this
