@@ -28,6 +28,29 @@ Every task's requirements implicitly include this section.
 - **`docs/` is generated, never hand-edited.** `make docs` must leave the tree clean; CI fails on a `git diff`. `docs/superpowers/` is unrelated hand-written content and must not be clobbered — Task 14 Step 3 verifies that explicitly.
 - **Formatter/linter/test runner:** `gofmt -l` empty, `go vet ./...` clean, `go test ./...` green, `make testacc` green against `tofu`.
 - **Commit style:** Conventional Commits. **Stage explicit paths;** never `git add -A`.
+- **Every `ExpectError` regexp must match text only the provider produces.** Terraform and OpenTofu echo the offending configuration inside a diagnostic, so a pattern matching an attribute name or a literal that appears in the test's own config will pass whether or not the provider ever ran. Task 2 measured this: its two patterns, `commonNam` and `1\.2\.3\.4\.5\.6\.7\.8\.9`, both passed **before any implementation existed**, matching the source line quoted in OpenTofu's "function not found" diagnostic.
+
+  **Many of the `ExpectError` values written into the tasks below have this defect.** They were drafted before the trap was understood. Each one is the implementing task's responsibility to tighten, and these are the ones already identified as suspect — every case where the pattern names something the config also contains:
+
+  | Task | Pattern | Also in the config |
+  | --- | --- | --- |
+  | 5 | `DSA\|Invalid Attribute Value` | `algorithm = "DSA"` |
+  | 5 | `ecdsa_curve\|ECDSA` | `ecdsa_curve = "P256"` |
+  | 5 | `rsa_bits\|RSA` | `rsa_bits = 2048` |
+  | 6 | `mutually exclusive\|attribute` | `attribute {` |
+  | 7 | `base64` | `content_base64` |
+  | 8 | `validity\|duration` | `validity = "forever"` |
+  | 8 | `serial\|hex` | `serial_number = "not-hex"` |
+  | 9 | `does not match\|ca_private_key_pem` | `ca_private_key_pem` |
+  | 11 | `reason\|Invalid Attribute Value` | `reason = "becauseISaidSo"` |
+  | 11 | `next_update\|duration` | `next_update = "soon"` |
+  | 11 | `revoked_at\|RFC3339` | `revoked_at = "yesterday"` |
+  | 11 | `duplicate\|2001` | `serial_number = "2001"` |
+  | 12 | `pkcs11\|Invalid Attribute Value` | `format = "pkcs11"` |
+  | 12 | `der\|private key` | `format = "der"` |
+  | 12 | `pkcs7\|private key` | `format = "pkcs7"` |
+
+  Replace each with a distinctive fragment of the message the implementation actually emits, then **verify by removing the check** — or, for a schema validator, by loosening it — and confirming the test fails. A pattern you have not seen fail is a pattern you have not tested. Patterns that match framework-generated text (`cannot be configured together`, `Invalid Attribute Combination`) or a value absent from the config (`2048` where the config says `1024`, `crlSign` where it says `keyCertSign`, `file://` where the ID has no scheme) are already sound and need no change.
 
 ## Naming conventions fixed by this plan
 
