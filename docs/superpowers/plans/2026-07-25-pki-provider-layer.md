@@ -1646,18 +1646,24 @@ func TestAccPrivateKeyRejectsInvalidConfig(t *testing.T) {
 			expect: regexp.MustCompile(`(?s)DSA|Invalid Attribute Value`),
 		},
 		"rsa too small": {
-			config: `resource "pki_private_key" "test" { algorithm = "RSA"
-  rsa_bits = 1024 }`,
+			config: `resource "pki_private_key" "test" {
+  algorithm = "RSA"
+  rsa_bits  = 1024
+}`,
 			expect: regexp.MustCompile(`(?s)2048`),
 		},
 		"curve on rsa": {
-			config: `resource "pki_private_key" "test" { algorithm = "RSA"
-  ecdsa_curve = "P256" }`,
+			config: `resource "pki_private_key" "test" {
+  algorithm   = "RSA"
+  ecdsa_curve = "P256"
+}`,
 			expect: regexp.MustCompile(`(?s)ecdsa_curve|ECDSA`),
 		},
 		"bits on ed25519": {
-			config: `resource "pki_private_key" "test" { algorithm = "ED25519"
-  rsa_bits = 2048 }`,
+			config: `resource "pki_private_key" "test" {
+  algorithm = "ED25519"
+  rsa_bits  = 2048
+}`,
 			expect: regexp.MustCompile(`(?s)rsa_bits|RSA`),
 		},
 	} {
@@ -1702,6 +1708,13 @@ resource "local_sensitive_file" "key" {
   file_permission = "0600"
 }
 `, keyPath),
+				// terraform-plugin-testing v1.16.0 rejects providers being
+				// specified at both levels ("Providers must only be specified
+				// either at the TestCase or TestStep level"), so this step
+				// declares BOTH the external provider and the in-process
+				// factories, and the TestCase must not set
+				// ProtoV6ProviderFactories at all. Measured during Task 5.
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 				ExternalProviders: map[string]resource.ExternalProvider{
 					"local": {Source: "hashicorp/local"},
 				},
