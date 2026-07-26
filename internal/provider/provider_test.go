@@ -3,7 +3,10 @@
 package provider_test
 
 import (
+	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
@@ -49,6 +52,17 @@ func testAccPreCheck(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("TF_ACC_TERRAFORM_PATH=%q is not usable: %v", path, err)
 	}
+	// Without this, terraform-plugin-testing pairs its default host
+	// registry.terraform.io with the legacy "-" namespace it registers for
+	// reattach, and OpenTofu refuses the combination with a message about
+	// provider address parsing that says nothing about the real cause. Fail
+	// here instead, where the message can name the fix.
+	if os.Getenv("TF_ACC_PROVIDER_HOST") == "" {
+		t.Fatal("TF_ACC_PROVIDER_HOST is not set. Run `make testacc`, which sets it to " +
+			"registry.opentofu.org. Without it terraform-plugin-testing pairs its default " +
+			"registry.terraform.io host with the legacy \"-\" namespace, and OpenTofu rejects " +
+			"that pairing before the provider is ever reached.")
+	}
 }
 
 // TestProviderSchema is a unit test -- no TF_ACC required -- that catches a
@@ -71,4 +85,55 @@ func TestProviderSchema(t *testing.T) {
 			PlanOnly: true,
 		}},
 	})
+}
+
+// TestEveryGoFileHasTheSPDXHeader guards the whole module, not just this
+// package. internal/pki enforces the header for its own files (see that
+// package's boundary_test.go), but every later task in this plan adds files
+// under main.go, internal/provider, and tools/ -- directories that package's
+// same-directory os.ReadDir check never sees. Without a repo-wide walk, the
+// header requirement is a convention everywhere outside internal/pki, and
+// conventions are exactly what slip.
+func TestEveryGoFileHasTheSPDXHeader(t *testing.T) {
+	t.Parallel()
+
+	const root = "../.."
+	const want = "// SPDX-License-Identifier: GPL-3.0-or-later"
+	skipDirs := map[string]bool{
+		".git":         true,
+		".claude":      true,
+		".superpowers": true,
+	}
+
+	checked := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".go") {
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("reading %s: %v", path, err)
+			return nil
+		}
+		checked++
+		if !strings.HasPrefix(string(content), want) {
+			t.Errorf("%s does not start with %q", path, want)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+	if checked == 0 {
+		t.Fatal("no Go files were checked; the test is not doing what it claims")
+	}
 }
