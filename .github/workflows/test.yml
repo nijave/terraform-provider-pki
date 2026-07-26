@@ -48,5 +48,27 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
       - run: go mod download
+      # internal/pki cross-validates its output against openssl and keytool, and
+      # each of those tests skips itself when the tool is absent. That is right
+      # for a contributor who does not have them and wrong for CI: with both off
+      # PATH, 12 tests vanish -- the PKCS#12 emitted-algorithm guards that keep a
+      # bundle importable on a phone, both truststore alias-collision guards that
+      # catch silent trust-anchor loss, and the subjectKeyIdentifier comparison
+      # against openssl -- while `go test` still prints ok. A runner-image change
+      # must not be able to delete this project's highest-value assertions
+      # silently, so assert the tools are here before running anything.
+      - name: Require openssl and keytool
+        run: |
+          missing=""
+          for tool in openssl keytool; do
+            command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "missing required test tools:$missing" >&2
+            echo "the internal/pki cross-validation tests would silently skip" >&2
+            exit 1
+          fi
+          openssl version
+          keytool -help 2>&1 | head -n 1
       - name: go test
         run: go test -v -cover ./internal/...
