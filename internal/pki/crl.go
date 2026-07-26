@@ -189,13 +189,16 @@ func CreateCRL(t CRLTemplate, caCert *x509.Certificate, caKey crypto.Signer) ([]
 		return nil, errors.New("signing key is required")
 	}
 
-	sigAlg := t.SignatureAlgorithm
-	if sigAlg == x509.UnknownSignatureAlgorithm {
-		alg, err := DefaultSignatureAlgorithm(caKey)
-		if err != nil {
-			return nil, err
-		}
-		sigAlg = alg
+	// resolveSignatureAlgorithm, not just DefaultSignatureAlgorithm: the
+	// defaulting is only half of what the certificate path does. The other half
+	// is the offered-algorithm allow-list, which is what keeps a SHA-1 or MD5
+	// signature out of a CRL this library could not then verify, and the family
+	// check, which reports a mismatch against the algorithm and key the operator
+	// named rather than leaving crypto/x509's "requested SignatureAlgorithm does
+	// not match private key type" to surface.
+	sigAlg, err := resolveSignatureAlgorithm(t.SignatureAlgorithm, caKey)
+	if err != nil {
+		return nil, err
 	}
 
 	// Reason goes in ReasonCode, never in ExtraExtensions: Go rejects a

@@ -207,6 +207,60 @@ func TestCreateCRLRejectsBadTemplates(t *testing.T) {
 	}
 }
 
+// TestCreateCRLRejectsAnInsecureSignatureAlgorithm is the CRL-side twin of
+// TestCreateCertificateRejectsInsecureSignatureAlgorithms.
+//
+// CreateCRL used to hand-roll only the defaulting half of what
+// resolveSignatureAlgorithm does, so the allow-list that keeps SHA-1 and MD5 out
+// of certificates did not cover CRLs at all: this call produced a SHA-1 signed
+// CRL without complaint, while the equivalent CreateCertificate call was refused
+// by name. The signing key here is the family SHA1WithRSA requires, so nothing
+// but the allow-list can reject it.
+func TestCreateCRLRejectsAnInsecureSignatureAlgorithm(t *testing.T) {
+	t.Parallel()
+	rsaCA, rsaCAKey := testRSACA(t, "rsa-ca")
+	now := time.Now().Truncate(time.Second).UTC()
+	_, err := CreateCRL(CRLTemplate{
+		Number:             big.NewInt(1),
+		ThisUpdate:         now,
+		NextUpdate:         now.Add(168 * time.Hour),
+		SignatureAlgorithm: x509.SHA1WithRSA,
+	}, rsaCA, rsaCAKey)
+	if err == nil {
+		t.Fatal("CreateCRL accepted SHA1WithRSA, which this package does not offer")
+	}
+	if !strings.Contains(err.Error(), "not offered") {
+		t.Errorf("error = %q, want it to report that the algorithm is not offered", err)
+	}
+}
+
+// TestCreateCRLMismatchedSignatureAlgorithmNamesTheKeyFamily pins that a family
+// mismatch on the CRL path is reported by this package's own message, naming the
+// algorithm and both key families, rather than by crypto/x509's "requested
+// SignatureAlgorithm does not match private key type" -- which names neither the
+// attribute the operator wrote nor the key they supplied, and is exactly what
+// signatureAlgorithmKeyTypes exists to replace.
+func TestCreateCRLMismatchedSignatureAlgorithmNamesTheKeyFamily(t *testing.T) {
+	t.Parallel()
+	ca, caKey := testCA(t, nil, nil, "ca") // ECDSA P-256
+	now := time.Now().Truncate(time.Second).UTC()
+	_, err := CreateCRL(CRLTemplate{
+		Number:             big.NewInt(1),
+		ThisUpdate:         now,
+		NextUpdate:         now.Add(168 * time.Hour),
+		SignatureAlgorithm: x509.SHA256WithRSA,
+	}, ca, caKey)
+	if err == nil {
+		t.Fatal("CreateCRL accepted an RSA signature algorithm with an ECDSA signing key")
+	}
+	if !strings.Contains(err.Error(), "requires a RSA signing key") {
+		t.Errorf("error = %q, want this package's message naming the required key family", err)
+	}
+	if strings.Contains(err.Error(), "does not match private key type") {
+		t.Errorf("error = %q, want this package's message rather than crypto/x509's", err)
+	}
+}
+
 func TestReasonCodes(t *testing.T) {
 	t.Parallel()
 	// RFC 5280 5.3.1. Note that 7 is unused and must not be accepted.
