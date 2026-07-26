@@ -466,11 +466,22 @@ func (m *subjectModel) toPKI(ctx context.Context, p path.Path) (pki.Subject, dia
 //
 // ExtraAttributes is an empty slice rather than nil, so it converts to an empty
 // list rather than a null one. Configuration that declares no `extra_attribute`
-// block actually sends null, not an empty list, so the two do not match
-// literally -- but Terraform treats a null and an empty block collection as the
-// same absence, and an ExpectEmptyPlan check against an imported certificate
-// confirmed no drift either way. Either representation works; this one is kept
-// because it makes len() the only emptiness test the code needs.
+// block sends null, not an empty list, so the two do not match literally.
+//
+// They are nonetheless the same absence to Terraform, and that is measured
+// rather than assumed: TestAccSharedBlocksImportShapedSubjectPlansClean applies a
+// resource whose Create writes this function's output over a configuration with
+// ordered `attribute` blocks and no `extra_attribute` block, which puts the empty
+// collection into state against a null one in configuration. Two independent
+// checks rule on it there -- Terraform's own after-apply consistency check, which
+// fails the apply when state and plan disagree in a way it can see, and
+// ExpectEmptyPlan on the plan after apply and refresh. Both pass against OpenTofu
+// 1.12 and framework v1.19.
+//
+// Either representation therefore works, and this one is kept because it makes
+// len() the only emptiness test the code needs. What is *not* true, and was the
+// original reason for writing it this way, is that a zero-occurrence
+// ListNestedBlock arrives as an empty list: it arrives null (see isSet).
 func subjectFromPKI(s pki.Subject) subjectModel {
 	m := subjectModel{
 		CommonName:          types.StringNull(),
