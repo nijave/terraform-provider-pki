@@ -50,6 +50,69 @@ func TestAccDataSourceOIDs(t *testing.T) {
 	})
 }
 
+// TestAccDataSourceOIDsSignatureAlgorithmAsymmetry asserts the one group that is
+// not a bijection, through the data source rather than through internal/pki.
+//
+// RFC 8017 registers a single OID for RSASSA-PSS, 1.2.840.113549.1.1.10, across
+// all hash sizes, because the hash is a PSS parameter rather than part of the
+// OID. So `by_name` maps all three of SHA256-RSAPSS, SHA384-RSAPSS and
+// SHA512-RSAPSS to that one value, and `by_oid` omits it rather than picking one
+// name to answer for it or inventing sub-arcs no implementation would recognise.
+//
+// internal/pki's TestSignatureAlgorithmTableIsNotBijective pins the table. It
+// cannot see this conversion path, which builds both maps out of pki.Table with
+// types.MapValueFrom: a change there that filled in the missing key, or that
+// dropped the duplicate names from `by_name`, would leave that test passing and
+// silently change what a `for_each` over this data source produces.
+func TestAccDataSourceOIDsSignatureAlgorithmAsymmetry(t *testing.T) {
+	const pssOID = "1.2.840.113549.1.1.10"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		TerraformVersionChecks:   testAccVersionChecks,
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: `
+data "pki_oids" "std" {}
+
+output "pss_oid_answers_in_by_oid" {
+  value = contains(keys(data.pki_oids.std.signature_algorithms.by_oid), "` + pssOID + `")
+}
+
+output "names_without_an_oid_of_their_own" {
+  value = length(data.pki_oids.std.signature_algorithms.by_name) - length(data.pki_oids.std.signature_algorithms.by_oid)
+}
+`,
+			ConfigStateChecks: []statecheck.StateCheck{
+				// All three PSS names resolve, and to the same real OID.
+				statecheck.ExpectKnownValue("data.pki_oids.std",
+					tfjsonpath.New("signature_algorithms").AtMapKey("by_name").AtMapKey("SHA256-RSAPSS"),
+					knownvalue.StringExact(pssOID)),
+				statecheck.ExpectKnownValue("data.pki_oids.std",
+					tfjsonpath.New("signature_algorithms").AtMapKey("by_name").AtMapKey("SHA384-RSAPSS"),
+					knownvalue.StringExact(pssOID)),
+				statecheck.ExpectKnownValue("data.pki_oids.std",
+					tfjsonpath.New("signature_algorithms").AtMapKey("by_name").AtMapKey("SHA512-RSAPSS"),
+					knownvalue.StringExact(pssOID)),
+				// by_oid is populated and answers for the algorithms that do own
+				// their OID, so the absence assertion below is about the one
+				// shared OID and not about an empty map.
+				statecheck.ExpectKnownValue("data.pki_oids.std",
+					tfjsonpath.New("signature_algorithms").AtMapKey("by_oid").AtMapKey("1.2.840.113549.1.1.11"),
+					knownvalue.StringExact("SHA256-RSA")),
+				// The shared OID is absent from by_oid. Asserted through
+				// `contains(keys(...))` because a state check can only assert what
+				// a key holds, never that the map does not have it.
+				statecheck.ExpectKnownOutputValue("pss_oid_answers_in_by_oid", knownvalue.Bool(false)),
+				// And exactly three names are missing from the reverse map, which
+				// is the same statement counted the other way: it fails both if
+				// by_oid gains the shared OID and if by_name loses a PSS name.
+				statecheck.ExpectKnownOutputValue("names_without_an_oid_of_their_own", knownvalue.Int64Exact(3)),
+			},
+		}},
+	})
+}
+
 // TestAccDataSourceOIDsSupportsForEach is the capability spec section 11 calls
 // out: the maps must be real maps, iterable and usable as a for_each source,
 // not opaque strings.
