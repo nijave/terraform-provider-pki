@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"os"
 	"os/exec"
@@ -34,6 +35,20 @@ func mustOID(t *testing.T, s string) asn1.ObjectIdentifier {
 		t.Fatalf("ParseOID(%q): %v", s, err)
 	}
 	return oid
+}
+
+// mustFindExt returns the extension with the given dotted OID or fails.
+func mustFindExt(t *testing.T, exts []pkix.Extension, oid string) pkix.Extension {
+	t.Helper()
+	parsed, err := ParseOID(oid)
+	if err != nil {
+		t.Fatalf("ParseOID(%q): %v", oid, err)
+	}
+	ext, ok := FindExtension(exts, parsed)
+	if !ok {
+		t.Fatalf("extension %s not found", oid)
+	}
+	return ext
 }
 
 // requireOpenSSL returns the path to the openssl binary, skipping the test when
