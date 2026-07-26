@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/x509"
+	"slices"
 	"strings"
 	"testing"
 
@@ -406,9 +407,73 @@ func TestEncodePKCS12TrustStoreAliasesAreDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeBundle: %v", err)
 	}
-	text := keytoolList(t, out, testPassword)
-	if !strings.Contains(text, "contains 2 entries") {
-		t.Errorf("keytool -list does not report 2 entries; certificates sharing a subject collapsed into one alias:\n%s", text)
+	assertKeytoolAliases(t, out, testPassword,
+		"certificates sharing a subject collapsed into one alias",
+		"duplicate-subject", "duplicate-subject-2")
+}
+
+// keytoolEntryTypes are the three entry-type tokens `keytool -list` prints on an
+// entry's first line, and the anchor this file's alias parsing uses.
+//
+// They are safe to match where the surrounding prose is not. keytool's
+// Main.doPrintEntry writes these as literals in the source -- "SecretKeyEntry, ",
+// "PrivateKeyEntry, ", "trustedCertEntry, " -- while everything else on the
+// screen comes from its localized resource bundle, so under a non-English locale
+// the entry type is the only part of the line that still reads the same. The
+// creation date next to it is locale-formatted too.
+var keytoolEntryTypes = []string{"trustedCertEntry", "PrivateKeyEntry", "SecretKeyEntry"}
+
+// keytoolAliases returns the aliases `keytool -list` reports, lowercased, in the
+// order keytool printed them.
+//
+// The alias is the text before the first comma on an entry line. That is safe for
+// every alias trustStoreAliases can produce -- a common name, a serial, or a
+// FriendlyName, each optionally suffixed -N -- none of which contains a comma; a
+// DN-shaped alias would break the split, and nothing in this package makes one.
+//
+// This exists because the assertion it replaces matched the English sentence
+// "contains 2 entries", which is `keytool -list`'s localized summary line and
+// therefore reads differently under any other locale. Counting parsed aliases is
+// locale-independent, and naming them is strictly stronger: the collapse these
+// tests exist to catch is one alias swallowing another, and only the alias list
+// says which of the two survived.
+func keytoolAliases(t *testing.T, store []byte, password string) []string {
+	t.Helper()
+	text := keytoolList(t, store, password)
+	var aliases []string
+	for _, line := range strings.Split(text, "\n") {
+		if !slices.ContainsFunc(keytoolEntryTypes, func(kind string) bool {
+			return strings.Contains(line, kind)
+		}) {
+			continue
+		}
+		alias, _, ok := strings.Cut(line, ",")
+		if !ok {
+			continue
+		}
+		aliases = append(aliases, strings.ToLower(strings.TrimSpace(alias)))
+	}
+	if len(aliases) == 0 {
+		// No entry line parsed at all. That is a broken helper, not a passing
+		// keystore, and it must not read as "the aliases do not match".
+		t.Fatalf("no %v lines found in keytool -list output, so no alias could be parsed:\n%s", keytoolEntryTypes, text)
+	}
+	return aliases
+}
+
+// assertKeytoolAliases fails unless keytool reports exactly want, in order.
+// Aliases are compared lowercased because Java folds them: keytool lists an alias
+// set as "Root"/"root" under the single name "root", which is the collapse these
+// callers are guarding against.
+func assertKeytoolAliases(t *testing.T, store []byte, password, hazard string, want ...string) {
+	t.Helper()
+	lowered := make([]string, len(want))
+	for i, w := range want {
+		lowered[i] = strings.ToLower(w)
+	}
+	got := keytoolAliases(t, store, password)
+	if !slices.Equal(got, lowered) {
+		t.Errorf("keytool -list reports aliases %v, want %v; %s", got, lowered, hazard)
 	}
 }
 
@@ -434,10 +499,12 @@ func TestEncodePKCS12TrustStoreAliasesAreCaseInsensitivelyDistinct(t *testing.T)
 	if err != nil {
 		t.Fatalf("EncodeBundle: %v", err)
 	}
-	text := keytoolList(t, out, testPassword)
-	if !strings.Contains(text, "contains 2 entries") {
-		t.Errorf("keytool -list does not report 2 entries; aliases differing only in case collapsed:\n%s", text)
-	}
+	// "Root" is folded to "root" by Java, so the second certificate has to arrive
+	// under the suffixed alias. A case-sensitive dedup would emit [Root root] and
+	// keytool would list them both as "root" -- one entry, one lost anchor.
+	assertKeytoolAliases(t, out, testPassword,
+		"aliases differing only in case collapsed",
+		"root", "root-2")
 }
 
 // TestEncodePKCS12PasswordlessRejectsAPrivateKey covers a combination that

@@ -261,10 +261,12 @@ func TestEncodeJKSTrustStoreAliasesAreCaseInsensitivelyDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeBundle: %v", err)
 	}
-	text := keytoolList(t, out, testPassword)
-	if !strings.Contains(text, "contains 2 entries") {
-		t.Errorf("keytool -list does not report 2 entries; aliases differing only in case collapsed:\n%s", text)
-	}
+	// keystore-go lowercases with its own convertAlias, so the aliases keytool
+	// prints are already folded; the -2 suffix is the whole of what stops the
+	// second SetTrustedCertificateEntry from overwriting the first.
+	assertKeytoolAliases(t, out, testPassword,
+		"aliases differing only in case collapsed",
+		"root", "root-2")
 }
 
 // TestEncodeJKSTrustStoreIsDeterministic checks the property WithOrderedAliases
