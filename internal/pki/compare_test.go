@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -773,6 +774,193 @@ func TestCompareCertificateRejectsMissingDesiredPublicKey(t *testing.T) {
 	}
 }
 
+// TestCompareCertificateRejectsAnActualWithNoSerial covers the fourth
+// precondition, which no parsed certificate can reach.
+//
+// x509.ParseCertificate always fills SerialNumber -- cryptobyte reads it into a
+// big.Int that is never nil, whatever the DER says -- so this input has to be
+// constructed rather than parsed. That is not a contrivance: x509.Certificate has
+// exported fields and no constructor, and CompareInput.Actual is an exported field
+// of an exported type, so a caller assembling a certificate in code is a supported
+// way to call this function and the only way to reach the guard.
+//
+// The guard earns its place by what happens without it. Serial.Cmp dereferences
+// the nil, and a panic inside a Terraform provider is a plugin crash the operator
+// cannot attribute to an attribute or a resource. Everything else in the input
+// below is valid, so the error can only come from the serial check.
+func TestCompareCertificateRejectsAnActualWithNoSerial(t *testing.T) {
+	t.Parallel()
+	leaf, key, ca := testLeaf(t)
+	actual := *leaf
+	actual.SerialNumber = nil
+
+	_, err := CompareCertificate(CompareInput{
+		Desired: desiredFor(t, leaf), DesiredPublicKey: PublicKeyOf(key), Actual: &actual, CA: ca,
+	})
+	if err == nil {
+		t.Fatal("CompareCertificate with a nil Actual.SerialNumber returned nil error, want an error")
+	}
+	// Named specifically, because the desired-serial precondition two lines above
+	// produces a similar sentence and this test must not be satisfied by it.
+	if !strings.Contains(err.Error(), "actual certificate has no serial number") {
+		t.Errorf("err = %v, want the actual-serial precondition's own message", err)
+	}
+}
+
+// TestCompareExtensionsCollapsesADuplicateOIDInBothDirections is the consistency
+// property between compareExtensions' two sweeps.
+//
+// A duplicate extension OID is forbidden by RFC 5280 4.2 and rejected by
+// rejectDuplicateExtensionOIDs on everything this package issues, so it can only
+// arrive by adoption -- and adoption is the case the whole comparison exists for.
+// The forward sweep has always collapsed duplicates, because it indexes actual by
+// OID and takes the first occurrence. The reverse sweep iterated actual directly,
+// so an OID the template does not name produced one Drift per copy: the same
+// field, the same value, twice, in a plan explanation where an operator counts
+// lines to decide how much is wrong.
+//
+// Both directions are asserted from one fixture certificate, so a fix that
+// de-duplicated the reverse sweep by breaking the forward one fails here.
+func TestCompareExtensionsCollapsesADuplicateOIDInBothDirections(t *testing.T) {
+	t.Parallel()
+	// A certificate genuinely carrying the same OID twice, with different values
+	// so that the first-occurrence rule is observable in the reported Drift.
+	dup := mustOID(t, "2.5.29.31") // cRLDistributionPoints, which no template here sets
+	first := pkix.Extension{Id: dup, Value: []byte{0x04, 0x01, 0xaa}}
+	second := pkix.Extension{Id: dup, Value: []byte{0x04, 0x01, 0xbb}}
+
+	// Reverse direction: the template does not name the OID at all.
+	reverse := compareExtensions(nil, []pkix.Extension{first, second})
+	if len(reverse) != 1 {
+		t.Fatalf("a duplicated OID absent from the template produced %d drift entries (%v), want 1", len(reverse), reverse)
+	}
+	if reverse[0].Field != "2.5.29.31" || reverse[0].Want != "absent" {
+		t.Errorf("reverse drift = %v, want 2.5.29.31 wanting absent", reverse[0])
+	}
+	if want := describeExtension(first); reverse[0].Got != want {
+		t.Errorf("reverse drift reported %q, want the first occurrence %q; the two sweeps disagree on which copy wins",
+			reverse[0].Got, want)
+	}
+
+	// Forward direction: the template names the OID, and the certificate's first
+	// occurrence is the one compared against it. Asserted alongside the reverse
+	// case because "collapse duplicates" is only consistent if both sweeps pick
+	// the same copy.
+	forward := compareExtensions([]pkix.Extension{second}, []pkix.Extension{first, second})
+	if len(forward) != 1 {
+		t.Fatalf("a duplicated OID named by the template produced %d drift entries (%v), want 1", len(forward), forward)
+	}
+	if got, want := forward[0].Got, describeExtension(first); got != want {
+		t.Errorf("forward drift reported %q, want the first occurrence %q", got, want)
+	}
+
+	// And the same certificate compared against a template that names the first
+	// occurrence reports nothing, which is what proves the single entry above is a
+	// real difference rather than the duplicate itself being reported.
+	if clean := compareExtensions([]pkix.Extension{first}, []pkix.Extension{first, second}); len(clean) != 0 {
+		t.Errorf("a duplicated OID matching the template on its first occurrence reported %v, want no drift", clean)
+	}
+}
+
+// TestADuplicateExtensionOIDCannotBeParsed records why the collapse in
+// compareExtensions is defensive rather than load-bearing, and is the reason this
+// file tests the duplicate case on a constructed certificate rather than a parsed
+// one.
+//
+// The finding this closes was written expecting "a certificate genuinely carrying
+// a duplicate OID" to be producible and parseable. It is producible --
+// x509.CreateCertificate writes whatever ExtraExtensions holds, RFC 5280 4.2
+// notwithstanding -- and it is not parseable: crypto/x509's parser.go keeps a
+// seenExts set and fails the whole certificate. Measured on go1.25.12.
+//
+// So a duplicate OID cannot reach CompareCertificate from a PEM file, a
+// Kubernetes Secret, or Terraform state. It can only reach it from an
+// x509.Certificate a caller assembled in code, which is what the test below does.
+// Pinning the parser's behavior here means that if a future Go relaxes it -- and
+// the check is a policy choice, not a structural necessity -- this test fails and
+// points at the two sweeps that then start mattering for real input.
+func TestADuplicateExtensionOIDCannotBeParsed(t *testing.T) {
+	t.Parallel()
+	root, rootKey := testCA(t, nil, nil, "duplicate-oid-issuer")
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	serial, err := RandomSerial()
+	if err != nil {
+		t.Fatalf("RandomSerial: %v", err)
+	}
+	dup := mustOID(t, "2.5.29.31") // cRLDistributionPoints, which no template here sets
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "duplicate-oid-leaf"},
+		NotBefore:    root.NotBefore,
+		NotAfter:     root.NotAfter,
+		ExtraExtensions: []pkix.Extension{
+			{Id: dup, Value: []byte{0x04, 0x01, 0xaa}},
+			{Id: dup, Value: []byte{0x04, 0x01, 0xbb}},
+		},
+	}, root, PublicKeyOf(key), rootKey)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate refused to write a duplicate extension, so this test proves nothing: %v", err)
+	}
+
+	_, err = x509.ParseCertificate(der)
+	if err == nil {
+		t.Fatal("x509.ParseCertificate accepted a certificate carrying a duplicate extension OID; compareExtensions' duplicate collapse is now reachable from real input and needs a test over parsed bytes")
+	}
+	if !strings.Contains(err.Error(), "duplicate extension") {
+		t.Errorf("x509.ParseCertificate failed for some other reason than the duplicate, so this test is not pinning what it claims: %v", err)
+	}
+	// ParseCertificatePEM is the door real input comes through, and it must refuse
+	// the same bytes.
+	if _, err := ParseCertificatePEM(EncodeCertificatePEM(der)); err == nil {
+		t.Error("ParseCertificatePEM accepted a certificate carrying a duplicate extension OID")
+	}
+}
+
+// TestCompareCertificateCollapsesADuplicateOIDEndToEnd is the same property as
+// TestCompareExtensionsCollapsesADuplicateOIDInBothDirections, through the
+// exported entry point rather than the unexported helper, so the de-duplication is
+// pinned at the boundary a caller actually uses.
+//
+// The duplicate is added to a parsed certificate's Extensions slice rather than to
+// its DER, because TestADuplicateExtensionOIDCannotBeParsed establishes that DER
+// carrying a duplicate does not parse. Everything else about the certificate --
+// RawSubject, RawTBSCertificate, Signature -- is the real issued article, so the
+// subject, serial, validity and signature checks all pass and the extension sweeps
+// are the only thing that can report anything.
+func TestCompareCertificateCollapsesADuplicateOIDEndToEnd(t *testing.T) {
+	t.Parallel()
+	leaf, key, ca := testLeaf(t)
+	dup := mustOID(t, "2.5.29.31")
+
+	actual := *leaf
+	actual.Extensions = append(slices.Clone(leaf.Extensions),
+		pkix.Extension{Id: dup, Value: []byte{0x04, 0x01, 0xaa}},
+		pkix.Extension{Id: dup, Value: []byte{0x04, 0x01, 0xbb}},
+	)
+
+	drift, err := CompareCertificate(CompareInput{
+		Desired: desiredFor(t, leaf), DesiredPublicKey: PublicKeyOf(key), Actual: &actual, CA: ca,
+	})
+	if err != nil {
+		t.Fatalf("CompareCertificate: %v", err)
+	}
+	// Exactly one entry for the duplicated OID, and nothing else at all: the rest
+	// of the certificate matches its template, so any other entry means this test
+	// is measuring something it did not intend to.
+	if got := driftFields(drift); got != "2.5.29.31" {
+		t.Fatalf("CompareCertificate reported drift %v (fields %q), want exactly one entry for 2.5.29.31", drift, got)
+	}
+	if drift[0].Want != "absent" {
+		t.Errorf("drift = %v, want the reverse sweep's absent form", drift[0])
+	}
+	if want := describeExtension(pkix.Extension{Id: dup, Value: []byte{0x04, 0x01, 0xaa}}); drift[0].Got != want {
+		t.Errorf("drift reported %q, want the first occurrence %q", drift[0].Got, want)
+	}
+}
+
 // TestCompareCertificateReportsAnUnencodableSubjectAsAnError is the reason the
 // comparison calls EncodeDER rather than Subject.Equal. A DN that parses but
 // cannot be re-encoded -- here a PrintableString holding '@' -- must surface the
@@ -849,7 +1037,12 @@ func TestCompareValidity(t *testing.T) {
 		"inside the window":        {72 * time.Hour, true},
 		"longer than the lifetime": {365 * 24 * time.Hour, true},
 	} {
-		if got := CompareValidity(&cert, tc.earlyRenewal, now); got != tc.want {
+		got, err := CompareValidity(&cert, tc.earlyRenewal, now)
+		if err != nil {
+			t.Errorf("%s: CompareValidity: %v", label, err)
+			continue
+		}
+		if got != tc.want {
 			t.Errorf("%s: CompareValidity = %v, want %v", label, got, tc.want)
 		}
 	}
@@ -857,7 +1050,36 @@ func TestCompareValidity(t *testing.T) {
 	// An already-expired certificate is ready for renewal regardless.
 	expired := cert
 	expired.NotAfter = now.Add(-time.Hour)
-	if !CompareValidity(&expired, 0, now) {
+	if ready, err := CompareValidity(&expired, 0, now); err != nil {
+		t.Errorf("CompareValidity(expired): %v", err)
+	} else if !ready {
 		t.Error("an expired certificate is not reported ready for renewal")
+	}
+}
+
+// TestCompareValidityRejectsANilCertificate pins the nil contract this function
+// used to have no answer to at all: it dereferenced actual.NotAfter and panicked,
+// while its signature advertised a pointer and documented nothing about nil.
+//
+// An error rather than a bool is what the rest of compare.go does with a
+// precondition -- CompareCertificate has four of them -- and both bool answers
+// would be worse than a panic rather than better. A nil certificate reported as
+// ready for renewal makes the provider reissue on the strength of a certificate it
+// never looked at, which for a 20-year certificate installed on a phone means a
+// manual re-enrollment; reported as not ready, a resource silently stops renewing
+// and the operator finds out when TLS starts failing. The false alongside the
+// error is deliberate and asserted: a caller that ignores the error must not get
+// the reissuing answer.
+func TestCompareValidityRejectsANilCertificate(t *testing.T) {
+	t.Parallel()
+	ready, err := CompareValidity(nil, 24*time.Hour, time.Now())
+	if err == nil {
+		t.Fatalf("CompareValidity(nil) returned %v and a nil error, want an error", ready)
+	}
+	if ready {
+		t.Error("CompareValidity(nil) returned true alongside its error; a caller dropping the error would reissue")
+	}
+	if !strings.Contains(err.Error(), "actual certificate is required") {
+		t.Errorf("err = %v, want it to name the missing input", err)
 	}
 }

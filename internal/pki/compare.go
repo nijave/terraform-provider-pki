@@ -92,6 +92,21 @@ func CompareCertificate(in CompareInput) ([]Drift, error) {
 		return nil, fmt.Errorf("desired serial number is required")
 	}
 	if in.Actual.SerialNumber == nil {
+		// Kept deliberately, and it is the one precondition here that
+		// x509.ParseCertificate cannot violate: its serial number is parsed by
+		// cryptobyte into a big.Int that is always non-nil, so no amount of
+		// malformed DER produces a certificate that trips this.
+		//
+		// It is not dead all the same. x509.Certificate is an exported struct with
+		// exported fields and no constructor, and CompareInput.Actual is an
+		// exported field of an exported type, so a caller can hand this function a
+		// certificate it built rather than parsed -- which is exactly what the
+		// provider's own tests and this package's do to reach a case a real
+		// certificate cannot express. Without the guard, Serial.Cmp dereferences
+		// the nil and the panic surfaces from inside a Terraform provider process
+		// as a plugin crash with no attribution. The check is two lines and one
+		// branch, and TestCompareCertificateRejectsAnActualWithNoSerial reaches it
+		// the way a caller would.
 		return nil, fmt.Errorf("actual certificate has no serial number")
 	}
 
@@ -192,18 +207,41 @@ func CompareCertificate(in CompareInput) ([]Drift, error) {
 // reason it appears in an issued certificate at all: it identifies the issuer,
 // so no template ever contains it, and reporting it would make every CA-signed
 // certificate drift.
+//
+// Both sweeps collapse a duplicate OID to its first occurrence, and they have to
+// agree on that. RFC 5280 4.2 forbids a duplicate; rejectDuplicateExtensionOIDs
+// enforces it on everything this package issues, and crypto/x509's own parser
+// enforces it on everything this package reads -- parser.go's seenExts check
+// fails ParseCertificate outright with "certificate contains duplicate extension
+// with OID". So a duplicate cannot arrive by adoption either, and the collapse
+// below is defensive rather than load-bearing: it is reachable only from an
+// x509.Certificate a caller assembled in code, which is supported because the
+// struct's fields and CompareInput.Actual are all exported.
+//
+// It is kept because the two sweeps disagreeing is worse than either behavior.
+// The forward sweep collapses duplicates for free, by indexing actual by OID;
+// the reverse sweep iterating actual directly reported the same OID once per
+// copy, so one certificate carrying one unwanted attribute produced two
+// identical lines in a plan explanation -- and an operator reading
+// "2.5.29.31: want absent, got ..." twice reasonably concludes there are two
+// things to fix.
 func compareExtensions(desired, actual []pkix.Extension) []Drift {
 	var drift []Drift
 
-	// First occurrence wins, matching FindExtension. RFC 5280 4.2 forbids a
-	// duplicate OID and rejectDuplicateExtensionOIDs enforces that on anything
-	// this package issues, but an adopted certificate is not under that
-	// guarantee.
+	// First occurrence wins, matching FindExtension.
+	//
+	// actualOrder records the OIDs in the order the certificate carries them,
+	// once each, so the reverse sweep below can iterate the same de-duplicated
+	// set the forward sweep reads from without falling back on map iteration
+	// order -- which would make a multi-extension drift report shuffle between
+	// two plans of the same configuration.
 	actualByOID := make(map[string]pkix.Extension, len(actual))
+	actualOrder := make([]string, 0, len(actual))
 	for _, ext := range actual {
 		dotted := FormatOID(ext.Id)
 		if _, seen := actualByOID[dotted]; !seen {
 			actualByOID[dotted] = ext
+			actualOrder = append(actualOrder, dotted)
 		}
 	}
 
@@ -233,11 +271,12 @@ func compareExtensions(desired, actual []pkix.Extension) []Drift {
 		}
 	}
 
-	for _, got := range actual {
+	for _, dotted := range actualOrder {
+		got := actualByOID[dotted]
 		if got.Id.Equal(oidAuthorityKeyID) {
 			continue
 		}
-		if desiredOIDs[FormatOID(got.Id)] {
+		if desiredOIDs[dotted] {
 			continue
 		}
 		drift = append(drift, Drift{
@@ -386,6 +425,18 @@ func describePublicKey(pub crypto.PublicKey) string {
 // This is deliberately separate from CompareCertificate: expiry is a function of
 // the clock, not of configuration, so it is the one reason to reissue that has
 // no corresponding Drift.
-func CompareValidity(actual *x509.Certificate, earlyRenewal time.Duration, now time.Time) (readyForRenewal bool) {
-	return !now.Add(earlyRenewal).Before(actual.NotAfter)
+//
+// A nil actual is an error, exactly as it is in CompareCertificate, and for the
+// same reason: a caller with no certificate has a bug, not a certificate that
+// needs renewing. Both other readings of nil are worse. Returning true would
+// have this function answer "yes, replace it" for an input it never examined,
+// and the provider acts on that answer by reissuing -- which for a 20-year
+// certificate on a phone means a manual re-enrollment. Returning false would
+// have a resource silently stop renewing. The error return exists so neither can
+// happen quietly; it is the only error this function can produce.
+func CompareValidity(actual *x509.Certificate, earlyRenewal time.Duration, now time.Time) (readyForRenewal bool, err error) {
+	if actual == nil {
+		return false, fmt.Errorf("actual certificate is required")
+	}
+	return !now.Add(earlyRenewal).Before(actual.NotAfter), nil
 }
