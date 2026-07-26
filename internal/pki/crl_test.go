@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"math/big"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -295,8 +296,43 @@ func TestReasonCodes(t *testing.T) {
 	if _, err := ReasonName(7); err == nil {
 		t.Error("ReasonName(7) succeeded; 7 is unused in RFC 5280")
 	}
-	if names := ReasonNames(); len(names) != 10 {
-		t.Errorf("ReasonNames returned %d names, want 10", len(names))
+	// ReasonNames' order is part of its contract, not an accident of
+	// implementation: it sorts by numeric code so generated documentation and
+	// every error message that interpolates it read in the order RFC 5280 5.3.1
+	// lists the reasons. A count alone would not notice an accidental switch to
+	// the alphabetical order sort.Strings would give -- which starts
+	// "aACompromise, affiliationChanged, cACompromise" rather than "unspecified,
+	// keyCompromise, cACompromise" -- so the sequence is pinned here.
+	//
+	// Note that code 7 is absent, which is why this is a list rather than a range:
+	// removeFromCRL (8) follows certificateHold (6).
+	wantOrder := []string{
+		"unspecified",          // 0
+		"keyCompromise",        // 1
+		"cACompromise",         // 2
+		"affiliationChanged",   // 3
+		"superseded",           // 4
+		"cessationOfOperation", // 5
+		"certificateHold",      // 6
+		"removeFromCRL",        // 8
+		"privilegeWithdrawn",   // 9
+		"aACompromise",         // 10
+	}
+	names := ReasonNames()
+	if !slices.Equal(names, wantOrder) {
+		t.Errorf("ReasonNames() = %v,\n                want %v", names, wantOrder)
+	}
+	// And the order really is the numeric one, checked against the table rather
+	// than against the list above, so a name added to reasonCodes without being
+	// added there cannot pass by matching a stale expectation.
+	for i := 1; i < len(names); i++ {
+		if reasonCodes[names[i-1]] >= reasonCodes[names[i]] {
+			t.Errorf("ReasonNames() is not sorted by code: %q (%d) precedes %q (%d)",
+				names[i-1], reasonCodes[names[i-1]], names[i], reasonCodes[names[i]])
+		}
+	}
+	if len(names) != len(reasonCodes) {
+		t.Errorf("ReasonNames returned %d names, but reasonCodes has %d entries", len(names), len(reasonCodes))
 	}
 }
 
