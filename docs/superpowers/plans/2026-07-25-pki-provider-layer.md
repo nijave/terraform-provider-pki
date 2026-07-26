@@ -5555,6 +5555,8 @@ This is spec §14 follow-up 3, now actionable because the dependency set is fina
         run: go-licenses report ./... --ignore=github.com/nijave/terraform-provider-pki || true
 ```
 
+**Scan the build graph, not the module graph.** `go-licenses check ./...` walks packages actually imported, which is correct. Do not switch it to anything driven by `go list -m all`: that lists transitive requirements from dependencies' own `go.mod` files even when nothing imports them. Measured at the end of Plan 1 — `golang.org/x/net`, `golang.org/x/term`, and `golang.org/x/text` all appear in `go list -m all` via `golang.org/x/crypto`'s `go.mod`, while `go mod why golang.org/x/text` reports "main module does not need package golang.org/x/text" and none is linked into the build. All three are BSD-3-Clause, so nothing was at risk, but a module-graph-driven gate would have demanded an audit trail for dependencies the binary never contains.
+
 `go-licenses` classifies MPL-2.0 as `reciprocal`, which is not in the disallowed set — correct, because spec §13 establishes that MPL-2.0 §3.3 permits distributing the combined work under GPLv3 and that the framework's sources carry no Exhibit B notice. If `go-licenses check` reports an unexpected classification, read spec §13 before changing the allowlist; the MPL false-positive trap documented there is exactly the kind of finding that looks like a real problem.
 
 The `report` step runs even on failure so the log shows the full license inventory, which is what a human needs to adjudicate a new finding.
