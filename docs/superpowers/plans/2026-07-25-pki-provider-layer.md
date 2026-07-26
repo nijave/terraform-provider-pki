@@ -1400,15 +1400,33 @@ func TestResolveImportIDErrorNamesTheSchemes(t *testing.T) {
 // TestResolveImportIDErrorDoesNotEchoContents matters because a private key can
 // be imported inline with pem:// or base64://, and a diagnostic is printed to
 // the console and to CI logs.
+//
+// Cover the malformed-scheme shapes, not just the well-formed one. The first
+// version of this test used only "base64://<bad base64>", which the code
+// handled safely, while a one-slash typo and a bare payload both leaked the
+// start of the key.
 func TestResolveImportIDErrorDoesNotEchoContents(t *testing.T) {
 	t.Parallel()
-	const secret = "c3VwZXJzZWNyZXRrZXltYXRlcmlhbA"
-	_, err := resolveImportID("base64://" + secret + "!!!")
-	if err == nil {
-		t.Fatal("expected an error for malformed base64")
-	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("error message echoes the payload: %q", err.Error())
+	const secret = "c3VwZXJzZWNyZXRrZXltYXRlcmlhbHBheWxvYWQ"
+	for _, id := range []string{
+		"base64://" + secret + "!!!", // right scheme, bad payload
+		"base64:/" + secret,          // one slash: no "://" to split on
+		"pem:/" + secret,             // same, other scheme
+		secret,                       // no scheme at all
+		"nonsense://" + secret,       // unknown but well-formed scheme
+	} {
+		_, err := resolveImportID(id)
+		if err == nil {
+			t.Errorf("resolveImportID(%.12s...) returned nil error, want an error", id)
+			continue
+		}
+		// Any run of the payload long enough to be recognizable is a leak.
+		for n := 8; n <= len(secret); n += 8 {
+			if strings.Contains(err.Error(), secret[:n]) {
+				t.Errorf("error message echoes %d characters of the payload: %q", n, err.Error())
+				break
+			}
+		}
 	}
 }
 ```
@@ -1499,20 +1517,46 @@ func resolveImportID(id string) ([]byte, error) {
 		return nil, fmt.Errorf("import ID is empty; %s", usage)
 
 	default:
-		return nil, fmt.Errorf("import ID %q has no recognized scheme; %s", firstSegment(id), usage)
+		if scheme := schemeOf(id); scheme != "" {
+			return nil, fmt.Errorf("import ID scheme %q is not recognized; %s", scheme, usage)
+		}
+		// No scheme to name, and nothing else in the ID is safe to print.
+		return nil, fmt.Errorf("import ID has no recognized scheme; %s", usage)
 	}
 }
 
-// firstSegment returns a short, safe prefix of an ID for use in an error
-// message: enough to identify a typo, never enough to leak a payload.
-func firstSegment(id string) string {
-	if i := strings.Index(id, "://"); i >= 0 {
-		return id[:i+3]
+// schemeOf returns the scheme of an import ID for use in an error message, or
+// the empty string when there is no recognizable one.
+//
+// It returns ONLY the scheme, and nothing when there is no scheme. An earlier
+// version of this helper echoed the first sixteen characters of an
+// unrecognized ID, which leaks key material: `base64:/<key>` -- a one-slash
+// typo -- has no "://" to split on, so it fell through to the length branch and
+// printed the start of the payload. So did an ID with no scheme at all, which
+// is exactly what someone pasting a bare base64 key produces. Measured on all
+// three shapes.
+//
+// A scheme name is not secret and naming it helps a user see the typo. Anything
+// after it may be a private key, and no part of it belongs in a diagnostic that
+// prints to a console and a CI log.
+func schemeOf(id string) string {
+	i := strings.Index(id, "://")
+	if i < 0 {
+		return ""
 	}
-	if len(id) > 16 {
-		return id[:16] + "..."
+	scheme := id[:i]
+	// A scheme is a short token. If the text before "://" is long or contains
+	// anything unexpected, it is not a scheme -- it is payload that happens to
+	// contain "://", so return nothing rather than echoing it.
+	if len(scheme) > 12 {
+		return ""
 	}
-	return id
+	for _, r := range scheme {
+		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '+' && r != '-' && r != '.' {
+			return ""
+		}
+	}
+	return scheme + "://"
 }
 ```
 
