@@ -4,6 +4,8 @@ package pki
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"math/big"
@@ -455,6 +457,91 @@ func TestParseSubjectDERFlattensMultiValuedRDNs(t *testing.T) {
 		t.Fatalf("flattened order = %q, %q, %q; want infra, homelab, cn",
 			parsed.Attributes[0].Value, parsed.Attributes[1].Value, parsed.Attributes[2].Value)
 	}
+}
+
+// TestParseSubjectDERRejectsConstructedStrings covers the BER shape no
+// certificate can carry but an exported parser can still be handed: a DN
+// attribute value whose tag is constructed (0x2c, UTF8String with the compound
+// bit set) rather than primitive, holding the value split into primitive
+// fragments the way BER permits.
+//
+// It has to be built by hand, because crypto/x509 refuses the tag before
+// RawSubject is ever populated -- the sub-test below proves that, and is what
+// makes this defence in depth rather than a live bug. Without the check,
+// ParseSubjectDER takes the fragments' own tag and length bytes for content: the
+// DN "parses" to a value containing raw ASN.1 headers and re-encodes to bytes
+// that match neither the input nor any valid DN.
+func TestParseSubjectDERRejectsConstructedStrings(t *testing.T) {
+	t.Parallel()
+
+	// "ab" and "c" as two primitive UTF8String fragments, which is how BER
+	// spells a constructed string carrying "abc".
+	first, err := asn1.Marshal(asn1.RawValue{Class: asn1.ClassUniversal, Tag: asn1.TagUTF8String, Bytes: []byte("ab")})
+	if err != nil {
+		t.Fatalf("marshalling the first fragment: %v", err)
+	}
+	second, err := asn1.Marshal(asn1.RawValue{Class: asn1.ClassUniversal, Tag: asn1.TagUTF8String, Bytes: []byte("c")})
+	if err != nil {
+		t.Fatalf("marshalling the second fragment: %v", err)
+	}
+	fragments := append(append([]byte{}, first...), second...)
+
+	der, err := asn1.Marshal(rawRDNSequence{
+		rawRelativeDistinguishedNameSET{
+			{
+				Type: mustDNOID(t, "commonName"),
+				Value: asn1.RawValue{
+					Class:      asn1.ClassUniversal,
+					Tag:        asn1.TagUTF8String,
+					IsCompound: true,
+					Bytes:      fragments,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshalling the constructed-string DN: %v", err)
+	}
+
+	// Guard the fixture: the value's TLV must really open with 0x2c, or this
+	// test is not exercising a constructed string at all.
+	if want := byte(0x2c); !bytes.Contains(der, []byte{want, byte(len(fragments))}) {
+		t.Fatalf("fixture does not carry a constructed UTF8String tag 0x%02x:\n% x", want, der)
+	}
+
+	if _, err := ParseSubjectDER(der); err == nil {
+		t.Error("ParseSubjectDER accepted a constructed UTF8String; the value would re-encode to different bytes than it parsed from")
+	} else if !strings.Contains(err.Error(), "constructed") {
+		t.Errorf("error = %q, want one naming the constructed tag", err)
+	}
+
+	// The unreachability half of the claim: a certificate cannot deliver this
+	// DN, because crypto/x509 rejects the tag while parsing the name. If a
+	// future Go release starts accepting it, the check above stops being
+	// defence in depth and starts being the only thing standing there -- so
+	// pin it rather than asserting it in a comment.
+	t.Run("crypto/x509 rejects it first", func(t *testing.T) {
+		t.Parallel()
+		k, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+		if err != nil {
+			t.Fatalf("GenerateKey: %v", err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(1),
+			RawSubject:   der,
+			NotBefore:    time.Now(),
+			NotAfter:     time.Now().Add(time.Hour),
+		}
+		// CreateCertificate copies RawSubject verbatim, so it will emit the
+		// constructed tag without complaint.
+		certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, PublicKeyOf(k), k)
+		if err != nil {
+			t.Fatalf("CreateCertificate with a constructed-string subject: %v", err)
+		}
+		if _, err := x509.ParseCertificate(certDER); err == nil {
+			t.Error("crypto/x509 parsed a certificate whose subject holds a constructed string; ParseSubjectDER's check is now the only guard")
+		}
+	})
 }
 
 func TestParseSubjectDERRejectsGarbage(t *testing.T) {

@@ -322,6 +322,25 @@ func ParseSubjectDER(der []byte) (Subject, error) {
 			if len(atv.Type) == 0 {
 				return Subject{}, fmt.Errorf("subject RDN %d attribute %d has no OID", i, j)
 			}
+			if atv.Value.IsCompound {
+				// BER lets a string be sent constructed: a chain of primitive
+				// fragments under a compound tag, 0x2c for a UTF8String rather
+				// than 0x0c. Without this check the fragments' own tag and
+				// length bytes are taken for content, so the DN parses to a
+				// value full of ASN.1 header bytes and re-encodes to something
+				// that is neither the original nor valid -- the exact
+				// byte-exactness failure this parser exists to prevent. DER
+				// forbids constructed strings outright (X.690 8.21.6, 10.2).
+				//
+				// crypto/x509 rejects the tag before RawSubject is ever
+				// populated ("x509: invalid RDNSequence: invalid attribute
+				// value: unsupported string type: 44"), so no certificate can
+				// reach here carrying one. This is defence in depth on an
+				// exported parser that callers may hand DER from anywhere. See
+				// TestParseSubjectDERRejectsConstructedStrings.
+				return Subject{}, fmt.Errorf("subject RDN %d attribute %d (%s): ASN.1 string tag %d is constructed; only primitive DER string encodings are supported",
+					i, j, FormatOID(atv.Type), atv.Value.Tag)
+			}
 			st, ok := stringTypeByTag[atv.Value.Tag]
 			if !ok || atv.Value.Class != asn1.ClassUniversal {
 				// An unrecognized tag is an error, not a passthrough:
