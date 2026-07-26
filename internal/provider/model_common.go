@@ -316,15 +316,21 @@ func attributesToPKI(models []attributeModel, base path.Path) ([]pki.Attribute, 
 // treating unknown as set is what turns the mistake into a plan-time error
 // rather than an apply-time one.
 //
-// A check whose verdict *would* change once the value resolves must not use
-// isSet. "This list must have at least one element" is such a check: an unknown
-// list has no elements to count yet, and answering it now either rejects a
-// configuration that resolves fine or accepts one that resolves to nothing.
-// Those checks have to return early on unknown and let apply decide, which is
-// exactly what every stock terraform-plugin-framework-validators validator does
-// (each one skips null and unknown before looking at the value) and why the
-// emptiness rules in schema_common.go are expressed with those rather than with
-// isSet.
+// The eleven tasks that follow must not copy the pattern into a check where
+// unknown should defer instead, and the difference is which way the answer
+// points. A rule that stays quiet when isSet reports true is safe: quiet is what
+// an unresolved value deserves, and apply gets the final say. A rule that
+// *reports an error* because isSet returned true is not, because the value can
+// still resolve to null and the configuration was fine all along.
+//
+// nonEmptyBlockValidator in schema_common.go is the safe shape, and it still
+// tests IsUnknown explicitly before consulting isSet rather than relying on this
+// coincidence, which is also what every stock
+// terraform-plugin-framework-validators validator does: each one skips null and
+// unknown before looking at a value, and the cross-attribute ones say so --
+// "delay validation until all involved attributes have a known value". A
+// conflicts-with or requires-together check added later belongs in that shape,
+// not in an isSet call.
 func isSet(v attr.Value) bool {
 	if v == nil || v.IsNull() {
 		return false
