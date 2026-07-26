@@ -71,18 +71,43 @@ func resolveImportID(id string) ([]byte, error) {
 		return nil, fmt.Errorf("import ID is empty; %s", usage)
 
 	default:
-		return nil, fmt.Errorf("import ID %q has no recognized scheme; %s", firstSegment(id), usage)
+		// A scheme name is public and short by construction; everything after
+		// "://" may be key material, so only the scheme -- never a prefix of
+		// the rest of the ID -- is safe to name here.
+		if scheme := schemeOf(id); scheme != "" {
+			return nil, fmt.Errorf("import ID scheme %q is not recognized; %s", scheme, usage)
+		}
+		return nil, fmt.Errorf("import ID has no recognized scheme; %s", usage)
 	}
 }
 
-// firstSegment returns a short, safe prefix of an ID for use in an error
-// message: enough to identify a typo, never enough to leak a payload.
-func firstSegment(id string) string {
-	if i := strings.Index(id, "://"); i >= 0 {
-		return id[:i+3]
+// schemeOf returns id's scheme, including the trailing "://", or "" if id has
+// no plausible scheme.
+//
+// This is deliberately narrower than "does the string contain \"://\" ": a
+// one-slash typo of a real scheme (base64:/..., pem:/...) or a bare payload
+// pasted with no scheme at all have no "://" substring either, and the
+// previous version of this function fell back to printing a prefix of
+// whatever came before it -- which for those two shapes is the start of the
+// payload itself, not a scheme. Capping the scheme at 12 characters and a
+// restrictive character class means a base64 or PEM payload that happens to
+// contain "://" cannot be mistaken for one either.
+func schemeOf(id string) string {
+	i := strings.Index(id, "://")
+	if i < 0 {
+		return ""
 	}
-	if len(id) > 16 {
-		return id[:16] + "..."
+	scheme := id[:i]
+	if scheme == "" || len(scheme) > 12 {
+		return ""
 	}
-	return id
+	for _, r := range scheme {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '+', r == '-', r == '.':
+			// allowed
+		default:
+			return ""
+		}
+	}
+	return scheme + "://"
 }

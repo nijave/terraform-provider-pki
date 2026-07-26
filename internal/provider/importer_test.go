@@ -95,14 +95,47 @@ func TestResolveImportIDErrorNamesTheSchemes(t *testing.T) {
 // TestResolveImportIDErrorDoesNotEchoContents matters because a private key can
 // be imported inline with pem:// or base64://, and a diagnostic is printed to
 // the console and to CI logs.
+//
+// It covers every malformed shape that reaches the fallback "no recognized
+// scheme" branch, not just the well-formed-scheme case (base64:// followed by
+// bad base64): a one-slash typo of a real scheme, and a bare payload pasted
+// with no scheme at all, both fall through to that branch too, and a helper
+// that only special-cased strings containing "://" would print a prefix of
+// the payload for exactly these shapes.
+//
+// It checks for any recognizable run of the payload, not just the whole
+// string, because a helper that truncates its output never echoes the whole
+// secret -- only a leading slice of it -- so a whole-string match would miss
+// the leak entirely.
 func TestResolveImportIDErrorDoesNotEchoContents(t *testing.T) {
 	t.Parallel()
 	const secret = "c3VwZXJzZWNyZXRrZXltYXRlcmlhbA"
-	_, err := resolveImportID("base64://" + secret + "!!!")
-	if err == nil {
-		t.Fatal("expected an error for malformed base64")
+
+	cases := map[string]string{
+		"well-formed scheme, bad base64 payload": "base64://" + secret + "!!!",
+		"one-slash typo of base64 scheme":        "base64:/" + secret,
+		"one-slash typo of pem scheme":           "pem:/" + secret,
+		"no scheme at all":                       secret,
+		"unrecognized but well-formed scheme":    "nonsense://" + secret,
 	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("error message echoes the payload: %q", err.Error())
+
+	for label, id := range cases {
+		t.Run(label, func(t *testing.T) {
+			t.Parallel()
+			_, err := resolveImportID(id)
+			if err == nil {
+				t.Fatalf("expected an error for %q", id)
+			}
+			msg := err.Error()
+			// A leak that truncates its output would not contain the whole
+			// secret, so scan increasing-length prefixes of it rather than
+			// looking for an exact match on the entire string.
+			const minRunLength = 8
+			for length := minRunLength; length <= len(secret); length++ {
+				if run := secret[:length]; strings.Contains(msg, run) {
+					t.Fatalf("error message echoes %d bytes of the payload (%q): %q", length, run, msg)
+				}
+			}
+		})
 	}
 }
