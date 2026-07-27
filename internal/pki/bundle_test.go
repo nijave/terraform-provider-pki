@@ -4,9 +4,7 @@ package pki
 
 import (
 	"bytes"
-	"crypto"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/pem"
 	"strings"
 	"testing"
@@ -364,57 +362,10 @@ func TestEncodeBundleErrorsNameAttributesWithoutEchoingKeys(t *testing.T) {
 				t.Errorf("EncodeBundle(%s) error = %q, want it to name %q", label, msg, want)
 			}
 		}
-		assertNoKeyMaterial(t, label, msg, leafKey, otherKey)
-	}
-}
-
-// assertNoKeyMaterial fails when msg contains any encoding of any of the given
-// keys.
-//
-// Both PEM encodings are checked, and both matter: EncodePrivateKeyPEM emits SEC1
-// for an ECDSA key while EncodePrivateKeyPKCS8DER emits PKCS#8, so their base64
-// bodies share no long substring and checking one would miss a leak of the other.
-// Each body is then checked in fixed-length slices rather than whole, because a
-// message that quoted a single wrapped line of a key -- or truncated it, the way
-// hexPreview in compare.go deliberately does for extension values -- would still
-// be a leak, and comparing whole bodies would not see it.
-func assertNoKeyMaterial(t *testing.T, label, msg string, keys ...crypto.Signer) {
-	t.Helper()
-	for i, key := range keys {
-		pkcs8, err := EncodePrivateKeyPKCS8DER(key)
-		if err != nil {
-			t.Fatalf("EncodePrivateKeyPKCS8DER: %v", err)
-		}
-		keyPEM, err := EncodePrivateKeyPEM(key)
-		if err != nil {
-			t.Fatalf("EncodePrivateKeyPEM: %v", err)
-		}
-		nativeBlock, _ := pem.Decode(keyPEM)
-		if nativeBlock == nil {
-			t.Fatalf("EncodePrivateKeyPEM did not produce a PEM block, so this test would check nothing")
-		}
-
-		for form, der := range map[string][]byte{"PKCS#8": pkcs8, nativeBlock.Type: nativeBlock.Bytes} {
-			if strings.Contains(msg, string(der)) {
-				t.Errorf("EncodeBundle(%s) error echoes key %d's raw %s DER: %q", label, i, form, msg)
-			}
-			b64 := base64.StdEncoding.EncodeToString(der)
-			// Every 16-character window, stepped one character at a time -- not
-			// every 16th window. A stride equal to the window length only catches
-			// a leak that happens to be aligned to it: measured during this
-			// change, an error echoing 32 characters starting mid-line contained
-			// no whole 24-aligned run and slipped past a strided check. 16 base64
-			// characters is 12 bytes of key, far past any chance of a
-			// coincidental match, and the whole loop is a few hundred substring
-			// searches over a one-line message.
-			const window = 16
-			for start := 0; start+window <= len(b64); start++ {
-				if strings.Contains(msg, b64[start:start+window]) {
-					t.Errorf("EncodeBundle(%s) error echoes key %d's %s base64 body at offset %d: %q", label, i, form, start, msg)
-					break
-				}
-			}
-		}
+		// Every rejection above is checked against both keys' material through
+		// the one shared guard in testhelper_test.go; see assertNoEcho there for
+		// what "no echo" means and why it is a single function.
+		assertNoKeyMaterial(t, "EncodeBundle("+label+")", msg, leafKey, otherKey)
 	}
 }
 

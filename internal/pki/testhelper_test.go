@@ -8,13 +8,152 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/pem"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+// assertNoEcho is the single guard behind this package's one critical
+// invariant: no error message may ever echo private key material. Every test
+// that checks that property goes through here, and there is deliberately only
+// one of these functions.
+//
+// There used to be two -- a strong one over parse errors in key_test.go and a
+// weaker one over bundle errors in bundle_test.go -- and the weak one had a hole
+// exactly where the two disagreed: it checked the whole raw DER and 16-character
+// windows of its base64, so an error appending the entire PKCS#8 DER as *hex*, or
+// quoting a raw 32-byte slice of it with %q, passed while leaking a whole key.
+// Two helpers for one invariant is how that hole appeared, so the strengths are
+// merged here and there is no weaker path left to reach for.
+//
+// The rendering a leak arrives in is whichever fmt verb the author reached for,
+// so every verb that takes a []byte is covered, plus the base64 a PEM body
+// carries:
+//
+//   - %s and string(): the raw bytes, 4-byte window.
+//   - %x and %X: hex, 8-character window, matched case-insensitively.
+//   - PEM/base64: 8-character window, in all three phase alignments.
+//   - %q: Go's quoted form, 16-character window. This one is not optional and is
+//     not implied by the raw check -- %q escapes every unprintable byte as \xNN,
+//     which shatters the raw run into fragments no substring search finds. It is
+//     the shape hexPreview in compare.go is one careless copy away from, and it
+//     is the mutation that survived every earlier version of this helper.
+//   - %v: space-separated decimals, 24-character window. The one rendering that
+//     shares no substring with any of the above.
+//
+// Every window is stepped one unit at a time, never by the window length. A
+// stride equal to the window only catches a leak that happens to be aligned to
+// it: measured during this campaign, an error echoing 32 base64 characters
+// starting mid-line contained no whole 24-aligned run and slipped past a strided
+// check.
+//
+// The three base64 phases matter for the same reason. base64 encodes each 3-byte
+// group independently, so the base64 of secret[k:] shares no long substring with
+// the base64 of secret[0:] unless k is a multiple of 3. Encoding at offsets 0, 1,
+// and 2 covers every k, since secret[k:] with k congruent to phase p mod 3 is
+// group-aligned inside the phase-p encoding. The %q and %v renderings need no
+// such treatment because both encode each byte independently of its position;
+// %q's only context sensitivity is UTF-8 rune boundaries, which can differ at a
+// quoted slice's two edges and not in its interior.
+//
+// Thresholds are short enough that quoting so much as a fragment of a key fails,
+// and long enough that the structural numbers crypto/x509 does report
+// ("length:1213", tag numbers, byte offsets) cannot collide by accident: 4 raw
+// bytes and 8 hex characters are both 2^32 of entropy, and 8 base64 characters
+// is 6 bytes of key.
+func assertNoEcho(t *testing.T, label, msg string, secret []byte) {
+	t.Helper()
+
+	// hex.EncodeToString emits lowercase, so a lowered copy of the message is
+	// what the hex pass searches; a leak written with %X is then caught by the
+	// same pass. Every other rendering is compared against the message as it is.
+	lowered := strings.ToLower(msg)
+
+	// Quoted and decimal renderings are taken over the whole secret and then
+	// windowed, rather than rendered per window, because both are what fmt would
+	// have produced for the whole thing and a window of that is what a partial
+	// leak looks like. strconv.Quote's outer quotes are stripped so a window can
+	// start anywhere.
+	quoted := strconv.Quote(string(secret))
+	quoted = quoted[1 : len(quoted)-1]
+
+	renderings := []struct {
+		name        string
+		text        string
+		window      int
+		searchLower bool
+	}{
+		{"raw bytes (%s)", string(secret), 4, false},
+		{"hex (%x)", hex.EncodeToString(secret), 8, true},
+		{"Go-quoted (%q)", quoted, 16, false},
+		{"decimals (%v)", strings.Trim(fmt.Sprint(secret), "[]"), 24, false},
+	}
+	for phase := 0; phase < 3 && phase < len(secret); phase++ {
+		renderings = append(renderings, struct {
+			name        string
+			text        string
+			window      int
+			searchLower bool
+		}{
+			fmt.Sprintf("base64 (phase %d)", phase),
+			base64.StdEncoding.EncodeToString(secret[phase:]),
+			8,
+			false,
+		})
+	}
+
+	for _, r := range renderings {
+		haystack := msg
+		if r.searchLower {
+			haystack = lowered
+		}
+		for i := 0; i+r.window <= len(r.text); i++ {
+			window := r.text[i : i+r.window]
+			if strings.Contains(haystack, window) {
+				t.Errorf("%s: error message echoes the secret as %s from offset %d (%q): %q",
+					label, r.name, i, window, msg)
+				return
+			}
+		}
+	}
+}
+
+// assertNoKeyMaterial runs assertNoEcho over every encoding of every given key.
+// It is a thin adapter, not a second guard: all it adds is the list of byte
+// strings a key can be leaked as.
+//
+// Both PEM encodings are checked, and both matter: EncodePrivateKeyPEM emits
+// SEC1 for an ECDSA key while EncodePrivateKeyPKCS8DER emits PKCS#8, so their
+// bodies share no long substring and checking one would miss a leak of the
+// other.
+func assertNoKeyMaterial(t *testing.T, label, msg string, keys ...crypto.Signer) {
+	t.Helper()
+	for i, key := range keys {
+		pkcs8, err := EncodePrivateKeyPKCS8DER(key)
+		if err != nil {
+			t.Fatalf("EncodePrivateKeyPKCS8DER: %v", err)
+		}
+		keyPEM, err := EncodePrivateKeyPEM(key)
+		if err != nil {
+			t.Fatalf("EncodePrivateKeyPEM: %v", err)
+		}
+		nativeBlock, _ := pem.Decode(keyPEM)
+		if nativeBlock == nil {
+			t.Fatalf("EncodePrivateKeyPEM did not produce a PEM block, so this test would check nothing")
+		}
+		for form, der := range map[string][]byte{"PKCS#8": pkcs8, nativeBlock.Type: nativeBlock.Bytes} {
+			assertNoEcho(t, fmt.Sprintf("%s/key %d/%s", label, i, form), msg, der)
+		}
+	}
+}
 
 // mustDNOID looks up a DN attribute OID or fails the test. It exists so table
 // literals can stay expressions.

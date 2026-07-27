@@ -10,8 +10,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"os/exec"
@@ -260,12 +258,9 @@ func TestParsePrivateKeyPEMErrorDoesNotLeakKeyMaterial(t *testing.T) {
 // purely structural has to be enforced, not assumed.
 //
 // It takes real generated keys, mangles them in every position and length a
-// corrupted secret realistically arrives in, and asserts the resulting message
-// shares no run of the input with it: 4 raw bytes, the same 4 bytes as hex, or 8
-// characters of the PEM body's base64. Those thresholds are short enough that an
-// error quoting so much as a fragment of the DER fails, and long enough that the
-// structural numbers x509 does report ("length:1213", offsets, tag numbers)
-// cannot collide by accident.
+// corrupted secret realistically arrives in, and hands each resulting message to
+// assertNoEcho -- the package's single leak guard, in testhelper_test.go, which
+// is where the thresholds and the reasoning behind them live.
 func TestParsePrivateKeyPEMErrorNeverEchoesRealKeyBytes(t *testing.T) {
 	t.Parallel()
 	for _, alg := range []Algorithm{AlgorithmRSA, AlgorithmECDSA, AlgorithmED25519} {
@@ -295,7 +290,7 @@ func TestParsePrivateKeyPEMErrorNeverEchoesRealKeyBytes(t *testing.T) {
 					// byte of an unused field, say). Nothing to audit.
 					continue
 				}
-				assertNoEcho(t, fmt.Sprintf("%s/%s/%s", alg, block.Type, m.name), m.der, err)
+				assertNoEcho(t, fmt.Sprintf("%s/%s/%s", alg, block.Type, m.name), err.Error(), m.der)
 			}
 		}
 	}
@@ -344,7 +339,7 @@ func TestParsePrivateKeyPEMUnknownAlgorithmErrorLeaksOnlyTheOID(t *testing.T) {
 	if !strings.Contains(err.Error(), "unknown algorithm") {
 		t.Fatalf("error = %q, want crypto/x509's unknown-algorithm error; this test no longer covers the path it was written for", err)
 	}
-	assertNoEcho(t, "pkcs8/unknown-algorithm", rewritten, err)
+	assertNoEcho(t, "pkcs8/unknown-algorithm", err.Error(), rewritten)
 }
 
 // mangling is one corruption of a DER-encoded key, named for test output.
@@ -371,36 +366,6 @@ func manglings(der []byte) []mangling {
 		out = append(out, mangling{fmt.Sprintf("flip-%d", i), flipped})
 	}
 	return out
-}
-
-// assertNoEcho fails if err's text carries any recognizable run of der: the raw
-// bytes, the same bytes as hex, or the base64 a PEM body would carry them in.
-func assertNoEcho(t *testing.T, label string, der []byte, err error) {
-	t.Helper()
-	msg := err.Error()
-
-	const rawRun = 4
-	for i := 0; i+rawRun <= len(der); i++ {
-		window := der[i : i+rawRun]
-		if strings.Contains(msg, string(window)) {
-			t.Errorf("%s: error message echoes %d raw input bytes from offset %d (% x): %q", label, rawRun, i, window, msg)
-			return
-		}
-		if strings.Contains(msg, hex.EncodeToString(window)) {
-			t.Errorf("%s: error message echoes input bytes as hex from offset %d (%s): %q", label, i, hex.EncodeToString(window), msg)
-			return
-		}
-	}
-
-	b64 := base64.StdEncoding.EncodeToString(der)
-	const b64Run = 8
-	for i := 0; i+b64Run <= len(b64); i++ {
-		window := b64[i : i+b64Run]
-		if strings.Contains(msg, window) {
-			t.Errorf("%s: error message echoes base64 of the input (%q): %q", label, window, msg)
-			return
-		}
-	}
 }
 
 func TestEncodePublicKeyPEMAndParseRoundTrip(t *testing.T) {
