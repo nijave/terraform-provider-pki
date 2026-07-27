@@ -104,6 +104,13 @@ data "pki_oids" "check" {}
 // produces -- MarkdownDescription, diagnostic summary, diagnostic detail -- is a
 // literal in one of these files, so the one rule covers all of them.
 //
+// A literal is checked as its concatenated value, not one BasicLit at a time.
+// This package wraps long descriptions across `+`-joined literals
+// ("…preserved --" + " and the types…"), and a per-literal scan of " -- " misses
+// both halves -- the trailing space lives on one side of the split and the
+// leading space on the other. Constant-fold the concatenation first, then look
+// for any `--` (with, without, or across surrounding spaces) in the result.
+//
 // Scoped to internal/provider. internal/pki has two error-message literals with
 // `--` in them and belongs to a different set of files.
 func TestUserFacingStringsUseEmDashes(t *testing.T) {
@@ -117,26 +124,62 @@ func TestUserFacingStringsUseEmDashes(t *testing.T) {
 		t.Fatalf("parsing the package source: %v", err)
 	}
 
+	// constString reports the value of a compile-time constant string
+	// expression: a string literal, or a `+` concatenation of them. It returns
+	// false for anything it cannot fully resolve (a non-constant operand, a raw
+	// string literal), so the caller can keep walking rather than guess.
+	var constString func(ast.Node) (string, bool)
+	constString = func(n ast.Node) (string, bool) {
+		switch e := n.(type) {
+		case *ast.BasicLit:
+			if e.Kind != token.STRING {
+				return "", false
+			}
+			v, err := strconv.Unquote(e.Value)
+			if err != nil {
+				return "", false
+			}
+			return v, true
+		case *ast.BinaryExpr:
+			if e.Op != token.ADD {
+				return "", false
+			}
+			left, ok := constString(e.X)
+			if !ok {
+				return "", false
+			}
+			right, ok := constString(e.Y)
+			if !ok {
+				return "", false
+			}
+			return left + right, true
+		default:
+			return "", false
+		}
+	}
+
 	checked := 0
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
 			ast.Inspect(file, func(n ast.Node) bool {
-				lit, ok := n.(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					return true
-				}
-				value, err := strconv.Unquote(lit.Value)
-				if err != nil {
-					// A raw string literal that will not unquote is not
-					// something this test can read; skip it rather than fail.
+				value, ok := constString(n)
+				if !ok {
 					return true
 				}
 				checked++
-				if strings.Contains(value, " -- ") {
-					t.Errorf("%s: string literal contains \" -- \"; user-facing text renders it "+
-						"literally, so use an em dash (—) instead", fset.Position(lit.Pos()))
+				// A concatenation expression is checked here as a whole, and its
+				// child literals must not be re-checked on their own: a `--` split
+				// across the join would be reported twice, and a trailing fragment
+				// would be misreported. Returning false stops the descent once a
+				// node has been folded into a value, which covers both.
+				if strings.Contains(value, "--") {
+					t.Errorf("%s: user-facing string contains \"--\" (%q); "+
+						"it renders as two literal hyphens, so use an em dash (—) instead",
+						fset.Position(n.Pos()), value)
 				}
-				return true
+				// Do not descend: children of a folded concatenation are already
+				// covered by this check, and a standalone literal has none.
+				return false
 			})
 		}
 	}
