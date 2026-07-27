@@ -149,6 +149,34 @@ func DescribeKey(k crypto.Signer) (KeyParams, error) {
 	}
 }
 
+// PublicKeyAlgorithm reports the canonical Algorithm name for a public key,
+// spelt the way the provider's schema spells it: RSA, ECDSA, ED25519.
+//
+// It exists because x509.PublicKeyAlgorithm.String() returns "Ed25519" for an
+// Ed25519 key, while every other spelling (RSA, ECDSA) already matches -- so
+// the data sources and resources that surface a parsed key's algorithm
+// (pki_cert_request's data source here, the certificate data source and
+// resources in later tasks) would each carry a one-off "Ed25519" -> "ED25519"
+// rewrite otherwise. Centralizing the mapping here means the schema's spelling
+// lives next to the Algorithm constants it has to agree with, not in four
+// copies that drift the day one of them is missed.
+//
+// DescribeKey covers the private-key side of the same idea; this is its
+// public-key counterpart, for the case where only the public half is to hand
+// (a CSR or certificate carries a public key, not a signer).
+func PublicKeyAlgorithm(pub crypto.PublicKey) (Algorithm, error) {
+	switch pub.(type) {
+	case *rsa.PublicKey:
+		return AlgorithmRSA, nil
+	case *ecdsa.PublicKey:
+		return AlgorithmECDSA, nil
+	case ed25519.PublicKey:
+		return AlgorithmED25519, nil
+	default:
+		return "", fmt.Errorf("unsupported public key type %T", pub)
+	}
+}
+
 // ParsePrivateKeyPEM decodes the first PEM block in b and parses it as a
 // private key, accepting PKCS#8, PKCS#1, and SEC1 (in that order, matching the
 // attempts below; order matters only for speed, since the three encodings are

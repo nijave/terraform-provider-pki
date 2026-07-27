@@ -129,6 +129,40 @@ func TestDescribeKeyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPublicKeyAlgorithmReportsTheCanonicalName covers the Ed25519 spelling
+// mismatch that motivated the helper: Go's x509.PublicKeyAlgorithm.String()
+// returns "Ed25519", while the provider's schema and pki_private_key use
+// "ED25519". RSA and ECDSA already match, so the helper must return those
+// unchanged and rewrite only Ed25519 -- and must reject a type this package
+// does not generate, rather than guess.
+func TestPublicKeyAlgorithmReportsTheCanonicalName(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		algorithm Algorithm
+		want      Algorithm
+	}{
+		{AlgorithmRSA, "RSA"},
+		{AlgorithmECDSA, "ECDSA"},
+		{AlgorithmED25519, "ED25519"},
+	} {
+		k, err := GenerateKey(KeyParams{Algorithm: tc.algorithm})
+		if err != nil {
+			t.Fatalf("GenerateKey(%s): %v", tc.algorithm, err)
+		}
+		got, err := PublicKeyAlgorithm(PublicKeyOf(k))
+		if err != nil {
+			t.Fatalf("PublicKeyAlgorithm(%s): %v", tc.algorithm, err)
+		}
+		if got != tc.want {
+			t.Errorf("PublicKeyAlgorithm(%s) = %q, want %q", tc.algorithm, got, tc.want)
+		}
+	}
+
+	if _, err := PublicKeyAlgorithm(struct{}{}); err == nil {
+		t.Error("PublicKeyAlgorithm accepted an unknown public key type instead of erroring")
+	}
+}
+
 func TestEncodePrivateKeyPEMUsesTheExpectedBlockTypes(t *testing.T) {
 	t.Parallel()
 	// The block type is what openssl and every other consumer keys off, and it

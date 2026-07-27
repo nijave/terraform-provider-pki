@@ -285,15 +285,16 @@ func (d *certRequestDataSource) Read(ctx context.Context, req datasource.ReadReq
 	}
 	config.RequestedExtensions = requested
 
-	// Public key algorithm. Go's x509.PublicKeyAlgorithm.String() returns
-	// "Ed25519" for Ed25519, but the provider convention (matching
-	// pki.Algorithm and the pki_private_key resource) is "ED25519". RSA and
-	// ECDSA match between the two spellings.
-	pubAlg := csr.PublicKeyAlgorithm.String()
-	if pubAlg == "Ed25519" {
-		pubAlg = "ED25519"
+	// Public key algorithm in the provider's canonical spelling (ED25519, not
+	// Go's "Ed25519"). The mapping lives in pki.PublicKeyAlgorithm so the
+	// certificate data source and resources in later tasks share it rather than
+	// each rewriting "Ed25519".
+	alg, err := pki.PublicKeyAlgorithm(csr.PublicKey)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to read CSR public key algorithm", err.Error())
+		return
 	}
-	config.PublicKeyAlgorithm = types.StringValue(pubAlg)
+	config.PublicKeyAlgorithm = types.StringValue(string(alg))
 
 	pubPEM, err := pki.EncodePublicKeyPEM(csr.PublicKey)
 	if err != nil {
