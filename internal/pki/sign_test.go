@@ -713,6 +713,27 @@ func TestParseCertificateChainPEMRejectsUndecodablePEM(t *testing.T) {
 		}
 	}
 
+	// A chain whose ONLY block is corrupt. The mixed cases above all decode at
+	// least one certificate, so they exercise the markers != len(certs) branch.
+	// This one decodes zero, which is the case that used to fall through to the
+	// "no CERTIFICATE PEM blocks found" message -- a true claim about pem.Decode's
+	// output and a misleading one about the file, which held a block that was
+	// dropped. The marker count runs before the empty-chain check precisely so
+	// this reports the corruption instead.
+	for label, in := range map[string][]byte{
+		"corrupt block only":      corrupt,
+		"truncated block only":    truncated,
+		"two corrupt blocks only": concat(corrupt, truncated),
+	} {
+		certs, err := ParseCertificateChainPEM(in)
+		if err == nil {
+			t.Fatalf("ParseCertificateChainPEM(%s) returned %d certificates and no error", label, len(certs))
+		}
+		if !strings.Contains(err.Error(), "decoded") {
+			t.Errorf("ParseCertificateChainPEM(%s) error = %q; a corrupt-only chain must report that a block opened but did not decode, not that no block was found", label, err)
+		}
+	}
+
 	// Non-PEM text is NOT an error, wherever it appears. Real chain files carry
 	// it: see the doc comment on ParseCertificateChainPEM, and
 	// TestParseCertificateChainPEMReadsAnOpenSSLEmittedChain for the generated

@@ -467,12 +467,20 @@ func ParseCertificateChainPEM(b []byte) ([]*x509.Certificate, error) {
 		}
 		certs = append(certs, cert)
 	}
-	if len(certs) == 0 {
-		return nil, fmt.Errorf("no %s PEM blocks found in certificate chain", pemTypeCertificate)
-	}
+	// The marker count is checked before the empty-chain check, and the order
+	// matters. A chain whose only block is corrupt decodes to zero certificates
+	// AND opens one marker; checking emptiness first would report "no CERTIFICATE
+	// PEM blocks found", which is a true statement about pem.Decode's output and a
+	// misleading one about the file -- the same silent drop this check exists to
+	// name. Counting first makes a corrupt-only chain report the corruption, and
+	// leaves a genuinely empty input (no markers, no certs) to fall through to the
+	// message below. decodeSinglePEMBlock checks the same way for the same reason.
 	if markers := bytes.Count(b, []byte(pemBeginMarker)); markers != len(certs) {
 		return nil, fmt.Errorf("certificate chain opens %d PEM blocks but only %d decoded; a truncated or corrupt block would be dropped silently, so the whole chain is rejected",
 			markers, len(certs))
+	}
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("no %s PEM blocks found in certificate chain", pemTypeCertificate)
 	}
 	return certs, nil
 }
