@@ -217,8 +217,8 @@ func (d *certificateDataSource) ConfigValidators(_ context.Context) []datasource
 type certificateDataSourceModel struct {
 	ContentPEM                 types.String           `tfsdk:"content_pem"`
 	ContentBase64              types.String           `tfsdk:"content_base64"`
-	Subject                    []attributeModel       `tfsdk:"subject"`
-	Issuer                     []attributeModel       `tfsdk:"issuer"`
+	Subject                    types.List             `tfsdk:"subject"`
+	Issuer                     types.List             `tfsdk:"issuer"`
 	SerialNumber               types.String           `tfsdk:"serial_number"`
 	NotBefore                  types.String           `tfsdk:"not_before"`
 	NotAfter                   types.String           `tfsdk:"not_after"`
@@ -227,7 +227,7 @@ type certificateDataSourceModel struct {
 	KeyUsage                   *keyUsageModel         `tfsdk:"key_usage"`
 	ExtKeyUsage                *extKeyUsageModel      `tfsdk:"extended_key_usage"`
 	NameConstraints            *nameConstraintsModel  `tfsdk:"name_constraints"`
-	Extensions                 []extraExtensionModel  `tfsdk:"extensions"`
+	Extensions                 types.List             `tfsdk:"extensions"`
 	IsCA                       types.Bool             `tfsdk:"is_ca"`
 	PublicKeyAlgorithm         types.String           `tfsdk:"public_key_algorithm"`
 	PublicKeyPEM               types.String           `tfsdk:"public_key_pem"`
@@ -277,20 +277,36 @@ func (d *certificateDataSource) Read(ctx context.Context, req datasource.ReadReq
 		return
 	}
 
+	// diags holds the diagnostics the list-building helpers return, appended to
+	// the response as each computed list is populated.
+	var diags diag.Diagnostics
+
 	// Subject and issuer: ordered form, with string_type always populated.
+	// Both go through subjectListValue, the same helper Tasks 8 and 9 use in
+	// ImportState, so the data source and the resource import path produce the
+	// same state shape for the same certificate -- including the empty case,
+	// which is null, not [].
 	subject, err := pki.ParseSubjectDER(cert.RawSubject)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to parse certificate subject", err.Error())
 		return
 	}
-	config.Subject = certificateSubjectFromPKI(subject)
+	config.Subject, diags = subjectListValue(ctx, subject)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	issuer, err := pki.ParseSubjectDER(cert.RawIssuer)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to parse certificate issuer", err.Error())
 		return
 	}
-	config.Issuer = certificateSubjectFromPKI(issuer)
+	config.Issuer, diags = subjectListValue(ctx, issuer)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	config.SerialNumber = types.StringValue(pki.FormatSerial(cert.SerialNumber))
 	config.NotBefore = types.StringValue(cert.NotBefore.Format("2006-01-02T15:04:05Z07:00"))
@@ -327,16 +343,10 @@ func (d *certificateDataSource) Read(ctx context.Context, req datasource.ReadReq
 		return
 	}
 
-	extensions := make([]extraExtensionModel, 0, len(cert.Extensions))
 	for _, ext := range cert.Extensions {
-		// Always capture the raw extension first so a parse failure on a typed
-		// one is still reported in the complete list.
-		extensions = append(extensions, extraExtensionModel{
-			OID:         types.StringValue(pki.FormatOID(ext.Id)),
-			Critical:    types.BoolValue(ext.Critical),
-			ValueBase64: types.StringValue(base64.StdEncoding.EncodeToString(ext.Value)),
-		})
-
+		// The complete extension list is built once after this loop through
+		// extensionListValue, which ranges every extension, so a parse failure
+		// on a typed extension below does not drop it from the raw list.
 		switch {
 		case ext.Id.Equal(sanOID):
 			s, parseErr := pki.ParseSANExtension(ext)
@@ -386,7 +396,15 @@ func (d *certificateDataSource) Read(ctx context.Context, req datasource.ReadReq
 		config.IsCA = types.BoolNull()
 	}
 
-	config.Extensions = extensions
+	// Every extension, including the typed ones dispatched above, in one place:
+	// extensionListValue, the same helper Tasks 8 and 9 use in ImportState, so
+	// the raw list's shape (and its empty case -- null, not []) matches the
+	// resource import path reading the same certificate.
+	config.Extensions, diags = extensionListValue(ctx, cert.Extensions)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	// Public key algorithm in the provider's canonical spelling (ED25519, not
 	// Go's "Ed25519"). The mapping lives in pki.PublicKeyAlgorithm so the
@@ -444,38 +462,14 @@ func (d *certificateDataSource) Read(ctx context.Context, req datasource.ReadReq
 	resp.Diagnostics.Append(resp.State.Set(ctx, &config)...)
 }
 
-// certificateSubjectFromPKI converts a parsed subject to the data source's
-// always-populated form. string_type is always written, because the data
-// source's computed subject documents the encoding every attribute carries — a
-// caller comparing two certificates needs to see it.
-//
-// Mirrors certRequestSubjectFromPKI; the two are kept identical rather than
-// shared through subjectListValue because the data source populates a slice
-// of attributeModel structs and lets the framework serialize them, while the
-// ImportState path in Tasks 8/9 needs a types.List directly.
-func certificateSubjectFromPKI(s pki.Subject) []attributeModel {
-	out := make([]attributeModel, 0, len(s.Attributes))
-	for _, a := range s.Attributes {
-		st := a.StringType
-		if st == "" {
-			st = pki.StringTypeUTF8
-		}
-		out = append(out, attributeModel{
-			OID:        types.StringValue(pki.FormatOID(a.OID)),
-			Value:      types.StringValue(a.Value),
-			StringType: types.StringValue(string(st)),
-		})
-	}
-	return out
-}
-
 // subjectListValue converts a parsed Subject to a types.List of `{oid, value,
 // string_type}` objects, matching the shape the data source's `subject` and
 // `issuer` attributes and the resources' `attribute`/`extra_attribute` blocks
-// all use. Tasks 8 and 9 call this during ImportState to reconstruct subject
-// state from a parsed certificate, so the conversion lives here (next to the
-// data source that first produces it) rather than duplicated in two more
-// places — the project's recurring derive-don't-duplicate lesson.
+// all use. The data source's Read calls it directly, and Tasks 8 and 9 call it
+// during ImportState to reconstruct subject state from a parsed certificate --
+// one conversion in one place, so the data source and the resource import path
+// cannot drift on the subject's shape (including the empty case, which is
+// null).
 //
 // An empty Subject produces a null list rather than an empty one, matching
 // stringsToList and the import convention that an absent collection is null.
