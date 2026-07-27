@@ -61,12 +61,14 @@ func (p *pkiProvider) Configure(_ context.Context, _ provider.ConfigureRequest, 
 func (p *pkiProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewPrivateKeyResource,
+		NewCertRequestResource,
 	}
 }
 
 func (p *pkiProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
 		NewOIDsDataSource,
+		NewCertRequestDataSource,
 	}
 }
 
