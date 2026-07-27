@@ -471,14 +471,14 @@ func TestKeyUsageBoundIsDerivedFromTheTable(t *testing.T) {
 	}
 
 	// And the real table yields the bound the rest of the package uses.
-	if got := highestKeyUsageBit(keyUsages); got != maxKeyUsageBit {
-		t.Errorf("maxKeyUsageBit = %d, but the key_usages table's highest bit is %d", maxKeyUsageBit, got)
+	if got := highestKeyUsageBit(keyUsages); got != maxKeyUsageBit() {
+		t.Errorf("maxKeyUsageBit = %d, but the key_usages table's highest bit is %d", maxKeyUsageBit(), got)
 	}
 	// 8 is decipherOnly, the highest RFC 5280 4.2.1.3 assigns today. This is the
 	// value the encoding tests' expected bytes are written against, so it is
 	// pinned rather than left implicit.
-	if maxKeyUsageBit != 8 {
-		t.Errorf("maxKeyUsageBit = %d, want 8 (decipherOnly)", maxKeyUsageBit)
+	if maxKeyUsageBit() != 8 {
+		t.Errorf("maxKeyUsageBit = %d, want 8 (decipherOnly)", maxKeyUsageBit())
 	}
 }
 

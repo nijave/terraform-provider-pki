@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 )
 
 // Extension OIDs this file builds and parses. They duplicate entries in the
@@ -39,7 +40,14 @@ var (
 // with the bound left at 8 would encode correctly and then parse back as "no
 // bits are set" -- a usage that disappears on import. Deriving it means adding a
 // row to the table is the whole change.
-var maxKeyUsageBit = highestKeyUsageBit(keyUsages)
+//
+// It is memoized through sync.OnceValue for the same reason oids.go memoizes its
+// tables: a plain var would be a mutable package-level cell any code in this
+// package (including a parallel test) could write, and wave 2 already declined
+// to mutate keyUsages from a test on exactly those data-race grounds. OnceValue
+// computes the bound once and exposes no setter, so the derivation cannot be
+// overwritten and the cost is paid once.
+var maxKeyUsageBit = sync.OnceValue(func() int { return highestKeyUsageBit(keyUsages) })
 
 // highestKeyUsageBit returns the highest bit position in a key_usages-shaped
 // table, whose values are decimal bit positions as strings (see keyUsages in
@@ -247,7 +255,7 @@ func ParseKeyUsage(ext pkix.Extension) (KeyUsage, error) {
 	}
 
 	var usages []string
-	for bit := 0; bit <= maxKeyUsageBit; bit++ {
+	for bit := 0; bit <= maxKeyUsageBit(); bit++ {
 		if bs.At(bit) == 0 {
 			continue
 		}
@@ -258,9 +266,9 @@ func ParseKeyUsage(ext pkix.Extension) (KeyUsage, error) {
 		usages = append(usages, name)
 	}
 	if len(usages) == 0 {
-		if unnamed := setBitsAbove(bs, maxKeyUsageBit); len(unnamed) > 0 {
+		if unnamed := setBitsAbove(bs, maxKeyUsageBit()); len(unnamed) > 0 {
 			return KeyUsage{}, fmt.Errorf("parsing keyUsage: the only bits set are %v, and RFC 5280 4.2.1.3 assigns no key usage above bit %d, so this extension names no usage this provider can represent",
-				unnamed, maxKeyUsageBit)
+				unnamed, maxKeyUsageBit())
 		}
 		return KeyUsage{}, fmt.Errorf("parsing keyUsage: no bits are set")
 	}
