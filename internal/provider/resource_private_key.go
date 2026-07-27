@@ -36,10 +36,16 @@ func NewPrivateKeyResource() resource.Resource {
 	return &privateKeyResource{}
 }
 
-// privateKeyErrorAttributes are the three attributes pki.GenerateKey and
-// pki.DescribeKey can name in a failure, all of them root attributes here. The
-// fallback at each call site is algorithm, which is what "unknown key algorithm"
-// is about and the attribute every other value depends on.
+// privateKeyErrorAttributes are the attributes pki.GenerateKey names when it
+// rejects an algorithm or a parameter mismatch (e.g. ecdsa_curve alongside
+// algorithm = "RSA"), all of them root attributes here. The fallback at the
+// GenerateKey call site is algorithm, which is what "unknown key algorithm" is
+// about and the attribute every other value depends on.
+//
+// pki.DescribeKey's "unsupported ecdsa curve %q" names the same ecdsa_curve
+// candidate, so it localizes through addPKIError too when DescribeKey runs in a
+// config context (Create, below). The import path's DescribeKey failure is a
+// different matter: see ImportState for why it stays a resource-level error.
 var privateKeyErrorAttributes = rootPKIErrorAttributes("algorithm", "rsa_bits", "ecdsa_curve")
 
 // privateKeyResourceModel is pki_private_key's state model.
@@ -254,7 +260,13 @@ func (r *privateKeyResource) Create(ctx context.Context, req resource.CreateRequ
 	}
 
 	if err := setKeyAttributes(&plan, key); err != nil {
-		resp.Diagnostics.AddError("Unable to describe generated private key", err.Error())
+		// DescribeKey runs here on a key GenerateKey just produced, so the only
+		// way it fails is an internal disagreement between the two -- but it
+		// routes through addPKIError like GenerateKey above, so a failure that
+		// does name a field (an "unsupported ecdsa curve" message) lands on
+		// ecdsa_curve rather than the whole resource block.
+		addPKIError(&resp.Diagnostics, err, "Unable to describe generated private key",
+			path.Root("algorithm"), privateKeyErrorAttributes)
 		return
 	}
 
@@ -299,6 +311,14 @@ func (r *privateKeyResource) Delete(_ context.Context, _ resource.DeleteRequest,
 // or base64://) that describes where to find the key, not the resource's
 // identity. The resource's identity, once imported, is its fingerprint.
 func (r *privateKeyResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// These three errors are deliberately resource-level (AddError, no path),
+	// not attribute-level. Import runs against `terraform import <addr> <id>`
+	// while no configuration block exists -- state is being built from the ID --
+	// so there is no schema attribute to localize a diagnostic against. The
+	// addPKIError routing Create uses is for config-time failures, where a value
+	// the operator wrote is wrong; here the failure is the import ID itself, and
+	// the framework renders a resource-level diagnostic against the resource
+	// address, which is the right place for it.
 	pemBytes, err := resolveImportID(req.ID)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to resolve import ID", err.Error())
