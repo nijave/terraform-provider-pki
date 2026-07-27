@@ -228,18 +228,21 @@ func (ku KeyUsage) Extension() (pkix.Extension, error) {
 // order so the result is canonical regardless of how the extension was
 // written.
 //
-// Bits above maxKeyUsageBit are ignored when at least one named bit is also
-// set: RFC 5280 assigns none, and a certificate that carries an extra bit
-// alongside real usages is better imported than rejected.
+// Any bit set above maxKeyUsageBit is an error, whether or not a named bit is
+// also set. RFC 5280 4.2.1.3 assigns no key usage above bit 8 (decipherOnly),
+// so a bit there has no name this provider can represent; and this package's
+// hardest requirement is byte-exact reproduction of an existing certificate, so
+// dropping such a bit silently would make an adopted certificate re-issue with
+// fewer keyUsage bits than it carries. That is a data loss the import path must
+// never absorb quietly, so the whole extension is rejected rather than
+// truncated, naming the offending bit positions.
 //
-// A keyUsage this function can name nothing from is rejected, because RFC 5280
+// A BIT STRING with no bits set at all is also rejected, because RFC 5280
 // 4.2.1.3 requires at least one usage and a KeyUsage holding none cannot be
-// re-encoded -- KeyUsage.Extension refuses an empty Usages list, so returning
-// one would produce a value this package cannot round-trip. The two ways to get
-// there are reported differently: a BIT STRING with no bits set at all names no
-// usage, while one setting only bits above maxKeyUsageBit names usages this
-// encoder has no vocabulary for, and only the second tells the operator that
-// something was in the certificate and could not be represented.
+// re-encoded -- KeyUsage.Extension refuses an empty Usages list. That case says
+// "no bits are set"; a certificate that did carry bits but only above the bound
+// says so, and is the one an operator might otherwise mistake for a missing
+// extension.
 func ParseKeyUsage(ext pkix.Extension) (KeyUsage, error) {
 	if !ext.Id.Equal(oidKeyUsage) {
 		return KeyUsage{}, fmt.Errorf("extension OID %s is not keyUsage (2.5.29.15)", FormatOID(ext.Id))
@@ -265,11 +268,11 @@ func ParseKeyUsage(ext pkix.Extension) (KeyUsage, error) {
 		}
 		usages = append(usages, name)
 	}
+	if unnamed := setBitsAbove(bs, maxKeyUsageBit()); len(unnamed) > 0 {
+		return KeyUsage{}, fmt.Errorf("parsing keyUsage: bits %v are set above bit %d (decipherOnly), but RFC 5280 4.2.1.3 assigns no key usage there; this provider cannot represent them and will not drop them silently, which would change the extension's bytes on re-issue",
+			unnamed, maxKeyUsageBit())
+	}
 	if len(usages) == 0 {
-		if unnamed := setBitsAbove(bs, maxKeyUsageBit()); len(unnamed) > 0 {
-			return KeyUsage{}, fmt.Errorf("parsing keyUsage: the only bits set are %v, and RFC 5280 4.2.1.3 assigns no key usage above bit %d, so this extension names no usage this provider can represent",
-				unnamed, maxKeyUsageBit())
-		}
 		return KeyUsage{}, fmt.Errorf("parsing keyUsage: no bits are set")
 	}
 	return KeyUsage{Usages: usages, Critical: ext.Critical}, nil

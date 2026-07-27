@@ -543,19 +543,25 @@ func TestParseKeyUsageDistinguishesNoBitsFromUnrepresentableBits(t *testing.T) {
 		t.Errorf("error = %q, want it to report that no bits are set", err)
 	}
 
-	// A usage above the bound alongside a named one is imported, not rejected:
-	// the extra bit is ignored and the real usage survives. This is what makes
-	// the rejection above specifically about naming *nothing*.
+	// A usage above the bound alongside a named one is rejected too. The extra
+	// bit has no name RFC 5280 assigns, and silently dropping it would make an
+	// adopted certificate re-issue with fewer keyUsage bits than it carries -- a
+	// byte-exactness loss on the adoption path. So the whole extension is
+	// rejected, naming the offending bit, rather than truncating to the named
+	// usage and importing a value that no longer matches the certificate.
 	mixed, err := asn1.Marshal(asn1.BitString{Bytes: []byte{0x80, 0x40}, BitLength: 10})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	ku, err := ParseKeyUsage(pkix.Extension{Id: oidKeyUsage, Value: mixed})
-	if err != nil {
-		t.Fatalf("ParseKeyUsage (bit 0 plus bit 9): %v", err)
+	_, err = ParseKeyUsage(pkix.Extension{Id: oidKeyUsage, Value: mixed})
+	if err == nil {
+		t.Fatal("ParseKeyUsage accepted a keyUsage with a bit set above decipherOnly alongside a named one; the extra bit would be dropped silently on re-issue")
 	}
-	if len(ku.Usages) != 1 || ku.Usages[0] != "digitalSignature" {
-		t.Errorf("parsed usages = %v, want [digitalSignature]", ku.Usages)
+	if !strings.Contains(err.Error(), "9") {
+		t.Errorf("error = %q, want it to name bit 9, the usage above the bound that could not be represented", err)
+	}
+	if strings.Contains(err.Error(), "no bits are set") {
+		t.Errorf("error = %q, but a named bit WAS set; the message must not claim no bits are set", err)
 	}
 }
 

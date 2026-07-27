@@ -5119,6 +5119,8 @@ git commit -m "feat: pki_bundle converter with write-only password support"
 
 Spec §10's remaining acceptance criteria, including the one that gates the migration follow-up: an existing device certificate is imported and the subsequent plan is empty.
 
+**Note on non-standard keyUsage (from the review-gate fix round).** `pki.ParseKeyUsage` now rejects — rather than silently truncates — a keyUsage extension carrying any bit above bit 8 (decipherOnly), whether or not a named bit is also set. RFC 5280 §4.2.1.3 assigns no key usage there, so such a bit has no name this provider can represent, and byte-exact reproduction is this project's hardest requirement: dropping the bit would make an adopted certificate re-issue with fewer keyUsage bytes than it carries. A reference certificate that ever carries such a bit therefore fails import loudly, with a message naming the offending bit position — and that is the correct outcome, not a test failure to suppress. The homelab reference fixtures (Plan 1 Task 15) use only RFC 5280 bits, so the fidelity scenario is unaffected; this note exists so a future fixture change that adds a non-standard bit is read correctly.
+
 **Files:**
 - Create: `internal/provider/import_fidelity_test.go`
 - Create: `internal/provider/testdata/README.md`
