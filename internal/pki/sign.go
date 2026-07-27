@@ -386,7 +386,8 @@ func CreateCertRequest(key crypto.Signer, t CertRequestTemplate) ([]byte, error)
 // to issue against the request: a CSR whose signature does not check out does
 // not prove the requester holds the private key for the public key it carries,
 // which is the only thing a CSR is for. A caller that wants to inspect an
-// unverifiable request must reach for crypto/x509 directly and say so.
+// unverifiable request without raising the signature failure as an error must
+// reach for ParseCertRequestPEMUnverified instead.
 func ParseCertRequestPEM(b []byte) (*x509.CertificateRequest, error) {
 	block, err := decodeSinglePEMBlock(b, pemTypeCertRequest)
 	if err != nil {
@@ -400,6 +401,37 @@ func ParseCertRequestPEM(b []byte) (*x509.CertificateRequest, error) {
 		return nil, fmt.Errorf("certificate request signature does not verify: %w", err)
 	}
 	return csr, nil
+}
+
+// ParseCertRequestPEMUnverified parses a CSR without checking its signature, and
+// reports separately whether the signature verifies.
+//
+// The verifying ParseCertRequestPEM is the right default for issuance. This
+// variant exists for the pki_cert_request data source, whose whole purpose is
+// inspecting a CSR that arrived from elsewhere: a caller wants
+// signature_valid = false reported as data, not raised as an error. A device or
+// another team handing over a CSR whose signature does not verify is exactly the
+// situation the data source exists to surface, and refusing to decode it would
+// hide the only signal that matters.
+//
+// A malformed PEM returns (nil, false, err) — the same error shape
+// ParseCertRequestPEM produces, because there is no signature to report on a
+// request that could not be parsed. A parsed-but-bad-signature request returns
+// (csr, false, nil): the CSR is available for inspection, and the false is the
+// data the caller asked for.
+func ParseCertRequestPEMUnverified(b []byte) (csr *x509.CertificateRequest, signatureValid bool, err error) {
+	block, err := decodeSinglePEMBlock(b, pemTypeCertRequest)
+	if err != nil {
+		return nil, false, fmt.Errorf("certificate request: %w", err)
+	}
+	csr, err = x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return nil, false, fmt.Errorf("parsing certificate request: %w", err)
+	}
+	// CheckSignature never panics on a parsed request, and a parsed request whose
+	// DER is structurally intact but whose signature does not verify is the case
+	// this function exists to report as data rather than as an error.
+	return csr, csr.CheckSignature() == nil, nil
 }
 
 // ParseCertificatePEM decodes and parses a single PEM certificate.

@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/pem"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -98,6 +99,94 @@ func TestParseCertRequestPEMRejectsABrokenSignature(t *testing.T) {
 	if _, err := ParseCertRequestPEM(tampered); err == nil {
 		t.Fatal("ParseCertRequestPEM accepted a tampered CSR")
 	}
+}
+
+// TestParseCertRequestPEMUnverified covers the variant the pki_cert_request data
+// source reaches for: a CSR whose signature does not verify is data, not an
+// error, so the data source can report signature_valid = false rather than fail.
+func TestParseCertRequestPEMUnverified(t *testing.T) {
+	t.Parallel()
+	key, err := GenerateKey(KeyParams{Algorithm: AlgorithmECDSA})
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	csrPEM, err := CreateCertRequest(key, CertRequestTemplate{
+		Subject: NamedSubject{CommonName: "cn"}.Expand(),
+	})
+	if err != nil {
+		t.Fatalf("CreateCertRequest: %v", err)
+	}
+
+	t.Run("valid CSR returns true with no error", func(t *testing.T) {
+		t.Parallel()
+		csr, ok, err := ParseCertRequestPEMUnverified(csrPEM)
+		if err != nil {
+			t.Fatalf("ParseCertRequestPEMUnverified returned an error for a valid CSR: %v", err)
+		}
+		if !ok {
+			t.Fatal("ParseCertRequestPEMUnverified reported a valid CSR's signature as invalid")
+		}
+		if csr == nil {
+			t.Fatal("ParseCertRequestPEMUnverified returned a nil CSR for a valid input")
+		}
+		if string(csr.RawSubject) == "" {
+			// Sanity: the parsed CSR carries the subject we asked for. A nil
+			// return wrapped in a "valid" verdict would be the silent failure
+			// mode this guard exists for.
+			t.Fatal("the parsed CSR has an empty RawSubject")
+		}
+	})
+
+	t.Run("tampered CSR returns false with a nil error", func(t *testing.T) {
+		t.Parallel()
+		// Tamper a byte inside the signature BIT STRING rather than in the
+		// base64 body at large: a byte flipped in the signed content or the
+		// public key can corrupt the DER structure itself, which surfaces as a
+		// parse error rather than the signature failure this function exists
+		// to report as data. The signature is the trailing field of the CSR's
+		// DER SEQUENCE, so a byte near the end of the DER is reliably inside
+		// it.
+		block, _ := pem.Decode(csrPEM)
+		if block == nil {
+			t.Fatalf("the fixture is not a PEM CSR")
+		}
+		der := append([]byte(nil), block.Bytes...)
+		// Flip a byte 8 bytes from the end of the DER, deep inside the
+		// signature BIT STRING content but not on a trailing length byte.
+		pos := len(der) - 8
+		der[pos] ^= 0x01
+		tampered := pem.EncodeToMemory(&pem.Block{Type: pemTypeCertRequest, Bytes: der})
+
+		csr, ok, err := ParseCertRequestPEMUnverified(tampered)
+		if err != nil {
+			// A bad signature is data here, not an error. An error means the
+			// tamper broke parsing rather than the signature, which is a
+			// different path than the one this function exists to take.
+			t.Fatalf("ParseCertRequestPEMUnverified returned an error for a tampered CSR; "+
+				"a false signature is data, not an error: %v", err)
+		}
+		if ok {
+			t.Fatal("ParseCertRequestPEMUnverified reported a tampered CSR's signature as valid")
+		}
+		if csr == nil {
+			t.Fatal("ParseCertRequestPEMUnverified returned a nil CSR for a parsed-but-bad-signature request; " +
+				"the whole point is inspecting a CSR whose signature does not verify")
+		}
+	})
+
+	t.Run("malformed PEM returns nil false and an error", func(t *testing.T) {
+		t.Parallel()
+		csr, ok, err := ParseCertRequestPEMUnverified([]byte("hello"))
+		if err == nil {
+			t.Fatal("ParseCertRequestPEMUnverified returned no error for a malformed PEM")
+		}
+		if ok {
+			t.Fatal("ParseCertRequestPEMUnverified reported signature_valid = true for a malformed PEM")
+		}
+		if csr != nil {
+			t.Fatal("ParseCertRequestPEMUnverified returned a non-nil CSR for a malformed PEM")
+		}
+	})
 }
 
 func TestCreateCertificateSelfSigned(t *testing.T) {
