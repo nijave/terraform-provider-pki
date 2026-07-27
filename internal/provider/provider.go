@@ -69,6 +69,7 @@ func (p *pkiProvider) DataSources(_ context.Context) []func() datasource.DataSou
 	return []func() datasource.DataSource{
 		NewOIDsDataSource,
 		NewCertRequestDataSource,
+		NewCertificateDataSource,
 	}
 }
 
