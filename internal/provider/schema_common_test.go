@@ -4,50 +4,29 @@ package provider
 
 import (
 	"context"
-	"os"
-	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
-	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
-	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
-	"github.com/hashicorp/terraform-plugin-testing/plancheck"
-	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 
 	"github.com/nijave/terraform-provider-pki/internal/pki"
 )
 
-// testAccProbeFactories serves the block probe from
-// probe_shared_blocks_test.go. The real provider's factories live in the
-// external provider_test package, which cannot see the unexported blocks this
-// probe exists to exercise, so the two sets are separate on purpose.
-var testAccProbeFactories = map[string]func() (tfprotov6.ProviderServer, error){
-	"pkiprobe": providerserver.NewProtocol6WithError(&sharedBlockProbeProvider{}),
-}
-
-var testAccProbeVersionChecks = []tfversion.TerraformVersionCheck{
-	tfversion.SkipBelow(tfversion.Version1_11_0),
-}
-
-// testAccProbePreCheck mirrors provider_test.go's testAccPreCheck. It is
-// duplicated rather than shared because that one lives in the external test
-// package; the messages are the part that matters, and they say the same thing.
-func testAccProbePreCheck(t *testing.T) {
-	t.Helper()
-	if os.Getenv("TF_ACC") == "" {
-		t.Skip("TF_ACC is not set; skipping the acceptance test")
-	}
-	if os.Getenv("TF_ACC_TERRAFORM_PATH") == "" || os.Getenv("TF_ACC_PROVIDER_HOST") == "" {
-		t.Fatal("TF_ACC_TERRAFORM_PATH and TF_ACC_PROVIDER_HOST must both be set. Run `make testacc`, " +
-			"which points the first at the tofu binary and sets the second to registry.opentofu.org.")
-	}
-}
+// The test-only probe resource pkiprobe_shared_blocks (and its
+// sharedBlockProbeProvider) that previously lived here was deleted in Task 6:
+// pki_cert_request is the first real resource to embed the shared subject, san,
+// and extra_extension blocks, so the probe's reason for existing is gone for
+// those. The acceptance tests that used the probe for key_usage,
+// extended_key_usage, and name_constraints empty-block rejection are deferred to
+// Tasks 8 and 9 — the certificate resources that embed those blocks — because
+// pki_cert_request carries only CSR-relevant blocks (subject, san,
+// extra_extension), and the nonEmptyBlockValidator lives on the certificate-
+// extension blocks it does not have. The unit tests below continue to cover
+// nonEmptyBlockValidator's Go-level behavior directly, without a probe.
 
 // TestNameConstraintsListNamesMatchTheBlock pins the derivation the emptiness
 // rule and its diagnostic both depend on. A ninth subtree list added to the model
@@ -257,185 +236,4 @@ func validateBlockObject(ctx context.Context, t *testing.T, block schema.Block, 
 		v.ValidateObject(ctx, validator.ObjectRequest{Path: at, ConfigValue: obj}, resp)
 	}
 	return resp.Diagnostics
-}
-
-// TestAccSharedBlocksRejectEmptyExtensionBlocks puts the emptiness rules through
-// a real OpenTofu plan. Every pattern below matches text only the provider
-// produces: the summaries are this package's own, and the stock validators'
-// details name the attribute path in a phrasing that appears nowhere in the
-// configuration.
-func TestAccSharedBlocksRejectEmptyExtensionBlocks(t *testing.T) {
-	for label, tc := range map[string]struct {
-		config string
-		expect *regexp.Regexp
-	}{
-		"key_usage with no usages": {
-			config: `resource "pkiprobe_shared_blocks" "test" {
-  key_usage {}
-}`,
-			expect: regexp.MustCompile(`(?s)Missing key usages`),
-		},
-		// An explicitly empty list is caught by both rules, and only one
-		// diagnostic reaches the operator: measured against OpenTofu 1.12, the
-		// block-level one is the one reported, and listvalidator.SizeAtLeast(1)'s
-		// "Attribute key_usage.usages list must contain at least 1 elements" is
-		// what surfaces instead if the block-level rule is ever removed. Either
-		// way the mistake is refused at plan time against key_usage.usages.
-		"key_usage with an empty usages list": {
-			config: `resource "pkiprobe_shared_blocks" "test" {
-  key_usage {
-    usages = []
-  }
-}`,
-			expect: regexp.MustCompile(`(?s)Missing key usages`),
-		},
-		"a duplicate key usage": {
-			config: `resource "pkiprobe_shared_blocks" "test" {
-  key_usage { usages = ["keyCertSign", "keyCertSign"] }
-}`,
-			// listvalidator.UniqueValues, which moves the duplicate internal/pki
-			// refused at encode time to plan time. Neither the summary nor the
-			// detail phrasing appears in the configuration.
-			expect: regexp.MustCompile(`(?s)Duplicate List Value.*contains duplicate values of`),
-		},
-		"extended_key_usage with no usages": {
-			config: `resource "pkiprobe_shared_blocks" "test" {
-  extended_key_usage {}
-}`,
-			expect: regexp.MustCompile(`(?s)Missing extended key usages`),
-		},
-		"name_constraints with nothing in any list": {
-			config: `resource "pkiprobe_shared_blocks" "test" {
-  name_constraints {}
-}`,
-			expect: regexp.MustCompile(`(?s)Empty name constraints`),
-		},
-		"name_constraints with only critical set": {
-			config: `resource "pkiprobe_shared_blocks" "test" {
-  name_constraints { critical = true }
-}`,
-			expect: regexp.MustCompile(`(?s)Empty name constraints`),
-		},
-	} {
-		t.Run(label, func(t *testing.T) {
-			resource.Test(t, resource.TestCase{
-				PreCheck:                 func() { testAccProbePreCheck(t) },
-				TerraformVersionChecks:   testAccProbeVersionChecks,
-				ProtoV6ProviderFactories: testAccProbeFactories,
-				Steps: []resource.TestStep{{
-					Config:      tc.config,
-					PlanOnly:    true,
-					ExpectError: tc.expect,
-				}},
-			})
-		})
-	}
-}
-
-// TestAccSharedBlocksAcceptEveryBlockOnceAndOmitted is the positive control the
-// rejection table needs. A rule that fires on an absent optional block would
-// break every resource in the eleven tasks that follow, and only a real plan can
-// show it does not: the framework walks an absent single-nested block's nested
-// attributes, so this is not a property the Go code makes obvious.
-func TestAccSharedBlocksAcceptEveryBlockOnceAndOmitted(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccProbePreCheck(t) },
-		TerraformVersionChecks:   testAccProbeVersionChecks,
-		ProtoV6ProviderFactories: testAccProbeFactories,
-		Steps: []resource.TestStep{
-			{
-				// Every optional block left out.
-				Config: `resource "pkiprobe_shared_blocks" "empty" {}`,
-				ConfigPlanChecks: resource.ConfigPlanChecks{
-					PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
-				},
-			},
-			{
-				// Every block present and populated.
-				Config: `
-resource "pkiprobe_shared_blocks" "empty" {}
-
-resource "pkiprobe_shared_blocks" "full" {
-  subject {
-    common_name  = "nick-ipad.ha.apps.somemissing.info"
-    organization = "homelab"
-
-    extra_attribute {
-      oid   = "2.16.840.1.113730.3.1.241"
-      value = "Nick V"
-    }
-  }
-
-  san {
-    dns_names    = ["nick-ipad.ha.apps.somemissing.info"]
-    ip_addresses = ["10.0.0.5"]
-  }
-
-  key_usage {
-    usages = ["digitalSignature", "keyEncipherment"]
-  }
-
-  extended_key_usage {
-    usages = ["clientAuth", "1.3.6.1.4.1.311.20.2.2"]
-  }
-
-  name_constraints {
-    permitted_dns_domains = [".ha.apps.somemissing.info"]
-  }
-
-  extra_extension {
-    oid          = "2.999.1"
-    value_base64 = "MAMCAQU="
-  }
-}
-`,
-				ConfigPlanChecks: resource.ConfigPlanChecks{
-					PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
-				},
-			},
-		},
-	})
-}
-
-// TestAccSharedBlocksImportShapedSubjectPlansClean settles the question
-// subjectFromPKI's comment answers in prose: state written from a parsed
-// certificate carries an empty non-nil `extra_attribute` collection, while a
-// configuration that declares no such block sends null, and the two have to be
-// the same absence or every imported certificate drifts forever.
-//
-// The probe's Create round-trips an ordered-form subject through internal/pki and
-// subjectFromPKI, which is exactly what a certificate resource's Read and
-// ImportState will do. Two checks then rule on it: Terraform's own after-apply
-// consistency check, which fails the apply outright if state and plan disagree in
-// a way it can see, and ExpectEmptyPlan on the plan after apply and refresh.
-func TestAccSharedBlocksImportShapedSubjectPlansClean(t *testing.T) {
-	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccProbePreCheck(t) },
-		TerraformVersionChecks:   testAccProbeVersionChecks,
-		ProtoV6ProviderFactories: testAccProbeFactories,
-		Steps: []resource.TestStep{{
-			Config: `
-resource "pkiprobe_shared_blocks" "ordered" {
-  subject {
-    attribute {
-      oid   = "2.5.4.3"
-      value = "nick-ipad.ha.apps.somemissing.info"
-    }
-    attribute {
-      oid   = "0.9.2342.19200300.100.1.1"
-      value = "nick"
-    }
-    attribute {
-      oid         = "2.5.4.6"
-      value       = "US"
-      string_type = "printable"
-    }
-  }
-}
-`,
-			ConfigPlanChecks: resource.ConfigPlanChecks{
-				PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
-			},
-		}},
-	})
 }
