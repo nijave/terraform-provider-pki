@@ -64,6 +64,7 @@ func (p *pkiProvider) Resources(_ context.Context) []func() resource.Resource {
 		NewCertRequestResource,
 		NewCertificateAuthorityResource,
 		NewCertificateResource,
+		NewCRLResource,
 	}
 }
 
