@@ -223,6 +223,22 @@ data "pki_certificate" "ca" {
 				// lowercased, 0x stripped, leading zeros stripped.
 				statecheck.ExpectKnownValue("data.pki_certificate.ca", tfjsonpath.New("serial_number"),
 					knownvalue.StringExact("2abc")),
+				// This config omits basic_constraints and key_usage, so the
+				// issuance defaults must have been applied: a CA certificate
+				// (ca = true) with keyCertSign and crlSign (DefaultCAKeyUsage).
+				// An omitted SingleNestedBlock cannot be materialized into state,
+				// so the defaults are observable only on the issued certificate,
+				// which is why these checks read through the data source. A
+				// regression in basicConstraintsValue(nil) or keyUsageValue(nil)
+				// would fail here.
+				statecheck.ExpectKnownValue("data.pki_certificate.ca",
+					tfjsonpath.New("is_ca"), knownvalue.Bool(true)),
+				statecheck.ExpectKnownValue("data.pki_certificate.ca",
+					tfjsonpath.New("key_usage").AtMapKey("usages"),
+					knownvalue.ListExact([]knownvalue.Check{
+						knownvalue.StringExact("keyCertSign"),
+						knownvalue.StringExact("crlSign"),
+					})),
 			},
 			ConfigPlanChecks: resource.ConfigPlanChecks{
 				PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},

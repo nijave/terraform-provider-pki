@@ -294,16 +294,17 @@ func (r *certificateAuthorityResource) ConfigValidators(_ context.Context) []res
 	}
 }
 
-// ModifyPlan is intentionally absent here. Serial normalization lives in a
-// per-attribute string plan modifier (normalizeSerialPlanModifier) because
-// Terraform Core rejects resource-level ModifyPlan overrides of values the
-// configuration set: "planned value ... does not match config value". Per-
-// attribute plan modifiers are the framework-sanctioned mechanism for that, and
-// they run before Terraform Core's plan validation. Block defaults live in
-// object plan modifiers for the same reason. Task 10 adds a resource-level
-// ModifyPlan for the drift-detection gating that decides whether an in-place
-// Update happens at all; that concern is orthogonal to normalization and can
-// share the entry point when it arrives.
+// ModifyPlan is intentionally absent here. Serial normalization (rewriting a
+// configured serial_number to canonical hex) is unimplementable for the reason
+// above: Terraform Core rejects any provider rewrite of a value the
+// configuration set, whether via resource.ModifyPlan or a per-attribute plan
+// modifier, so the configured spelling is preserved verbatim and the canonical
+// value lives only on the issued certificate (observable through the data
+// source). Block defaults cannot be materialized into state for an omitted
+// SingleNestedBlock either, so they are applied at issuance, not in a plan
+// modifier. Task 10 adds a resource-level ModifyPlan for the drift-detection
+// gating that decides whether an in-place Update happens at all; that concern
+// is orthogonal to normalization and lands then.
 
 func (r *certificateAuthorityResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan certificateAuthorityResourceModel
@@ -804,8 +805,15 @@ func (r *certificateAuthorityResource) issue(
 // certificate carries only the NotAfter the formula reads — at create time no
 // certificate exists yet, and the issued certificate's NotAfter is the
 // notBefore-plus-validity computed here.
+// issuanceValidity parses validity and early_renewal, computes the issuance
+// window, and reports ready_for_renewal. p is the path of the validity
+// attribute (the caller passes path.Root("validity")); early_renewal is a
+// separate top-level attribute, so its diagnostics carry path.Root("early_renewal")
+// directly. Using p.AtName("...") here produced validity.validity and
+// validity.early_renewal -- paths to attributes that do not exist, inherited
+// by Task 9 when it reuses this helper.
 func issuanceValidity(validity, earlyRenewal types.String, now time.Time, p path.Path) (notBefore, notAfter time.Time, ready bool, diags diag.Diagnostics) {
-	validDur, d := parseDurationAttr(validity, p.AtName("validity"))
+	validDur, d := parseDurationAttr(validity, p)
 	diags.Append(d...)
 	if diags.HasError() {
 		return time.Time{}, time.Time{}, false, diags
@@ -813,7 +821,7 @@ func issuanceValidity(validity, earlyRenewal types.String, now time.Time, p path
 
 	var earlyDur time.Duration
 	if !earlyRenewal.IsNull() && !earlyRenewal.IsUnknown() {
-		earlyDur, d = parseDurationAttr(earlyRenewal, p.AtName("early_renewal"))
+		earlyDur, d = parseDurationAttr(earlyRenewal, path.Root("early_renewal"))
 		diags.Append(d...)
 		if diags.HasError() {
 			return time.Time{}, time.Time{}, false, diags
