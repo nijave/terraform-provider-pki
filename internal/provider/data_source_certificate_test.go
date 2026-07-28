@@ -72,8 +72,77 @@ func TestAccDataSourceCertificateRejectsBadInput(t *testing.T) {
 // resource_certificate_authority_test.go, the same package), which Task 8
 // introduces. Their bodies are taken verbatim from Task 7's Step 1.
 //
-// TestAccDataSourceCertificateExtensionsAndSAN still moves to Task 9, which
-// introduces pki_certificate (the leaf resource it decodes).
+// TestAccDataSourceCertificateExtensionsAndSAN was deferred from Task 7 to
+// Task 9, which introduces pki_certificate (the leaf resource it decodes). It
+// lands below.
+
+// TestAccDataSourceCertificateExtensionsAndSAN asserts on the SAN's three
+// GeneralName types, key_usage, extended_key_usage, basic_constraints, and
+// is_ca of a decoded leaf certificate. Deferred from Task 7 (verbatim body)
+// because Task 7 had no pki_certificate resource to exercise; Task 9 adds it.
+func TestAccDataSourceCertificateExtensionsAndSAN(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		TerraformVersionChecks:   testAccVersionChecks,
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: testAccCAConfig + testAccKeyConfig + `
+resource "pki_certificate" "leaf" {
+  ca_certificate_pem = pki_certificate_authority.root.certificate_pem
+  ca_private_key_pem = pki_private_key.ca.private_key_pem
+  public_key_pem     = pki_private_key.test.public_key_pem
+  validity           = "8760h"
+
+  subject {
+    common_name = "nick-ipad.ha.apps.somemissing.info"
+  }
+
+  san {
+    dns_names       = ["nick-ipad.ha.apps.somemissing.info"]
+    email_addresses = ["nick@venenga.com"]
+    ip_addresses    = ["10.0.0.5"]
+  }
+
+  key_usage {
+    usages = ["digitalSignature", "keyEncipherment"]
+  }
+
+  extended_key_usage {
+    usages = ["clientAuth"]
+  }
+}
+
+data "pki_certificate" "decoded" {
+  content_pem = pki_certificate.leaf.certificate_pem
+}
+`,
+			ConfigStateChecks: []statecheck.StateCheck{
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("san").AtMapKey("dns_names").AtSliceIndex(0),
+					knownvalue.StringExact("nick-ipad.ha.apps.somemissing.info")),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("san").AtMapKey("email_addresses").AtSliceIndex(0),
+					knownvalue.StringExact("nick@venenga.com")),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("san").AtMapKey("ip_addresses").AtSliceIndex(0),
+					knownvalue.StringExact("10.0.0.5")),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("key_usage").AtMapKey("usages"),
+					knownvalue.ListExact([]knownvalue.Check{
+						knownvalue.StringExact("digitalSignature"),
+						knownvalue.StringExact("keyEncipherment"),
+					})),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("extended_key_usage").AtMapKey("usages"),
+					knownvalue.ListExact([]knownvalue.Check{knownvalue.StringExact("clientAuth")})),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("basic_constraints").AtMapKey("ca"), knownvalue.Bool(false)),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("is_ca"), knownvalue.Bool(false)),
+			},
+		}},
+	})
+}
 
 func TestAccDataSourceCertificate(t *testing.T) {
 	resource.Test(t, resource.TestCase{
