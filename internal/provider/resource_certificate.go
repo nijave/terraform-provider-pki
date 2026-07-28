@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/resourcevalidator"
@@ -28,6 +30,7 @@ var (
 	_ resource.Resource                     = (*certificateResource)(nil)
 	_ resource.ResourceWithConfigValidators = (*certificateResource)(nil)
 	_ resource.ResourceWithImportState      = (*certificateResource)(nil)
+	_ resource.ResourceWithModifyPlan       = (*certificateResource)(nil)
 )
 
 // certificateResource issues (and, on import, adopts) an end-entity (leaf)
@@ -88,6 +91,13 @@ func (r *certificateResource) Schema(_ context.Context, _ resource.SchemaRequest
 			"key (`public_key_pem`) — exactly one of the two. The issued certificate is held in Terraform " +
 			"state; there is no external CA service to refresh against, so `terraform plan` after apply " +
 			"is empty until the inputs change.\n\n" +
+			"Reissue is gated by a plan-time comparison against the certificate in state. A change only " +
+			"reissues when it changes the certificate's *content* — the encoded subject, the public key, " +
+			"the serial, the validity window, the extensions, or the issuer. Two consequences are " +
+			"surprising in a good way: changing `validity` to a different spelling of the **same window** " +
+			"(`175320h` vs `7305d`) does not reissue, and changing `ca_private_key_pem` (or `csr_pem`) " +
+			"never reissues at all, because neither can be read back from a certificate. The CA key " +
+			"arriving from a rotating Bitwarden Secret therefore never forces a re-enrollment.\n\n" +
 			"Changing the cryptographic inputs (`ca_certificate_pem`, `ca_private_key_pem`, `csr_pem`, " +
 			"`public_key_pem`) replaces the certificate. Changing the content inputs (`subject`, `san`, " +
 			"`validity`, `serial_number`, the extension blocks) reissues the certificate in place via " +
@@ -186,30 +196,25 @@ func (r *certificateResource) Schema(_ context.Context, _ resource.SchemaRequest
 					quotedList(pki.SignatureAlgorithmNames()) + ". When omitted, the conventional " +
 					"algorithm for the **signing key** (the CA's key) is chosen. The resolved name " +
 					"is written back to state.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
+				// UseStateForUnknown is intentionally absent: ModifyPlan (Task 10) owns the
+				// no-drift plan, copying state into plan when the comparison finds no content
+				// change. On genuine drift the cert is reissued and the resolved algorithm can
+				// change with it, so the framework must not carry the prior value forward.
 			},
 			"certificate_pem": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "The issued certificate as a PEM `CERTIFICATE` block.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
+				// UseStateForUnknown intentionally absent; see signature_algorithm.
 			},
 			"not_before": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "The certificate's `notBefore`, RFC 3339 timestamp.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
+				// UseStateForUnknown intentionally absent; see signature_algorithm.
 			},
 			"not_after": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "The certificate's `notAfter`, RFC 3339 timestamp.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
+				// UseStateForUnknown intentionally absent; see signature_algorithm.
 			},
 			"ready_for_renewal": schema.BoolAttribute{
 				Computed: true,
@@ -218,33 +223,29 @@ func (r *certificateResource) Schema(_ context.Context, _ resource.SchemaRequest
 					"wall-clock time passes without any change to the configuration — which is " +
 					"why this is the one computed attribute that intentionally does not carry " +
 					"`UseStateForUnknown`. A clock-only signal; it does not by itself reissue " +
-					"anything.",
+					"anything. ModifyPlan (Task 10) copies state's value into the plan when the " +
+					"drift comparison finds no content change, so the absence of UseStateForUnknown " +
+					"does not surface as a spurious update.",
 			},
 			"subject_key_id": schema.StringAttribute{
 				Computed: true,
 				MarkdownDescription: "The `subjectKeyIdentifier` extension's key identifier, " +
 					"lowercase hex (the SHA-1 of the public key, per RFC 5280 method 1).",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
+				// UseStateForUnknown intentionally absent; see signature_algorithm.
 			},
 			"authority_key_id": schema.StringAttribute{
 				Computed: true,
 				MarkdownDescription: "The `authorityKeyIdentifier` extension's key identifier, " +
 					"lowercase hex. Carried for every leaf issued under a CA, because the " +
 					"issuer DN always differs from the subject DN for a leaf.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
+				// UseStateForUnknown intentionally absent; see signature_algorithm.
 			},
 			"id": schema.StringAttribute{
 				Computed: true,
 				MarkdownDescription: "The hex-encoded SHA-256 of the certificate's DER — a stable " +
 					"identifier for the exact bytes of the certificate, which changes if and only " +
 					"if any signed content or the signature itself does.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
+				// UseStateForUnknown intentionally absent; see signature_algorithm.
 			},
 		},
 		Blocks: map[string]schema.Block{
@@ -338,6 +339,113 @@ func (r *certificateResource) Update(ctx context.Context, req resource.UpdateReq
 		return
 	}
 	r.issue(ctx, &plan, prior.SerialNumber, time.Now(), &resp.Diagnostics, &resp.State)
+}
+
+// ModifyPlan is the gate that decides whether Update reissues at all. It
+// compares the desired cert (assembled from the plan) against the cert in state
+// and suppresses the plan unless the content genuinely differs. The earlyrenewal
+// window overrides the comparison; see modifyCertificatePlan and the resource
+// description for the consequences.
+//
+// The build closure mirrors Create's template construction exactly, with one
+// difference: the desired NotBefore comes from STATE (not time.Now), and
+// NotAfter is stateNotBefore.Add(validity). That is what makes a rewritten
+// duration ("175320h" vs "7305d") compare equal — both produce the same
+// NotAfter against the same NotBefore. ca_private_key_pem and csr_pem feed
+// verification (the CA key match and the CSR signature check) but never the
+// comparison itself, because neither can be read back from an issued cert.
+func (r *certificateResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	stateNotBefore, ok := stateNotBefore(ctx, req, resp)
+	if !ok {
+		// stateNotBefore already added an error, or state has no not_before
+		// (e.g. mid-import). In the latter case the guards inside
+		// modifyCertificatePlan handle create/destroy; this early return just
+		// skips the comparison.
+		return
+	}
+
+	build := func() (pki.CertTemplate, crypto.PublicKey, *x509.Certificate, diag.Diagnostics) {
+		var plan certificateResourceModel
+		var diags diag.Diagnostics
+		diags.Append(req.Plan.Get(ctx, &plan)...)
+		if diags.HasError() {
+			return pki.CertTemplate{}, nil, nil, diags
+		}
+		// priorSerial comes from state so resolveSerial can preserve a
+		// previously-drawn random serial across plans; the build closure mutates
+		// a local plan copy rather than the planned state, which is owned by
+		// resp.Plan.
+		var prior certificateResourceModel
+		diags.Append(req.State.Get(ctx, &prior)...)
+		if diags.HasError() {
+			return pki.CertTemplate{}, nil, nil, diags
+		}
+		tpl, pub, caCert, buildDiags := r.buildDesired(ctx, &plan, stateNotBefore, prior.SerialNumber)
+		diags.Append(buildDiags...)
+		if diags.HasError() {
+			return pki.CertTemplate{}, nil, nil, diags
+		}
+		return tpl, pub, caCert, diags
+	}
+
+	copyComputed := func() {
+		var plan, state certificateResourceModel
+		resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+		resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		// copyComputed can only suppress the plan when the framework-level
+		// diff between plan and state is something we are allowed to rewrite.
+		// Terraform Core rejects provider rewrites of non-Computed attrs that
+		// disagree with config, and of ListNestedBlock counts, so a subject
+		// block that switched between the named-field form and the ordered
+		// `attribute` form cannot be reconciled to a Noop — Update fires, the
+		// cert is reissued, and the cert-derived Computed attrs take new
+		// values. Copying state's cert values into plan in that case would lie
+		// to Core ("the cert won't change") and trigger an
+		// "inconsistent result after apply" error when Update produces new
+		// bytes. Guard against that by checking the uncopiable blocks first.
+		if !reflect.DeepEqual(plan.Subject, state.Subject) ||
+			!reflect.DeepEqual(plan.SAN, state.SAN) ||
+			!reflect.DeepEqual(plan.BasicConstraints, state.BasicConstraints) ||
+			!reflect.DeepEqual(plan.KeyUsage, state.KeyUsage) ||
+			!reflect.DeepEqual(plan.ExtKeyUsage, state.ExtKeyUsage) ||
+			!reflect.DeepEqual(plan.ExtraExtensions, state.ExtraExtensions) {
+			return
+		}
+		// Computed-only attributes: always carry state forward. These are the
+		// exact fields that lose UseStateForUnknown in this task; without an
+		// explicit copy, the framework would leave them unknown and surface a
+		// spurious update for content identical to state.
+		plan.CertificatePEM = state.CertificatePEM
+		plan.NotBefore = state.NotBefore
+		plan.NotAfter = state.NotAfter
+		plan.SubjectKeyID = state.SubjectKeyID
+		plan.AuthorityKeyID = state.AuthorityKeyID
+		plan.SignatureAlgorithm = state.SignatureAlgorithm
+		plan.ID = state.ID
+		plan.ReadyForRenewal = state.ReadyForRenewal
+		// serial_number is Optional+Computed. Copy only when the configuration
+		// did not set it; a configured value must reach the plan verbatim or
+		// Terraform Core rejects the plan as inconsistent with config.
+		if plan.SerialNumber.IsNull() || plan.SerialNumber.IsUnknown() {
+			plan.SerialNumber = state.SerialNumber
+		}
+		// Top-level scalar inputs that the comparison has ruled content-
+		// irrelevant are also copied from state, so a rewritten-but-equivalent
+		// expression does not surface as a plan diff: validity rewritten to an
+		// equal-duration string ("175320h" vs "7305d") or early_renewal
+		// respelled. Copying them verbatim from state means state's spelling
+		// persists until the cert is genuinely reissued, which is the
+		// documented behavior — and the only one that produces a Noop plan for
+		// content identical to state.
+		plan.Validity = state.Validity
+		plan.EarlyRenewal = state.EarlyRenewal
+		resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
+	}
+
+	modifyCertificatePlan(ctx, req, resp, build, copyComputed)
 }
 
 // Delete is a no-op; the framework removes the resource from state and there is
@@ -776,4 +884,214 @@ func leafBasicConstraintsValue(m *basicConstraintsModel) (pki.BasicConstraints, 
 		return pki.BasicConstraints{CA: false, Critical: true}, nil
 	}
 	return m.toPKI(path.Root("basic_constraints"))
+}
+
+// buildDesired assembles the desired pki.CertTemplate from the plan, mirroring
+// issue() steps 1-7 (parsing, public-key resolution, subject/SAN precedence,
+// extension conversion, validity, serial) without signing or reading anything
+// back. It exists for ModifyPlan: the comparison against state needs the
+// *template the next apply would issue, not the template the previous apply
+// produced, and it must be parameterized by the desired NotBefore.
+//
+// desiredNotBefore comes from STATE (overlay B), not time.Now, because the
+// validity window is anchored at the issued cert's NotBefore — using now would
+// always drift. notAfter is desiredNotBefore.Add(validity), which is what makes
+// "175320h" and "7305d" compare equal. priorSerial is the serial held in state;
+// resolveSerial prefers a configured value and falls back to it, exactly as
+// issue() does on Update.
+//
+// plan is mutated in place to apply block-default self-checks and serial
+// resolution, matching issue()'s behavior; ModifyPlan passes a copy because the
+// actual planned state is owned by resp.Plan and the comparison must not
+// rewrite it.
+//
+// ca_private_key_pem is parsed and verified against the CA certificate here so
+// a crossed config fails at plan time with the same message apply would
+// produce, but the key itself is NOT returned (overlay B: it is excluded from
+// the comparison because it cannot be read back from an issued certificate).
+func (r *certificateResource) buildDesired(
+	ctx context.Context,
+	plan *certificateResourceModel,
+	desiredNotBefore time.Time,
+	priorSerial types.String,
+) (tpl pki.CertTemplate, pub crypto.PublicKey, caCert *x509.Certificate, diags diag.Diagnostics) {
+	// 1. Parse and cross-check the CA cert and key, exactly as issue() does.
+	caChain, err := pki.ParseCertificateChainPEM([]byte(plan.CACertificatePEM.ValueString()))
+	if err != nil {
+		diags.AddAttributeError(path.Root("ca_certificate_pem"),
+			"Unable to parse CA certificate", err.Error())
+		return tpl, nil, nil, diags
+	}
+	caCert = caChain[0]
+
+	caKey, err := pki.ParsePrivateKeyPEM([]byte(plan.CAPrivateKeyPEM.ValueString()))
+	if err != nil {
+		diags.AddAttributeError(path.Root("ca_private_key_pem"),
+			"Unable to parse CA private key",
+			"The CA private key could not be parsed as PKCS#8, PKCS#1, or SEC1: "+err.Error())
+		return tpl, nil, nil, diags
+	}
+	if !pki.PublicKeysEqual(caCert.PublicKey, caKey.Public()) {
+		diags.AddAttributeError(path.Root("ca_private_key_pem"),
+			"CA key does not match CA certificate",
+			"The ca_private_key_pem does not correspond to ca_certificate_pem: its "+
+				"public key does not match the certificate's. A certificate signed with this key "+
+				"combination would verify nowhere.")
+		return tpl, nil, nil, diags
+	}
+
+	// 2. Resolve the subject public key and the default subject/SAN.
+	var defaultSubject pki.Subject
+	var defaultSAN pki.SAN
+
+	if !plan.CSRPEM.IsNull() && !plan.CSRPEM.IsUnknown() {
+		csr, parseErr := pki.ParseCertRequestPEM([]byte(plan.CSRPEM.ValueString()))
+		if parseErr != nil {
+			diags.AddAttributeError(path.Root("csr_pem"),
+				"Unable to parse certificate signing request", parseErr.Error())
+			return tpl, nil, nil, diags
+		}
+		pub = csr.PublicKey
+		defaultSubject, parseErr = pki.ParseSubjectDER(csr.RawSubject)
+		if parseErr != nil {
+			diags.AddAttributeError(path.Root("csr_pem"),
+				"Unable to parse CSR subject", parseErr.Error())
+			return tpl, nil, nil, diags
+		}
+		sanOID, oidErr := pki.ParseOID("2.5.29.17")
+		if oidErr != nil {
+			diags.AddError("Internal error resolving subjectAltName OID", oidErr.Error())
+			return tpl, nil, nil, diags
+		}
+		for _, ext := range csr.Extensions {
+			if ext.Id.Equal(sanOID) {
+				s, extErr := pki.ParseSANExtension(ext)
+				if extErr != nil {
+					diags.AddAttributeError(path.Root("csr_pem"),
+						"Unable to parse CSR subjectAltName extension", extErr.Error())
+					return tpl, nil, nil, diags
+				}
+				defaultSAN = s
+				break
+			}
+		}
+	} else {
+		pub, err = pki.ParsePublicKeyPEM([]byte(plan.PublicKeyPEM.ValueString()))
+		if err != nil {
+			diags.AddAttributeError(path.Root("public_key_pem"),
+				"Unable to parse public key", err.Error())
+			return tpl, nil, nil, diags
+		}
+	}
+
+	// 3. Apply subject/SAN precedence (wholesale replacement, no merging).
+	var subject pki.Subject
+	if plan.Subject != nil {
+		s, d := plan.Subject.toPKI(ctx, path.Root("subject"))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		subject = s
+	} else {
+		subject = defaultSubject
+	}
+
+	var san pki.SAN
+	if plan.SAN != nil {
+		s, d := plan.SAN.toPKI(ctx, path.Root("san"))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		san = s
+	} else {
+		san = defaultSAN
+	}
+
+	// 4. Convert extension blocks. basic_constraints applies the leaf default
+	// when omitted; key_usage has no default.
+	bcConfigured := plan.BasicConstraints != nil
+	bc, d := leafBasicConstraintsValue(plan.BasicConstraints)
+	diags.Append(d...)
+	if diags.HasError() {
+		return tpl, nil, nil, diags
+	}
+	if bcConfigured {
+		plan.BasicConstraints = basicConstraintsFromPKI(bc)
+	}
+
+	var ku *pki.KeyUsage
+	if plan.KeyUsage != nil {
+		k, d := plan.KeyUsage.toPKI(ctx, path.Root("key_usage"))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		ku = &k
+	}
+
+	var eku *pki.ExtKeyUsage
+	if plan.ExtKeyUsage != nil {
+		e, d := plan.ExtKeyUsage.toPKI(ctx, path.Root("extended_key_usage"))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		eku = &e
+	}
+
+	extras := make([]pki.ExtraExtension, 0, len(plan.ExtraExtensions))
+	for i, em := range plan.ExtraExtensions {
+		e, d := em.toPKI(path.Root("extra_extension").AtListIndex(i))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		extras = append(extras, e)
+	}
+
+	// 5. Compute the desired validity window. desiredNotBefore arrives already
+	// truncated to a second (state's value was, and now.UTC().Truncate is the
+	// other caller); the addition preserves that granularity for notAfter.
+	validDur, d := parseDurationAttr(plan.Validity, path.Root("validity"))
+	diags.Append(d...)
+	if diags.HasError() {
+		return tpl, nil, nil, diags
+	}
+	notAfter := desiredNotBefore.Add(validDur)
+
+	// 6. Resolve serial.
+	serial, d := resolveSerial(plan.SerialNumber, priorSerial, path.Root("serial_number"))
+	diags.Append(d...)
+	if diags.HasError() {
+		return tpl, nil, nil, diags
+	}
+	if plan.SerialNumber.IsNull() || plan.SerialNumber.IsUnknown() {
+		plan.SerialNumber = types.StringValue(pki.FormatSerial(serial))
+	}
+
+	// 7. Assemble the template.
+	tpl = pki.CertTemplate{
+		Subject:          subject,
+		SAN:              san,
+		Serial:           serial,
+		NotBefore:        desiredNotBefore,
+		NotAfter:         notAfter,
+		BasicConstraints: &bc,
+		KeyUsage:         ku,
+		ExtKeyUsage:      eku,
+		ExtraExtensions:  extras,
+	}
+	if !plan.SignatureAlgorithm.IsNull() && !plan.SignatureAlgorithm.IsUnknown() {
+		a, err := pki.SignatureAlgorithmByName(plan.SignatureAlgorithm.ValueString())
+		if err != nil {
+			diags.AddAttributeError(path.Root("signature_algorithm"),
+				"Unknown signature algorithm", err.Error())
+			return tpl, nil, nil, diags
+		}
+		tpl.SignatureAlgorithm = a
+	}
+
+	return tpl, pub, caCert, diags
 }
