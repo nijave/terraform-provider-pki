@@ -338,3 +338,47 @@ resource "pki_certificate" "leaf" {
 		}},
 	})
 }
+
+// TestAccCertificateAuthorityValidityRewriteDoesNotReplace is the CA analogue of
+// TestAccCertificateValidityStringRewriteDoesNotReplace, and unlike
+// TestAccCertificateAuthorityRotatingParentKeyDoesNotReplace it genuinely
+// exercises the CA resource's ModifyPlan: the configured *value* of validity
+// changes (175320h -> 7305d), so without the drift comparison Core would plan an
+// Update and the CA would reissue (advancing NotBefore). The comparison must find
+// no drift -- the window is identical -- and copyComputed must turn the plan into
+// a Noop. This is the verification that the CA's buildDesired (state-sourced
+// NotBefore, parent/self-signed handling) and copyComputed work end to end.
+func TestAccCertificateAuthorityValidityRewriteDoesNotReplace(t *testing.T) {
+	base := func(validity string) string {
+		return `
+resource "pki_private_key" "ca" {
+  algorithm   = "ECDSA"
+  ecdsa_curve = "P384"
+}
+
+resource "pki_certificate_authority" "root" {
+  private_key_pem = pki_private_key.ca.private_key_pem
+  validity        = "` + validity + `"
+  serial_number   = "1001"
+  subject { common_name = "homelab-root" }
+  key_usage { usages = ["keyCertSign", "crlSign"] }
+}
+`
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		TerraformVersionChecks:   testAccVersionChecks,
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: base("175320h")},
+			{
+				Config: base("7305d"), // 7305 * 24 == 175320
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("pki_certificate_authority.root", plancheck.ResourceActionNoop),
+					},
+				},
+			},
+		},
+	})
+}

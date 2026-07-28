@@ -4,11 +4,13 @@ package provider
 
 import (
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"reflect"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/resourcevalidator"
@@ -29,6 +31,7 @@ var (
 	_ resource.Resource                     = (*certificateAuthorityResource)(nil)
 	_ resource.ResourceWithConfigValidators = (*certificateAuthorityResource)(nil)
 	_ resource.ResourceWithImportState      = (*certificateAuthorityResource)(nil)
+	_ resource.ResourceWithModifyPlan       = (*certificateAuthorityResource)(nil)
 )
 
 // certificateAuthorityResource issues (and, on import, adopts) a certificate
@@ -91,6 +94,14 @@ func (r *certificateAuthorityResource) Schema(_ context.Context, _ resource.Sche
 			"that parent. The issued certificate is held in Terraform state — there is no external " +
 			"CA service to refresh against, so `terraform plan` after apply is empty until the " +
 			"inputs change.\n\n" +
+			"Reissue is gated by a plan-time comparison against the certificate in state. A change " +
+			"only reissues when it changes the certificate's *content* — the encoded subject, the " +
+			"public key, the serial, the validity window, the extensions, or the issuer. Two " +
+			"consequences are surprising in a good way: changing `validity` to a different spelling " +
+			"of the **same window** (`175320h` vs `7305d`) does not reissue, and changing " +
+			"`parent_private_key_pem` (or `private_key_pem`) never reissues at all, because neither " +
+			"can be read back from a certificate. A CA key arriving from a rotating Bitwarden " +
+			"Secret therefore never forces a re-enrollment of the certificates it signed.\n\n" +
 			"Changing any of the cryptographic inputs (`private_key_pem`, `parent_certificate_pem`, " +
 			"`parent_private_key_pem`) replaces the certificate. Changing the content inputs " +
 			"(`subject`, `san`, `validity`, `serial_number`, the extension blocks) reissues the " +
@@ -172,39 +183,32 @@ func (r *certificateAuthorityResource) Schema(_ context.Context, _ resource.Sche
 					"algorithm for the **signing key** is chosen: for a self-signed root that is " +
 					"the certificate's own key, for an intermediate it is the parent's key. The " +
 					"resolved name is written back to state.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
+				// UseStateForUnknown is intentionally absent on the cert-derived Computed
+				// attributes below (signature_algorithm, certificate_pem, certificate_chain_pem,
+				// not_before, not_after, subject_key_id, authority_key_id, id): ModifyPlan (Task
+				// 10) owns the no-drift plan, copying state into plan when the comparison finds no
+				// content change. On genuine drift the cert is reissued and these take new values,
+				// so the framework must not carry the prior value forward. ready_for_renewal never
+				// carried it either. serial_number keeps UseStateForUnknown (it is Optional+
+				// Computed; resolveSerial preserves it across plans).
 			},
 			"certificate_pem": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "The issued certificate as a PEM `CERTIFICATE` block.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
 			},
 			"certificate_chain_pem": schema.StringAttribute{
 				Computed: true,
 				MarkdownDescription: "The certificate plus its ancestry, leaf-adjacent first, as " +
 					"concatenated PEM `CERTIFICATE` blocks. Null when the certificate is " +
 					"self-signed (no parent).",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
 			},
 			"not_before": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "The certificate's `notBefore`, RFC 3339 timestamp.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
 			},
 			"not_after": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "The certificate's `notAfter`, RFC 3339 timestamp.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
 			},
 			"ready_for_renewal": schema.BoolAttribute{
 				Computed: true,
@@ -213,33 +217,26 @@ func (r *certificateAuthorityResource) Schema(_ context.Context, _ resource.Sche
 					"wall-clock time passes without any change to the configuration — which is " +
 					"why this is the one computed attribute that intentionally does not carry " +
 					"`UseStateForUnknown`. A clock-only signal; it does not by itself reissue " +
-					"anything.",
+					"anything. ModifyPlan (Task 10) copies state's value into the plan when the " +
+					"drift comparison finds no content change, so the absence of UseStateForUnknown " +
+					"does not surface as a spurious update.",
 			},
 			"subject_key_id": schema.StringAttribute{
 				Computed: true,
 				MarkdownDescription: "The `subjectKeyIdentifier` extension's key identifier, " +
 					"lowercase hex (the SHA-1 of the public key, per RFC 5280 method 1).",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
 			},
 			"authority_key_id": schema.StringAttribute{
 				Computed: true,
 				MarkdownDescription: "The `authorityKeyIdentifier` extension's key identifier, " +
 					"lowercase hex. Null for a self-signed root whose issuer DN equals its subject " +
 					"DN, because crypto/x509 omits the extension in that case.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
 			},
 			"id": schema.StringAttribute{
 				Computed: true,
 				MarkdownDescription: "The hex-encoded SHA-256 of the certificate's DER — a stable " +
 					"identifier for the exact bytes of the certificate, which changes if and only " +
 					"if any signed content or the signature itself does.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
 			},
 		},
 		Blocks: map[string]schema.Block{
@@ -790,6 +787,224 @@ func (r *certificateAuthorityResource) issue(
 	plan.ReadyForRenewal = types.BoolValue(ready)
 
 	diags.Append(stateOut.Set(ctx, plan)...)
+}
+
+// buildDesired assembles the certificate template the plan is asking for, plus
+// the public key it is for and the CA certificate that signs it (the parent, or
+// nil for a self-signed root). It mirrors issue()'s template construction
+// exactly, with two differences that matter for the drift comparison: it does
+// not issue (no CreateCertificate, no state write), and the desired NotBefore
+// comes from STATE (desiredNotBefore) rather than time.Now, with NotAfter =
+// desiredNotBefore.Add(validity). That is what makes a rewritten-but-equivalent
+// validity ("175320h" vs "7305d") compare equal: both produce the same NotAfter
+// against the same NotBefore. caCert is the parent so pki.CompareCertificate
+// verifies the stored certificate's signature against the right issuer; nil for
+// a root means the comparison treats it as self-signed.
+func (r *certificateAuthorityResource) buildDesired(
+	ctx context.Context,
+	plan *certificateAuthorityResourceModel,
+	desiredNotBefore time.Time,
+	priorSerial types.String,
+) (tpl pki.CertTemplate, pub crypto.PublicKey, caCert *x509.Certificate, diags diag.Diagnostics) {
+	subjectKey, err := pki.ParsePrivateKeyPEM([]byte(plan.PrivateKeyPEM.ValueString()))
+	if err != nil {
+		diags.AddAttributeError(path.Root("private_key_pem"),
+			"Unable to parse private key",
+			"The private key could not be parsed as PKCS#8, PKCS#1, or SEC1: "+err.Error())
+		return tpl, nil, nil, diags
+	}
+	pub = pki.PublicKeyOf(subjectKey)
+
+	if !plan.ParentCertificatePEM.IsNull() && !plan.ParentCertificatePEM.IsUnknown() {
+		parentChain, parseErr := pki.ParseCertificateChainPEM([]byte(plan.ParentCertificatePEM.ValueString()))
+		if parseErr != nil {
+			diags.AddAttributeError(path.Root("parent_certificate_pem"),
+				"Unable to parse parent certificate", parseErr.Error())
+			return tpl, nil, nil, diags
+		}
+		caCert = parentChain[0]
+		// The parent private key is not needed for the comparison (CompareCertificate
+		// verifies against caCert.PublicKey), so it is not parsed here. A mismatched
+		// parent key is an issuance concern that Update will surface, not a drift one.
+	}
+
+	var subject pki.Subject
+	if plan.Subject != nil {
+		s, d := plan.Subject.toPKI(ctx, path.Root("subject"))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		subject = s
+	}
+
+	var san pki.SAN
+	if plan.SAN != nil {
+		s, d := plan.SAN.toPKI(ctx, path.Root("san"))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		san = s
+	}
+
+	bc, d := basicConstraintsValue(plan.BasicConstraints)
+	diags.Append(d...)
+	if diags.HasError() {
+		return tpl, nil, nil, diags
+	}
+
+	ku, d := keyUsageValue(ctx, plan.KeyUsage)
+	diags.Append(d...)
+	if diags.HasError() {
+		return tpl, nil, nil, diags
+	}
+
+	var eku *pki.ExtKeyUsage
+	if plan.ExtKeyUsage != nil {
+		e, d := plan.ExtKeyUsage.toPKI(ctx, path.Root("extended_key_usage"))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		eku = &e
+	}
+
+	var nc *pki.NameConstraints
+	if plan.NameConstraints != nil {
+		n, d := plan.NameConstraints.toPKI(ctx, path.Root("name_constraints"))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		nc = &n
+	}
+
+	extras := make([]pki.ExtraExtension, 0, len(plan.ExtraExtensions))
+	for i, em := range plan.ExtraExtensions {
+		e, d := em.toPKI(path.Root("extra_extension").AtListIndex(i))
+		diags.Append(d...)
+		if diags.HasError() {
+			return tpl, nil, nil, diags
+		}
+		extras = append(extras, e)
+	}
+
+	validDur, d := parseDurationAttr(plan.Validity, path.Root("validity"))
+	diags.Append(d...)
+	if diags.HasError() {
+		return tpl, nil, nil, diags
+	}
+	notAfter := desiredNotBefore.Add(validDur)
+
+	serial, d := resolveSerial(plan.SerialNumber, priorSerial, path.Root("serial_number"))
+	diags.Append(d...)
+	if diags.HasError() {
+		return tpl, nil, nil, diags
+	}
+
+	var sigAlg x509.SignatureAlgorithm
+	if !plan.SignatureAlgorithm.IsNull() && !plan.SignatureAlgorithm.IsUnknown() {
+		a, err := pki.SignatureAlgorithmByName(plan.SignatureAlgorithm.ValueString())
+		if err != nil {
+			diags.AddAttributeError(path.Root("signature_algorithm"), "Unknown signature algorithm", err.Error())
+			return tpl, nil, nil, diags
+		}
+		sigAlg = a
+	}
+
+	tpl = pki.CertTemplate{
+		Subject:            subject,
+		SAN:                san,
+		Serial:             serial,
+		NotBefore:          desiredNotBefore,
+		NotAfter:           notAfter,
+		BasicConstraints:   &bc,
+		KeyUsage:           &ku,
+		ExtKeyUsage:        eku,
+		NameConstraints:    nc,
+		ExtraExtensions:    extras,
+		SignatureAlgorithm: sigAlg,
+	}
+	return tpl, pub, caCert, diags
+}
+
+// ModifyPlan is the gate that decides whether Update reissues at all. See
+// modifyCertificatePlan (certdrift.go) and the resource description for the
+// consequences. The build closure mirrors issue()'s template construction via
+// buildDesired, and copyComputed turns a no-drift plan into a genuine Noop by
+// carrying state's cert-derived Computed values forward (guarded against Core
+// rejecting a Noop when a block's shape changed, exactly as the leaf resource
+// does).
+func (r *certificateAuthorityResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	stateNotBefore, ok := stateNotBefore(ctx, req, resp)
+	if !ok {
+		return
+	}
+
+	build := func() (pki.CertTemplate, crypto.PublicKey, *x509.Certificate, diag.Diagnostics) {
+		var plan certificateAuthorityResourceModel
+		var diags diag.Diagnostics
+		diags.Append(req.Plan.Get(ctx, &plan)...)
+		if diags.HasError() {
+			return pki.CertTemplate{}, nil, nil, diags
+		}
+		var prior certificateAuthorityResourceModel
+		diags.Append(req.State.Get(ctx, &prior)...)
+		if diags.HasError() {
+			return pki.CertTemplate{}, nil, nil, diags
+		}
+		tpl, pub, caCert, buildDiags := r.buildDesired(ctx, &plan, stateNotBefore, prior.SerialNumber)
+		diags.Append(buildDiags...)
+		if diags.HasError() {
+			return pki.CertTemplate{}, nil, nil, diags
+		}
+		return tpl, pub, caCert, diags
+	}
+
+	copyComputed := func() {
+		var plan, state certificateAuthorityResourceModel
+		resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+		resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		// Guard: copyComputed can only suppress the plan when the framework-level
+		// diff on the uncopiable blocks is absent. A subject block that switched
+		// between the named-field form and the ordered `attribute` form (or any
+		// other block-shape change) cannot be reconciled to a Noop — Update fires,
+		// the cert is reissued, and the cert-derived Computed attrs take new
+		// values. Copying state's cert values into plan in that case would lie to
+		// Core and trigger an "inconsistent result after apply". Mirrors the leaf.
+		if !reflect.DeepEqual(plan.Subject, state.Subject) ||
+			!reflect.DeepEqual(plan.SAN, state.SAN) ||
+			!reflect.DeepEqual(plan.BasicConstraints, state.BasicConstraints) ||
+			!reflect.DeepEqual(plan.KeyUsage, state.KeyUsage) ||
+			!reflect.DeepEqual(plan.ExtKeyUsage, state.ExtKeyUsage) ||
+			!reflect.DeepEqual(plan.NameConstraints, state.NameConstraints) ||
+			!reflect.DeepEqual(plan.ExtraExtensions, state.ExtraExtensions) {
+			return
+		}
+		plan.CertificatePEM = state.CertificatePEM
+		plan.CertificateChainPEM = state.CertificateChainPEM
+		plan.NotBefore = state.NotBefore
+		plan.NotAfter = state.NotAfter
+		plan.SubjectKeyID = state.SubjectKeyID
+		plan.AuthorityKeyID = state.AuthorityKeyID
+		plan.SignatureAlgorithm = state.SignatureAlgorithm
+		plan.ID = state.ID
+		plan.ReadyForRenewal = state.ReadyForRenewal
+		if plan.SerialNumber.IsNull() || plan.SerialNumber.IsUnknown() {
+			plan.SerialNumber = state.SerialNumber
+		}
+		// Carry validity and early_renewal from state so a rewritten-but-
+		// equivalent expression does not surface as a plan diff.
+		plan.Validity = state.Validity
+		plan.EarlyRenewal = state.EarlyRenewal
+		resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
+	}
+
+	modifyCertificatePlan(ctx, req, resp, build, copyComputed)
 }
 
 // issuanceValidity resolves the validity window and the renewal-readiness flag
