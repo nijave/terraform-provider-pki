@@ -7,6 +7,9 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/statecheck"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 )
 
 // TestAccDataSourceCertificateRejectsBadInput is the one test this task lands:
@@ -61,4 +64,73 @@ func TestAccDataSourceCertificateRejectsBadInput(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestAccDataSourceCertificate and TestAccDataSourceCertificateAcceptsBase64
+// were deferred from Task 7, which built the data source but had no certificate
+// resource to decode. They land here, against testAccCAConfig (defined in
+// resource_certificate_authority_test.go, the same package), which Task 8
+// introduces. Their bodies are taken verbatim from Task 7's Step 1.
+//
+// TestAccDataSourceCertificateExtensionsAndSAN still moves to Task 9, which
+// introduces pki_certificate (the leaf resource it decodes).
+
+func TestAccDataSourceCertificate(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		TerraformVersionChecks:   testAccVersionChecks,
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: testAccCAConfig + `
+data "pki_certificate" "decoded" {
+  content_pem = pki_certificate_authority.root.certificate_pem
+}
+`,
+			ConfigStateChecks: []statecheck.StateCheck{
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("subject").AtSliceIndex(0).AtMapKey("oid"),
+					knownvalue.StringExact("2.5.4.3")),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("subject").AtSliceIndex(0).AtMapKey("value"),
+					knownvalue.StringExact("homelab-root")),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("is_ca"), knownvalue.Bool(true)),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("public_key_algorithm"), knownvalue.StringExact("ECDSA")),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("signature_algorithm"), knownvalue.StringExact("ECDSA-SHA384")),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("serial_number"), knownvalue.StringRegexp(regexp.MustCompile(`^[0-9a-f]+$`))),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("not_after"), knownvalue.StringRegexp(regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T`))),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("subject_key_id"), knownvalue.StringRegexp(regexp.MustCompile(`^[0-9a-f]{40}$`))),
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("fingerprint_sha256"), knownvalue.StringRegexp(regexp.MustCompile(`^[0-9a-f]{64}$`))),
+			},
+		}},
+	})
+}
+
+func TestAccDataSourceCertificateAcceptsBase64(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		TerraformVersionChecks:   testAccVersionChecks,
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			// This is the shape that matters operationally: the CA arrives as
+			// base64 in a Kubernetes Secret's data map, and spec section 11
+			// requires no decoding step.
+			Config: testAccCAConfig + `
+data "pki_certificate" "decoded" {
+  content_base64 = base64encode(pki_certificate_authority.root.certificate_pem)
+}
+`,
+			ConfigStateChecks: []statecheck.StateCheck{
+				statecheck.ExpectKnownValue("data.pki_certificate.decoded",
+					tfjsonpath.New("subject").AtSliceIndex(0).AtMapKey("value"),
+					knownvalue.StringExact("homelab-root")),
+			},
+		}},
+	})
 }
