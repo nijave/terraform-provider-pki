@@ -382,3 +382,44 @@ resource "pki_certificate_authority" "root" {
 		},
 	})
 }
+
+// TestAccCertificateAuthorityGenuineDriftReissues is the CA analogue of
+// TestAccCertificateGenuineDriftReissues: a real content change (the subject CN)
+// must plan an in-place Update, not a Noop and not a replace. It exercises the
+// CA resource's full drift path -- buildDesired with a self-signed root
+// (caCert nil), CompareCertificate detecting the subject change, the warning
+// diagnostic, and Update reissuing -- which the no-drift CA tests do not reach.
+func TestAccCertificateAuthorityGenuineDriftReissues(t *testing.T) {
+	base := func(cn string) string {
+		return `
+resource "pki_private_key" "ca" {
+  algorithm   = "ECDSA"
+  ecdsa_curve = "P384"
+}
+
+resource "pki_certificate_authority" "root" {
+  private_key_pem = pki_private_key.ca.private_key_pem
+  validity        = "87600h"
+  serial_number   = "1001"
+  subject { common_name = "` + cn + `" }
+  key_usage { usages = ["keyCertSign", "crlSign"] }
+}
+`
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		TerraformVersionChecks:   testAccVersionChecks,
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: base("before-root")},
+			{
+				Config: base("after-root"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("pki_certificate_authority.root", plancheck.ResourceActionUpdate),
+					},
+				},
+			},
+		},
+	})
+}

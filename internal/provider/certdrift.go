@@ -208,11 +208,13 @@ func stateNotBefore(ctx context.Context, req resource.ModifyPlanRequest, resp *r
 // verbatim or Core rejects the plan as inconsistent with config; resolveSerial
 // in Update preserves it anyway.
 //
-// certificate_chain_pem (pki_certificate_authority only) is also omitted: it is
-// Computed, so when certificate_pem is marked Unknown here Core plans an Update,
-// and Update recomputes the chain alongside every other cert-derived Computed
-// attr. The CA resource's copyComputed carries state's chain value forward on
-// the no-drift path.
+// certificate_chain_pem (pki_certificate_authority only) is omitted from the
+// list for two reinforcing reasons: it lost UseStateForUnknown in this task, so
+// it already arrives Unknown in the proposed plan (independently contributing to
+// the diff), and it is Computed, so the Update that forceReissuePlan provokes
+// recomputes it alongside every other cert-derived attr. Marking it here would
+// be redundant; the CA resource's copyComputed carries state's chain value
+// forward on the no-drift path instead.
 func forceReissuePlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	for _, p := range []path.Path{
 		path.Root("certificate_pem"),
