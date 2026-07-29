@@ -117,7 +117,7 @@ func (r *certificateResource) Schema(_ context.Context, _ resource.SchemaRequest
 					"key matches this certificate, supplied as `ca_private_key_pem`. Changing this " +
 					"value replaces the certificate.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					requiresReplaceUnlessStateIsNull(),
 				},
 			},
 			"ca_private_key_pem": schema.StringAttribute{
@@ -131,7 +131,7 @@ func (r *certificateResource) Schema(_ context.Context, _ resource.SchemaRequest
 					"the same key produces the same signature, so comparing the bytes would manufacture " +
 					"spurious drift.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					requiresReplaceUnlessStateIsNull(),
 				},
 			},
 			"csr_pem": schema.StringAttribute{
@@ -145,7 +145,7 @@ func (r *certificateResource) Schema(_ context.Context, _ resource.SchemaRequest
 					"extensions are never copied from the CSR (see `basic_constraints` and " +
 					"`key_usage`). Changing this value replaces the certificate.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					requiresReplaceUnlessStateIsNull(),
 				},
 			},
 			"public_key_pem": schema.StringAttribute{
@@ -155,7 +155,7 @@ func (r *certificateResource) Schema(_ context.Context, _ resource.SchemaRequest
 					"set. Inline mode requires a `subject` or `san` block, since there is no CSR to " +
 					"derive them from. Changing this value replaces the certificate.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					requiresReplaceUnlessStateIsNull(),
 				},
 			},
 			"validity": schema.StringAttribute{
@@ -327,6 +327,20 @@ func (r *certificateResource) Read(ctx context.Context, req resource.ReadRequest
 // serial comes from state unless the configuration changed it, which
 // resolveSerial expresses by preferring a configured value and falling back to
 // the prior state.
+//
+// There is one short-circuit. ModifyPlan's no-drift path (copyComputed) copies
+// state's certificate_pem and every cert-derived Computed attr into plan, and
+// the post-import settling apply reaches Update with those attrs already set
+// rather than Unknown — the only path that does so, because the drift and
+// early-renewal paths both leave certificate_pem Unknown. When Update sees a
+// non-Unknown certificate_pem, no reissue is needed: the cert in state already
+// matches what the configuration describes, and the only reason Update fired at
+// all is that a Required input (ca_certificate_pem, ca_private_key_pem) was
+// null in state after ImportState and is being settled from configuration for
+// the first time. Reissuing would burn a fresh notBefore onto every adopted
+// certificate. Writing the plan straight back to state preserves the imported
+// cert byte-for-byte and records the inputs the configuration supplied, so the
+// next plan is a genuine Noop.
 func (r *certificateResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan certificateResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -336,6 +350,13 @@ func (r *certificateResource) Update(ctx context.Context, req resource.UpdateReq
 	var prior certificateResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+	// No-drift signal from ModifyPlan: copyComputed already populated the
+	// cert-derived attrs from state. Skip issue() so the imported cert's
+	// notBefore (and bytes) survive the settling apply.
+	if !plan.CertificatePEM.IsNull() && !plan.CertificatePEM.IsUnknown() {
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
 	r.issue(ctx, &plan, prior.SerialNumber, time.Now(), &resp.Diagnostics, &resp.State)
@@ -460,16 +481,22 @@ func (r *certificateResource) Delete(_ context.Context, _ resource.DeleteRequest
 // form that reproduces an adopted DN byte-for-byte.
 //
 // ca_certificate_pem and ca_private_key_pem cannot be recovered from a leaf and
-// are left null; the resource description documents that the configuration must
-// supply them and that the first plan after import shows them being set, which
-// does not reissue the certificate — Task 10's comparison excludes
-// ca_private_key_pem entirely and matches ca_certificate_pem against the
-// certificate's issuer rather than treating it as an input diff. early_renewal
-// is also left null: it is not a property of the certificate, and the readiness
+// are left null. The first plan after import would therefore show them being
+// set from configuration, and stringplanmodifier.RequiresReplace would force a
+// replace — which would reissue the cert with a fresh notBefore, exactly the
+// device-re-enrollment this provider exists to prevent. ModifyPlan's no-drift
+// path (copyComputed in certdrift.go) prevents that by overwriting these
+// content-irrelevant inputs from state when the cert comparison finds no drift,
+// clearing RequiresReplace so the plan becomes a genuine Noop. early_renewal is
+// also left null: it is not a property of the certificate, and the readiness
 // check reduces to "has the certificate expired" until configuration sets a
-// window. csr_pem and public_key_pem are likewise left null: the certificate's
-// public key is the only recoverable identity, and supplying either in
-// configuration post-import selects the mode without forcing reissue.
+// window. csr_pem is left null: it cannot be recovered from the cert, and
+// supplying it in configuration post-import selects CSR mode without forcing
+// reissue (it is excluded from the comparison). public_key_pem, by contrast,
+// IS recovered — the cert carries the subject's public key — so it is
+// reconstructed here rather than left null, matching what
+// pki_private_key.public_key_pem resolves to when the adopted key is the cert's
+// subject key.
 func (r *certificateResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	pemBytes, err := resolveImportID(req.ID)
 	if err != nil {
@@ -510,7 +537,22 @@ func (r *certificateResource) ImportState(ctx context.Context, req resource.Impo
 	model.CACertificatePEM = types.StringNull()
 	model.CAPrivateKeyPEM = types.StringNull()
 	model.CSRPEM = types.StringNull()
-	model.PublicKeyPEM = types.StringNull()
+	// public_key_pem IS recoverable from the certificate (the cert carries the
+	// subject's public key), so reconstruct it here rather than leaving it
+	// null. Without this, the first plan after import shows public_key_pem
+	// going from null to the configured value, and the schema's
+	// stringplanmodifier.RequiresReplace() forces a replace — which reissues
+	// the cert with a fresh notBefore and breaks the empty-plan guarantee the
+	// migration depends on. Reconstructing the PEM byte-exact from the cert
+	// means state.public_key_pem matches what pki_private_key.public_key_pem
+	// resolves to (the adopted key IS the cert's subject key), so the diff is
+	// empty and ModifyPlan's no-drift path turns the plan into a Noop.
+	pubPEM, err := pki.EncodePublicKeyPEM(cert.PublicKey)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to encode public key from certificate", err.Error())
+		return
+	}
+	model.PublicKeyPEM = types.StringValue(string(pubPEM))
 
 	if len(cert.SubjectKeyId) > 0 {
 		model.SubjectKeyID = types.StringValue(hex.EncodeToString(cert.SubjectKeyId))

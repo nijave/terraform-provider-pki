@@ -120,7 +120,7 @@ func (r *certificateAuthorityResource) Schema(_ context.Context, _ resource.Sche
 					"the key whose certificate matches `parent_certificate_pem`. Changing this " +
 					"value replaces the certificate.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					requiresReplaceUnlessStateIsNull(),
 				},
 			},
 			"parent_certificate_pem": schema.StringAttribute{
@@ -131,7 +131,7 @@ func (r *certificateAuthorityResource) Schema(_ context.Context, _ resource.Sche
 					"key's public key must match the certificate's. Changing this value replaces " +
 					"the certificate.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					requiresReplaceUnlessStateIsNull(),
 				},
 			},
 			"parent_private_key_pem": schema.StringAttribute{
@@ -141,7 +141,7 @@ func (r *certificateAuthorityResource) Schema(_ context.Context, _ resource.Sche
 					"Required iff `parent_certificate_pem` is set, and must correspond to it. " +
 					"Changing this value replaces the certificate.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					requiresReplaceUnlessStateIsNull(),
 				},
 			},
 			"validity": schema.StringAttribute{
@@ -364,6 +364,13 @@ func (r *certificateAuthorityResource) Read(ctx context.Context, req resource.Re
 // whose Update paths are unreachable because every input requires replacement.
 // Task 10 adds the ModifyPlan gating that decides whether an update happens at
 // all (by comparing desired content against the issued certificate).
+//
+// The same no-drift short-circuit as pki_certificate.Update applies here: when
+// ModifyPlan's copyComputed has already populated certificate_pem from state,
+// the post-import settling apply has reached Update solely to record the
+// previously-null private_key_pem (and parent material) from configuration, and
+// reissuing would burn a fresh notBefore onto an adopted CA. Writing the plan
+// straight back to state preserves the imported cert.
 func (r *certificateAuthorityResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan certificateAuthorityResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -373,6 +380,13 @@ func (r *certificateAuthorityResource) Update(ctx context.Context, req resource.
 	var prior certificateAuthorityResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+	// No-drift signal from ModifyPlan: copyComputed already populated the
+	// cert-derived attrs from state. Skip issue() so the imported cert's
+	// notBefore (and bytes) survive the settling apply.
+	if !plan.CertificatePEM.IsNull() && !plan.CertificatePEM.IsUnknown() {
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
 	r.issue(ctx, &plan, prior.SerialNumber, time.Now(), &resp.Diagnostics, &resp.State)

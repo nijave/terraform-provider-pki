@@ -10,6 +10,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
@@ -35,6 +37,49 @@ func criticalAttribute(defaultValue bool, description string) schema.BoolAttribu
 		Default:             booldefault.StaticBool(defaultValue),
 		MarkdownDescription: description,
 	}
+}
+
+// requiresReplaceUnlessStateIsNull is the plan modifier on the cryptographic
+// input attributes (ca_certificate_pem, ca_private_key_pem, csr_pem,
+// public_key_pem on pki_certificate; private_key_pem, parent_certificate_pem,
+// parent_private_key_pem on pki_certificate_authority).
+//
+// A plain stringplanmodifier.RequiresReplace would force a replace whenever
+// state and plan differ for these attributes. That is correct after Create
+// (state has a real value, changing it means a different CA/key, and the cert
+// must be reissued) but catastrophic after ImportState: the CA material and the
+// CA's private key cannot be recovered from an issued certificate, so ImportState
+// leaves them null in state, configuration supplies them, and the null-to-value
+// transition would force a replace on every adopted certificate — reissuing
+// 20-year device certificates with a fresh notBefore, which means a manual
+// re-enrollment per device. That is exactly the incident this provider exists
+// to prevent.
+//
+// Suppressing RequiresReplace when state is null converts the post-import
+// replace into an update. The update path then settles the inputs into state
+// without reissuing: ModifyPlan's no-drift copyComputed copies state's
+// certificate_pem into plan (signalling no reissue is needed), and Update
+// detects that and writes plan straight back to state rather than calling
+// issue(). After that single settling apply, state holds the configured inputs
+// and the next plan is a genuine Noop.
+//
+// Once state has a non-null value (post-create, or after the settling apply),
+// changes to these attributes require replace exactly as before — the CA/key
+// really did change, and the cert must be reissued.
+func requiresReplaceUnlessStateIsNull() planmodifier.String {
+	return stringplanmodifier.RequiresReplaceIf(
+		func(_ context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
+			if req.StateValue.IsNull() {
+				// Post-import: state has no value to "change away" from. The
+				// configuration is supplying the value for the first time, and
+				// ModifyPlan/Update handle preserving the cert without reissue.
+				return
+			}
+			resp.RequiresReplace = true
+		},
+		"If the value of this attribute changes and was previously set, Terraform will destroy and recreate the resource.",
+		"If the value of this attribute changes and was previously set, Terraform will destroy and recreate the resource.",
+	)
 }
 
 // stringListAttribute builds an optional list-of-strings attribute. A list, not
