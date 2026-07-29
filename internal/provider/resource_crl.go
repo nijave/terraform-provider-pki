@@ -3,6 +3,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/x509"
@@ -359,17 +360,19 @@ func (r *crlResource) Delete(_ context.Context, _ resource.DeleteRequest, _ *res
 // pki_certificate_authority use ModifyPlan for.
 //
 // This deviates from the plan section's "No ModifyPlan: unlike a certificate,
-// regenerating a CRL is cheap..." line. The deviation is forced by the test
-// requirements the same section writes: TestAccCRLSignatureVerifiesAndSerialIsPresent
-// and TestAccCRLEmptyIsValid assert `PostApplyPostRefresh: ExpectEmptyPlan`,
-// and TestAccCRLNumberIncrementsOnRegeneration exercises real Updates that
-// produce new crl_pem values. Both together are inconsistent: the framework's
-// default refresh plan carries state's Computed values forward, so a no-op
-// refresh is empty by default — but Update (on drift) needs those values
-// marked Unknown so the apply response can compose fresh ones. ModifyPlan's
-// drift check is the mechanism that does the right one in each case, which is
-// why the cert resources use it. The plan author's "no ModifyPlan" line was
-// an aspiration that did not survive contact with the framework.
+// regenerating a CRL is cheap..." line. The deviation is forced by the
+// `PostApplyPostRefresh: ExpectEmptyPlan` requirement that
+// TestAccCRLSignatureVerifiesAndSerialIsPresent and TestAccCRLEmptyIsValid pin:
+// the cert-derived Computed attributes deliberately carry no UseStateForUnknown
+// (see schema), so on a no-op refresh the framework proposes Unknown for them
+// rather than state's value, and the plan comes back non-empty. ModifyPlan
+// carries state's cert-derived values forward when the inputs are unchanged,
+// turning that refresh into the empty plan the tests require. (The drift path
+// does not need ModifyPlan — a config-driven diff naturally proposes Unknown
+// and Update composes fresh values — but ModifyPlan must leave that path alone,
+// which is the no-drift/early-regeneration split below.) The plan author's "no
+// ModifyPlan" line was an aspiration that did not survive contact with the
+// framework.
 //
 // "Cheap to regenerate" is still true: unlike the cert resources, whose
 // ModifyPlan also gates whether Update fires at all, this one does NOT
@@ -421,7 +424,7 @@ func (r *crlResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReq
 		// inputs are otherwise unchanged. This is the one case where a
 		// content-identical CRL still regenerates, on purpose, mirroring the
 		// certificate resources' early-renewal override.
-		plan.Number = types.Int64Null()
+		plan.Number = types.Int64Unknown()
 		plan.CRLPEM = types.StringUnknown()
 		plan.CRLBase64 = types.StringUnknown()
 		plan.ThisUpdate = types.StringUnknown()
@@ -461,11 +464,48 @@ func (r *crlResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReq
 // null-vs-value comparisons there would force a regeneration on every plan.
 // Explicitly changing revoked_at IS drift, handled via the "config-set value
 // differs from state" branch of crlRevokedDrifts.
-func crlDrifts(plan, state crlResourceModel) bool {
-	if plan.CACertificatePEM.ValueString() != state.CACertificatePEM.ValueString() {
+// crlSameCACertificate reports whether two CA-certificate PEM strings describe
+// the same certificate. The PEM bytes are not compared directly: a CA cert
+// re-serialized (different whitespace, re-issued DER-equal) is byte-different
+// but the same issuer, and a spurious regeneration here would churn the CRL's
+// thisUpdate on every plan. Parse both and compare the DER; on a parse failure
+// fall back to treating them as different so a genuinely changed value is still
+// detected (the issuing path reports its own diagnostic for an unparseable CA).
+func crlSameCACertificate(planPEM, statePEM string) bool {
+	if planPEM == statePEM {
 		return true
 	}
-	if plan.CAPrivateKeyPEM.ValueString() != state.CAPrivateKeyPEM.ValueString() {
+	plan, errP := pki.ParseCertificatePEM([]byte(planPEM))
+	st, errS := pki.ParseCertificatePEM([]byte(statePEM))
+	if errP != nil || errS != nil {
+		return false
+	}
+	return bytes.Equal(plan.Raw, st.Raw)
+}
+
+// crlSameSigningKey reports whether two CA-private-key PEM strings describe the
+// same signing key. The CRL schema advertises "any PEM encoding pki_private_key
+// produces (PKCS#1, SEC1, or PKCS#8)", and a Bitwarden-managed key may be
+// re-serialized between those encodings; comparing PEM bytes would flag that as
+// drift and regenerate the CRL for a cryptographically identical key. Parse both
+// and compare their public keys; on a parse failure treat them as different.
+func crlSameSigningKey(planPEM, statePEM string) bool {
+	if planPEM == statePEM {
+		return true
+	}
+	plan, errP := pki.ParsePrivateKeyPEM([]byte(planPEM))
+	st, errS := pki.ParsePrivateKeyPEM([]byte(statePEM))
+	if errP != nil || errS != nil {
+		return false
+	}
+	return pki.PublicKeysEqual(plan.Public(), st.Public())
+}
+
+func crlDrifts(plan, state crlResourceModel) bool {
+	if !crlSameCACertificate(plan.CACertificatePEM.ValueString(), state.CACertificatePEM.ValueString()) {
+		return true
+	}
+	if !crlSameSigningKey(plan.CAPrivateKeyPEM.ValueString(), state.CAPrivateKeyPEM.ValueString()) {
 		return true
 	}
 	if plan.NextUpdate.ValueString() != state.NextUpdate.ValueString() {
