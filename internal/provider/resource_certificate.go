@@ -108,7 +108,12 @@ func (r *certificateResource) Schema(_ context.Context, _ resource.SchemaRequest
 			"copied from the CSR — see the `basic_constraints` and `key_usage` descriptions for why.\n\n" +
 			"This resource is importable. The CA certificate and key cannot be recovered from a leaf, " +
 			"so after import the configuration must supply them; the first plan will show them being " +
-			"set, which does not reissue the certificate.",
+			"set, which does not reissue the certificate. For a byte-exact adoption — an empty plan " +
+			"after import — write the `subject` in its **ordered `attribute` form** " +
+			"(`subject { attribute { oid = ... } }`). The named-field form (`subject { common_name = ... }`) " +
+			"encodes to the same DN, but Terraform treats the two block shapes as a configuration " +
+			"difference and cannot reconcile the post-import plan to a no-op, so the certificate " +
+			"reissues (with a fresh `not_before`) on the settling apply. The ordered form avoids that.",
 		Attributes: map[string]schema.Attribute{
 			"ca_certificate_pem": schema.StringAttribute{
 				Required: true,

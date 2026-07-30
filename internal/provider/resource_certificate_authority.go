@@ -109,7 +109,10 @@ func (r *certificateAuthorityResource) Schema(_ context.Context, _ resource.Sche
 			"and then held in state, so reissuing for any other reason keeps the serial stable.\n\n" +
 			"This resource is importable. The private key cannot be recovered from a certificate, " +
 			"so after import the configuration must supply `private_key_pem`; the first plan will " +
-			"show it being set, which does not reissue the certificate.",
+			"show it being set, which does not reissue the certificate. For a byte-exact adoption — " +
+			"an empty plan after import — write the `subject` in its **ordered `attribute` form** " +
+			"(`subject { attribute { oid = ... } }`); the named-field form reissues on the settling " +
+			"apply because Terraform cannot reconcile the block-shape change to a no-op.",
 		Attributes: map[string]schema.Attribute{
 			"private_key_pem": schema.StringAttribute{
 				Required:  true,
