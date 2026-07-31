@@ -96,3 +96,30 @@ func selfSignedCertPEM(t *testing.T) string {
 	}
 	return string(pemBytes)
 }
+
+// TestCrlSameCACertificateHandlesChainForm is the whole-branch-review regression
+// for crlSameCACertificate using a single-block parser. ca_certificate_pem may be
+// a chain (leaf-adjacent first), and issue() reads it with ParseCertificateChainPEM.
+// A single-block parser rejects a multi-block input, so a re-serialized chain would
+// compare as "different" and regenerate the CRL every plan -- the churn the
+// function exists to prevent. Two concatenated CERTIFICATE blocks (CA + a second
+// cert) must compare equal to a whitespace-varied copy, and unequal when the
+// leading (signing) cert differs.
+func TestCrlSameCACertificateHandlesChainForm(t *testing.T) {
+	t.Parallel()
+	ca := selfSignedCertPEM(t)
+	other := selfSignedCertPEM(t)
+	chain := ca + other          // signing CA first, one more block after it
+	variant := ca + "\n" + other // whitespace between blocks, same certs
+
+	if chain == variant {
+		t.Fatal("setup invariant failed: variant did not differ from the chain")
+	}
+	if !crlSameCACertificate(chain, variant) {
+		t.Errorf("crlSameCACertificate rejected a re-serialized chain-form CA cert; a single-block parser would, and the CRL would regenerate every plan")
+	}
+	// A chain whose leading (signing) cert differs must compare unequal.
+	if crlSameCACertificate(chain, other+ca) {
+		t.Error("crlSameCACertificate reported two chains with different signing certs as the same")
+	}
+}

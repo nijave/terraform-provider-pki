@@ -479,19 +479,27 @@ func (r *crlResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReq
 // the same certificate. The PEM bytes are not compared directly: a CA cert
 // re-serialized (different whitespace, re-issued DER-equal) is byte-different
 // but the same issuer, and a spurious regeneration here would churn the CRL's
-// thisUpdate on every plan. Parse both and compare the DER; on a parse failure
-// fall back to treating them as different so a genuinely changed value is still
-// detected (the issuing path reports its own diagnostic for an unparseable CA).
+// thisUpdate on every plan. Parse both and compare the leaf-adjacent DER; on a
+// parse failure fall back to treating them as different so a genuinely changed
+// value is still detected (the issuing path reports its own diagnostic for an
+// unparseable CA).
+//
+// ParseCertificateChainPEM, not ParseCertificatePEM: the schema and issue()
+// accept ca_certificate_pem as a chain (leaf-adjacent first), and a single-block
+// parser rejects a multi-block input outright -- which would make any
+// re-serialized chain compare as "different" and regenerate the CRL every plan,
+// the exact churn this function exists to prevent. The signing CA is the first
+// certificate, matching how issue() reads it.
 func crlSameCACertificate(planPEM, statePEM string) bool {
 	if planPEM == statePEM {
 		return true
 	}
-	plan, errP := pki.ParseCertificatePEM([]byte(planPEM))
-	st, errS := pki.ParseCertificatePEM([]byte(statePEM))
-	if errP != nil || errS != nil {
+	plan, errP := pki.ParseCertificateChainPEM([]byte(planPEM))
+	st, errS := pki.ParseCertificateChainPEM([]byte(statePEM))
+	if errP != nil || errS != nil || len(plan) == 0 || len(st) == 0 {
 		return false
 	}
-	return bytes.Equal(plan.Raw, st.Raw)
+	return bytes.Equal(plan[0].Raw, st[0].Raw)
 }
 
 // crlSameSigningKey reports whether two CA-private-key PEM strings describe the

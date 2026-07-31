@@ -434,8 +434,16 @@ func (r *certificateAuthorityResource) ImportState(ctx context.Context, req reso
 		resp.Diagnostics.AddError("Unable to parse certificate subject", err.Error())
 		return
 	}
-	s := subjectFromPKI(subject)
-	model.Subject = &s
+	// Guard on a non-empty subject, matching the leaf resource. subjectFromPKI on
+	// an empty DN returns a present-but-empty *subjectModel, which would leave a
+	// null-vs-&{} mismatch against a config that legitimately carries only a san
+	// block (AtLeastOneOf permits that) -- copyComputed's reflect.DeepEqual guard
+	// then refuses the Noop and reissues on settling. An empty CA subject is
+	// non-RFC-5280 but adoptable, so the guard is correctness, not just symmetry.
+	if len(subject.Attributes) > 0 {
+		s := subjectFromPKI(subject)
+		model.Subject = &s
+	}
 
 	model.SerialNumber = types.StringValue(pki.FormatSerial(cert.SerialNumber))
 	model.Validity = types.StringValue(fmt.Sprintf("%dh", int(cert.NotAfter.Sub(cert.NotBefore).Hours())))
