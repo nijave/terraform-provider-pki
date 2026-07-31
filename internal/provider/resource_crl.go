@@ -431,6 +431,17 @@ func (r *crlResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReq
 		plan.NextUpdateTime = types.StringUnknown()
 		plan.SignatureAlgorithm = types.StringUnknown()
 		plan.ID = types.StringUnknown()
+		// ready_for_regeneration must be Unknown too, mirroring the cert path's
+		// forceReissuePlan. issue() recomputes it from the new far-future
+		// next_update_time, so in the normal early_regenerate < next_update case
+		// it goes true (this refresh) -> false (after regeneration). It lacks
+		// UseStateForUnknown, so today the framework already proposes it Unknown
+		// and no mismatch occurs -- but setting it here keeps the force block
+		// self-contained, so adding UseStateForUnknown later (which the no-drift
+		// path might want) cannot silently reintroduce an inconsistent-result
+		// crash. Defense in depth against the exact asymmetry the whole-branch
+		// review flagged.
+		plan.ReadyForRegeneration = types.BoolUnknown()
 		resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
 		return
 	}

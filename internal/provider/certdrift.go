@@ -48,12 +48,21 @@ import (
 // duration compare equal (overlay B). copyComputed is called only when the
 // comparison finds no drift, so the resource can copy every Computed attribute
 // from state into the plan — turning an update into a genuine no-op (overlay D).
+// extraUnknownPaths names Computed attributes that a specific resource must also
+// mark Unknown on the early-renewal force path, beyond the shared cert-derived
+// set forceReissuePlan handles. pki_certificate_authority passes
+// certificate_pem's sibling certificate_chain_pem here: it is rebuilt by the
+// reissue (with a fresh notBefore) but, lacking UseStateForUnknown, the
+// framework otherwise carries its state value forward into the forced plan, so
+// the applied chain would differ from the planned one -- "inconsistent result
+// after apply". The leaf has no such attribute and passes nothing.
 func modifyCertificatePlan(
 	ctx context.Context,
 	req resource.ModifyPlanRequest,
 	resp *resource.ModifyPlanResponse,
 	build func() (pki.CertTemplate, crypto.PublicKey, *x509.Certificate, diag.Diagnostics),
 	copyComputed func(),
+	extraUnknownPaths ...path.Path,
 ) {
 	// 1. Create (no prior state to compare against) and destroy (Plan.Raw is
 	// null and dereferencing it would panic). Both guards are required.
@@ -138,7 +147,7 @@ func modifyCertificatePlan(
 		// certificate_pem (and the rest of the cert-derived Computed attrs)
 		// Unknown forces a diff against state and surfaces the Update that the
 		// reissue requires.
-		forceReissuePlan(ctx, req, resp)
+		forceReissuePlan(ctx, req, resp, extraUnknownPaths...)
 		resp.Diagnostics.AddWarning(
 			"Certificate scheduled for reissue (early-renewal window)",
 			"The certificate is inside its early_renewal window of not_after and will be "+
@@ -208,15 +217,16 @@ func stateNotBefore(ctx context.Context, req resource.ModifyPlanRequest, resp *r
 // verbatim or Core rejects the plan as inconsistent with config; resolveSerial
 // in Update preserves it anyway.
 //
-// certificate_chain_pem (pki_certificate_authority only) is omitted from the
-// list for two reinforcing reasons: it lost UseStateForUnknown in this task, so
-// it already arrives Unknown in the proposed plan (independently contributing to
-// the diff), and it is Computed, so the Update that forceReissuePlan provokes
-// recomputes it alongside every other cert-derived attr. Marking it here would
-// be redundant; the CA resource's copyComputed carries state's chain value
-// forward on the no-drift path instead.
-func forceReissuePlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	for _, p := range []path.Path{
+// certificate_chain_pem (pki_certificate_authority only) is NOT in this shared
+// list -- the leaf has no such attribute and SetAttribute on a missing path
+// errors -- so the CA passes it through extraUnknownPaths. It must be marked
+// Unknown here: unlike the no-drift path where copyComputed carries state's
+// chain forward, the early-renewal path reissues (fresh notBefore rebuilds the
+// chain), and certificate_chain_pem lacks UseStateForUnknown, so the framework
+// would otherwise carry its stale state value into the plan and the applied
+// chain would not match. All extraUnknownPaths are String-typed Computed attrs.
+func forceReissuePlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse, extraUnknownPaths ...path.Path) {
+	stringPaths := []path.Path{
 		path.Root("certificate_pem"),
 		path.Root("not_before"),
 		path.Root("not_after"),
@@ -224,7 +234,9 @@ func forceReissuePlan(ctx context.Context, req resource.ModifyPlanRequest, resp 
 		path.Root("authority_key_id"),
 		path.Root("signature_algorithm"),
 		path.Root("id"),
-	} {
+	}
+	stringPaths = append(stringPaths, extraUnknownPaths...)
+	for _, p := range stringPaths {
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, p, types.StringUnknown())...)
 	}
 	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("ready_for_renewal"), types.BoolUnknown())...)

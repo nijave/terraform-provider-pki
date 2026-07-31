@@ -423,3 +423,74 @@ resource "pki_certificate_authority" "root" {
 		},
 	})
 }
+
+// TestAccCertificateAuthorityIntermediateReadyForRenewalApplies is the
+// whole-branch-review regression for the shared forceReissuePlan omitting
+// certificate_chain_pem. An intermediate CA (non-null chain) inside its
+// early_renewal window must not just PLAN a reissue but APPLY it without an
+// "inconsistent result after apply" error: on the config-unchanged early-renewal
+// path Core carries every Computed attr forward from state, forceReissuePlan
+// flips the cert-derived ones Unknown, and Update rebuilds the chain with a
+// fresh notBefore -- so certificate_chain_pem MUST be marked Unknown too, or the
+// applied chain differs from the (carried-forward) planned one. The existing
+// TestAccCertificateReadyForRenewal masks this: it uses a leaf (null chain) and a
+// single step that never applies the reissue.
+func TestAccCertificateAuthorityIntermediateReadyForRenewalApplies(t *testing.T) {
+	config := testAccCAConfig + `
+resource "pki_private_key" "intermediate" {
+  algorithm   = "ECDSA"
+  ecdsa_curve = "P256"
+}
+resource "pki_certificate_authority" "intermediate" {
+  private_key_pem        = pki_private_key.intermediate.private_key_pem
+  parent_certificate_pem = pki_certificate_authority.root.certificate_pem
+  parent_private_key_pem = pki_private_key.ca.private_key_pem
+  validity               = "1h"
+  early_renewal          = "2h"
+  serial_number          = "4001"
+  subject { common_name = "homelab-intermediate" }
+  key_usage { usages = ["keyCertSign", "crlSign"] }
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		TerraformVersionChecks:   testAccVersionChecks,
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: config, ExpectNonEmptyPlan: true},
+			// The second apply of the same config is what applies the reissue the
+			// window forces. Without certificate_chain_pem marked Unknown, this
+			// step fails with "Provider produced inconsistent result after apply".
+			{Config: config, ExpectNonEmptyPlan: true},
+		},
+	})
+}
+
+// TestAccCRLIntermediateReadyForRegenerationApplies is the CRL analogue: a CRL in
+// its regeneration window must apply the regeneration (not just plan it) without
+// an inconsistent-result error. The window force block must mark
+// ready_for_regeneration Unknown -- Read set it true on the entering refresh, but
+// issue() recomputes it false from the new far-future next_update_time (the normal
+// early_regenerate < next_update case), so a carried-forward true would mismatch
+// the applied false. TestAccCRLReadyForRegeneration masks this with an inverted
+// window (next_update < early_regenerate, so ready stays true) and a single step.
+func TestAccCRLIntermediateReadyForRegenerationApplies(t *testing.T) {
+	config := testAccCAConfig + `
+resource "pki_crl" "test" {
+  ca_certificate_pem = pki_certificate_authority.root.certificate_pem
+  ca_private_key_pem = pki_private_key.ca.private_key_pem
+  next_update        = "1h"
+  early_regenerate   = "2h"
+  revoked { serial_number = "2001" }
+}
+`
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		TerraformVersionChecks:   testAccVersionChecks,
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: config, ExpectNonEmptyPlan: true},
+			{Config: config, ExpectNonEmptyPlan: true},
+		},
+	})
+}

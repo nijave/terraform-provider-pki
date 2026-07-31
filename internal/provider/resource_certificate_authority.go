@@ -1021,7 +1021,11 @@ func (r *certificateAuthorityResource) ModifyPlan(ctx context.Context, req resou
 		resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
 	}
 
-	modifyCertificatePlan(ctx, req, resp, build, copyComputed)
+	// certificate_chain_pem is CA-only and lacks UseStateForUnknown, so the
+	// early-renewal force path must mark it Unknown too, or an intermediate CA's
+	// reissue (fresh notBefore rebuilds the chain) fails "inconsistent result
+	// after apply". The leaf has no chain attribute and passes nothing.
+	modifyCertificatePlan(ctx, req, resp, build, copyComputed, path.Root("certificate_chain_pem"))
 }
 
 // issuanceValidity resolves the validity window and the renewal-readiness flag
