@@ -15,3 +15,10 @@ openssl x509 -in fetched-secrets/pki-ca.crt -noout -subject
 echo
 echo "=== openssl verify -crl_check against a real leaf cert (expect OK) ==="
 openssl verify -CAfile fetched-secrets/pki-ca.crt -crl_check -CRLfile crl.pem fetched-secrets/nick-desktop.crt
+
+echo
+echo "=== revoked cert must now fail crl_check as revoked (expect 'certificate revoked') ==="
+if openssl verify -CAfile fetched-secrets/pki-ca.crt -crl_check -CRLfile crl.pem migration-test.crt; then
+  echo "FAIL: expected migration-test.crt to be reported as revoked, but verify succeeded" >&2
+  exit 1
+fi
