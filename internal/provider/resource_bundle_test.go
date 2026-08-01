@@ -77,6 +77,10 @@ output "cert_only_content" {
 				// representations, or it lands in plan output and CI logs.
 				statecheck.ExpectSensitiveValue("pki_bundle.full", tfjsonpath.New("content")),
 				statecheck.ExpectSensitiveValue("pki_bundle.full", tfjsonpath.New("content_base64")),
+				// pkcs12_encoding has no meaning for a non-pkcs12 format and is
+				// left null rather than persisting a spurious "modern".
+				statecheck.ExpectKnownValue("pki_bundle.full", tfjsonpath.New("pkcs12_encoding"), knownvalue.Null()),
+				statecheck.ExpectKnownValue("pki_bundle.cert_only", tfjsonpath.New("pkcs12_encoding"), knownvalue.Null()),
 			},
 			Check: resource.ComposeAggregateTestCheckFunc(func(s *terraform.State) error {
 				full := s.RootModule().Outputs["full_content"].Value.(string)
@@ -132,6 +136,9 @@ resource "pki_bundle" "pkcs7" {
 				statecheck.ExpectKnownValue("pki_bundle.der", tfjsonpath.New("content_base64"), knownvalue.NotNull()),
 				statecheck.ExpectKnownValue("pki_bundle.pkcs7", tfjsonpath.New("content"), knownvalue.Null()),
 				statecheck.ExpectKnownValue("pki_bundle.pkcs7", tfjsonpath.New("content_base64"), knownvalue.NotNull()),
+				// pkcs12_encoding stays null for these formats too.
+				statecheck.ExpectKnownValue("pki_bundle.der", tfjsonpath.New("pkcs12_encoding"), knownvalue.Null()),
+				statecheck.ExpectKnownValue("pki_bundle.pkcs7", tfjsonpath.New("pkcs12_encoding"), knownvalue.Null()),
 			},
 			ConfigPlanChecks: resource.ConfigPlanChecks{
 				PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
@@ -312,6 +319,12 @@ output "truststore_base64" {
 				}
 				return nil
 			}),
+			ConfigPlanChecks: resource.ConfigPlanChecks{
+				// The salt-suppression that keeps a keyed pkcs12 bundle stable is
+				// format- and encoding-agnostic; assert the empty refresh plan on
+				// every encoding, including the keyless passwordless truststore.
+				PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+			},
 		}},
 	})
 }
@@ -349,6 +362,11 @@ output "jks_base64" {
 				}
 				return nil
 			}),
+			ConfigPlanChecks: resource.ConfigPlanChecks{
+				// JKS draws a fresh random salt on every encode; assert the
+				// salt-suppression holds and a second plan is empty.
+				PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+			},
 		}},
 	})
 }
@@ -420,6 +438,21 @@ func TestAccBundleRejectsBadConfig(t *testing.T) {
 				`  certificate_pem = pki_certificate.leaf.certificate_pem` + "\n" +
 				`  password_wo = "password"` + "\n" + `  password_wo_version = 1`,
 			expect: regexp.MustCompile(`is not supported by pkcs12_encoding`),
+		},
+		// Apply-time library fallback: ValidateConfig deliberately does NOT cover
+		// passwordless + private_key_pem (it only rejects passwordless + a
+		// password), so this rejection comes from internal/pki's EncodeBundle at
+		// apply. "Java reads such a bundle as empty" is that path's distinctive
+		// phrase and cannot appear in the config, so the pattern is load-bearing.
+		// Mutation: dropping the passwordless+key guard in EncodeBundle lets the
+		// bundle encode successfully → no error → ExpectError fails → test fails.
+		"passwordless with a private key": {
+			body: `format = "pkcs12"` + "\n" + `  pkcs12_encoding = "passwordless"` + "\n" +
+				`  certificate_pem = pki_certificate.leaf.certificate_pem` + "\n" +
+				`  private_key_pem = pki_private_key.leaf.private_key_pem`,
+			// \s+ between words: Terraform wraps long diagnostic detail across
+			// lines, inserting a newline and indentation mid-phrase.
+			expect: regexp.MustCompile(`Java\s+reads\s+such\s+a\s+bundle\s+as\s+empty`),
 		},
 		// Sound: "does not match" is the provider's mismatched-key error text,
 		// which does not appear in the config.

@@ -499,12 +499,19 @@ func (r *bundleResource) encode(
 
 	// 4. Resolve the encoding. An omitted or unknown pkcs12_encoding defaults
 	// to modern, matching EncodeBundle's own resolution. The resolved value is
-	// written back to state so the operator sees what was used.
+	// written back to state only for a pkcs12 bundle, where it names the suite
+	// that was used; every other format has no encoding, so the attribute stays
+	// null rather than persisting a meaningless "modern" (ValidateConfig already
+	// rejects setting pkcs12_encoding on a non-pkcs12 format).
 	encoding := pki.PKCS12Modern
 	if !model.PKCS12Encoding.IsNull() && !model.PKCS12Encoding.IsUnknown() {
 		encoding = pki.PKCS12Encoding(model.PKCS12Encoding.ValueString())
 	}
-	model.PKCS12Encoding = types.StringValue(string(encoding))
+	if format == pki.FormatPKCS12 {
+		model.PKCS12Encoding = types.StringValue(string(encoding))
+	} else {
+		model.PKCS12Encoding = types.StringNull()
+	}
 
 	// 5. Read the write-only password from the model (which Create/Update
 	// populated from req.Config).
