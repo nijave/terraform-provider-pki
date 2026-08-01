@@ -95,9 +95,10 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-      # tfplugindocs formats the examples with `terraform fmt`, and OpenTofu's
-      # `tofu fmt` is equivalent for this purpose. Install OpenTofu rather than
-      # Terraform, so no BUSL-licensed binary is used anywhere in CI.
+      # tools/gen-schema.sh shells out to `tofu` to export the provider schema
+      # (see that script for why tfplugindocs can't be pointed at OpenTofu
+      # directly). Install OpenTofu rather than Terraform, so no
+      # BUSL-licensed binary is used anywhere in CI.
       - uses: opentofu/setup-opentofu@v2
         with:
           tofu_version: '1.12.4'
