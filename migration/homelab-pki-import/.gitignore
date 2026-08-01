@@ -1,0 +1,10 @@
+fetched-secrets/
+bin/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+dev.tfrc
+crl.pem
+migration-test.crt
+.terraform/
+.terraform.lock.hcl
