@@ -102,6 +102,12 @@ jobs:
         with:
           tofu_version: '1.12.4'
           tofu_wrapper: false
+      - name: DEBUG which terraform
+        run: |
+          which terraform || echo "no terraform on PATH"
+          terraform version || true
+          which tofu || echo "no tofu on PATH"
+          tofu version || true
       - name: Generate
         run: make docs
       - name: DEBUG full diff
