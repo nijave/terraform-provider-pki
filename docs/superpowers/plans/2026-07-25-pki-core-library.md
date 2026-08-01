@@ -16,7 +16,16 @@
 
 Every task's requirements implicitly include this section.
 
-- **Module path:** `github.com/nijave/terraform-provider-pki`. Go directive `go 1.25`.
+- **Module path:** `github.com/nijave/terraform-provider-pki`. Go directive `go 1.25.8`.
+  **Plan defect, corrected 2026-07-26.** This constraint originally said `go 1.25`,
+  which is not buildable once Plan 2's acceptance-test harness lands. Go requires the
+  main module's `go` directive to be greater than or equal to every dependency's, and
+  `hashicorp/hc-install`, `hashicorp/terraform-exec` and
+  `hashicorp/terraform-plugin-testing v1.16.0` all declare `go 1.25.8`. With `go 1.25`
+  every go command fails with `go: updates to go.mod needed`; a `toolchain` line does
+  not help. Measured directly. `1.25.8` is the lowest the module graph allows, so
+  honoring the original constraint literally would have meant dropping the acceptance-test
+  harness. Do not "correct" this back to a two-component version.
 - **License: GPLv3.** `LICENSE` holds the full GPL-3.0 text. Every `.go` file starts with the two-line header `// SPDX-License-Identifier: GPL-3.0-or-later` followed by a blank line before `package`. Every dependency must be GPLv3-compatible; the audited set is MPL-2.0, BSD-3-Clause, and MIT only (spec §13). Adding a dependency outside that set requires re-auditing §13 first.
 - **Nothing under BUSL-1.1 may be linked in** (spec §13). Terraform CLI is BUSL since 1.6; OpenTofu (MPL-2.0) is the test platform.
 - **`internal/pki` imports zero Terraform packages.** No `github.com/hashicorp/terraform-plugin-*` import may appear anywhere under `internal/pki`. Task 16 enforces this with a test.
@@ -73,7 +82,6 @@ Module, license, Makefile, and a CI job that runs unit tests. Nothing here is pr
 - Create: `GNUmakefile`
 - Create: `.github/workflows/test.yml`
 - Create: `internal/pki/doc.go`
-- Test: `internal/pki/doc_test.go`
 - Modify: `README.md`
 
 **Interfaces:**
@@ -92,7 +100,7 @@ go get github.com/pavlo-v-chernykh/keystore-go/v4@v4.5.0
 go get golang.org/x/crypto@latest
 ```
 
-The resulting `go.mod` must contain the `go 1.25` directive and these four requires. Do not add `terraform-plugin-*` dependencies in this plan — they arrive in Plan 2 and would break the Task 16 boundary test if imported here.
+The resulting `go.mod` must contain the `go 1.25.8` directive (see the Global Constraints note — `go 1.25` is unbuildable once Plan 2's test harness lands) and these four requires. Do not add `terraform-plugin-*` dependencies in this plan — they arrive in Plan 2 and would break the Task 16 boundary test if imported here.
 
 License check for the record (spec §13): go-pkcs12 is BSD-3-Clause, smallstep/pkcs7 is MIT, keystore-go/v4 is MIT, `golang.org/x/crypto` is BSD-3-Clause. All four are GPLv3-compatible.
 
@@ -130,34 +138,17 @@ Do not add a copyright line inside `LICENSE` itself; the per-file SPDX headers c
 package pki
 ```
 
-- [ ] **Step 4: Write a failing test that the package builds and is importable**
+- [ ] **Step 4: Verify the module builds**
 
-`internal/pki/doc_test.go`:
-
-```go
-// SPDX-License-Identifier: GPL-3.0-or-later
-
-package pki
-
-import "testing"
-
-// TestPackageBuilds is a placeholder that keeps the package's test binary
-// buildable before any real code lands. Later tasks may delete it once the
-// package has real tests.
-func TestPackageBuilds(t *testing.T) {
-	t.Parallel()
-}
-```
-
-- [ ] **Step 5: Run the tests**
+Do **not** add a placeholder test file. `go test ./...` succeeds on a package with no test file at all — it reports `?  <package>  [no test files]` and exits zero — so a test that asserts nothing buys nothing, and Task 2 adds real tests to this package immediately.
 
 ```bash
-gofmt -l . && go vet ./... && go test ./...
+gofmt -l . && go vet ./... && go build ./... && go test ./...
 ```
 
-Expected: `gofmt -l` prints nothing, `go vet` is silent, `go test` reports `ok github.com/nijave/terraform-provider-pki/internal/pki`.
+Expected: `gofmt -l` prints nothing, `go vet` and `go build` are silent, and `go test` reports `?  github.com/nijave/terraform-provider-pki/internal/pki  [no test files]` with exit status 0.
 
-- [ ] **Step 6: Write the GNUmakefile**
+- [ ] **Step 5: Write the GNUmakefile**
 
 `GNUmakefile` (the `docs` and `testacc` targets are placeholders until Plan 2 adds the framework layer, but they belong here so the target names never change):
 
@@ -191,7 +182,7 @@ release:
 	@git push origin $$RELEASE_VERSION
 ```
 
-- [ ] **Step 7: Write the CI workflow**
+- [ ] **Step 6: Write the CI workflow**
 
 `.github/workflows/test.yml`. This is the unit-test half of spec §12; Plan 2 adds the `generate` job and the OpenTofu acceptance matrix to this same file. The triggers, `permissions`, and `concurrency` block are already in their final form, per spec §12's correction of cortextool's push-only trigger.
 
@@ -252,7 +243,7 @@ jobs:
 
 The `unit` job deliberately does not set `TF_ACC`, so acceptance tests added in Plan 2 skip here and run only in the matrix job Plan 2 adds.
 
-- [ ] **Step 8: Replace the README stub**
+- [ ] **Step 7: Replace the README stub**
 
 `README.md` currently contains only the title with no trailing newline. Replace it with:
 
@@ -283,11 +274,11 @@ CRL support. This provider closes those gaps.
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 ```
 
-- [ ] **Step 9: Verify and commit**
+- [ ] **Step 8: Verify and commit**
 
 ```bash
 gofmt -l . && go vet ./... && go test ./...
-git add go.mod go.sum LICENSE GNUmakefile README.md .github/workflows/test.yml internal/pki/doc.go internal/pki/doc_test.go
+git add go.mod go.sum LICENSE GNUmakefile README.md .github/workflows/test.yml internal/pki/doc.go
 git commit -m "chore: module foundation, GPLv3 license, unit-test CI"
 ```
 
@@ -328,6 +319,7 @@ package pki
 import (
 	"crypto/x509"
 	"encoding/asn1"
+	"strings"
 	"testing"
 )
 
@@ -399,8 +391,29 @@ func TestTablesAreBidirectional(t *testing.T) {
 		if len(tbl.ByName) == 0 {
 			t.Errorf("table %q has an empty ByName map", tbl.Name)
 		}
+		// Every entry in ByOID must round-trip back through ByName. This holds
+		// for all five groups, including signature_algorithms, where the
+		// reverse direction is a strict subset (see below).
+		for oid, name := range tbl.ByOID {
+			back, ok := tbl.ByName[name]
+			if !ok {
+				t.Errorf("table %q: ByOID[%q] = %q but ByName is missing that key", tbl.Name, oid, name)
+				continue
+			}
+			if back != oid {
+				t.Errorf("table %q: %q -> %q -> %q, want the original OID back", tbl.Name, oid, name, back)
+			}
+		}
+	}
+
+	// Four of the five groups are strict bijections. signature_algorithms is
+	// not, and cannot be: see TestSignatureAlgorithmTableIsNotBijective.
+	for _, tbl := range tables {
+		if tbl.Name == "signature_algorithms" {
+			continue
+		}
 		if len(tbl.ByName) != len(tbl.ByOID) {
-			t.Errorf("table %q: ByName has %d entries, ByOID has %d; the maps must be the same size",
+			t.Errorf("table %q: ByName has %d entries, ByOID has %d; this group must be a strict bijection",
 				tbl.Name, len(tbl.ByName), len(tbl.ByOID))
 		}
 		for name, oid := range tbl.ByName {
@@ -412,6 +425,73 @@ func TestTablesAreBidirectional(t *testing.T) {
 			if back != name {
 				t.Errorf("table %q: %q -> %q -> %q, want the original name back", tbl.Name, name, oid, back)
 			}
+		}
+	}
+}
+
+// TestSignatureAlgorithmTableIsNotBijective documents the one place the
+// name-to-OID mapping is genuinely many-to-one, so nobody "fixes" it by
+// inventing OID arcs that do not exist.
+//
+// RFC 8017 registers a single OID for RSASSA-PSS, 1.2.840.113549.1.1.10. The
+// hash lives in the AlgorithmIdentifier's PSS parameters, not in the OID, so
+// SHA256-RSAPSS, SHA384-RSAPSS, and SHA512-RSAPSS all share it. An OID alone
+// therefore cannot name a PSS variant, and the reverse map omits it rather
+// than guessing a hash or fabricating a sub-arc.
+func TestSignatureAlgorithmTableIsNotBijective(t *testing.T) {
+	t.Parallel()
+	const pssOID = "1.2.840.113549.1.1.10"
+
+	var sigs Table
+	for _, tbl := range Tables() {
+		if tbl.Name == "signature_algorithms" {
+			sigs = tbl
+		}
+	}
+	if sigs.Name == "" {
+		t.Fatal("Tables() has no signature_algorithms group")
+	}
+
+	// All three PSS names are present in ByName and all three share the one
+	// real registered OID.
+	for _, name := range []string{"SHA256-RSAPSS", "SHA384-RSAPSS", "SHA512-RSAPSS"} {
+		got, ok := sigs.ByName[name]
+		if !ok {
+			t.Errorf("ByName is missing %q", name)
+			continue
+		}
+		if got != pssOID {
+			t.Errorf("ByName[%q] = %q, want the single registered RSASSA-PSS OID %q", name, got, pssOID)
+		}
+	}
+
+	// The shared OID is absent from the reverse map, because it does not
+	// identify one algorithm.
+	if name, ok := sigs.ByOID[pssOID]; ok {
+		t.Errorf("ByOID[%q] = %q; the shared RSASSA-PSS OID must not appear in the reverse map, because it does not determine the hash", pssOID, name)
+	}
+
+	// No fabricated sub-arcs of the PSS OID anywhere in either direction.
+	for name, oid := range sigs.ByName {
+		if strings.HasPrefix(oid, pssOID+".") {
+			t.Errorf("ByName[%q] = %q invents a sub-arc of the RSASSA-PSS OID; no such arc is registered", name, oid)
+		}
+	}
+	for oid := range sigs.ByOID {
+		if strings.HasPrefix(oid, pssOID+".") {
+			t.Errorf("ByOID has key %q, which invents a sub-arc of the RSASSA-PSS OID", oid)
+		}
+	}
+
+	// Every non-PSS name still round-trips, so the exception is narrow.
+	for _, name := range []string{"SHA256-RSA", "ECDSA-SHA384", "Ed25519"} {
+		oid, ok := sigs.ByName[name]
+		if !ok {
+			t.Errorf("ByName is missing %q", name)
+			continue
+		}
+		if back := sigs.ByOID[oid]; back != name {
+			t.Errorf("%q -> %q -> %q, want the original name back", name, oid, back)
 		}
 	}
 }
@@ -546,6 +626,12 @@ The key usages "OID" side is the decimal RFC 5280 bit position, per the design d
 `SignatureAlgorithmNames` returns the table's keys via `slices.Sorted(maps.Keys(...))`, so the list is stable across runs — an unsorted list would make generated documentation churn between `make docs` invocations and fail the CI diff check in Plan 2.
 
 The signature algorithms table maps the names Go's `x509.SignatureAlgorithm.String()` produces, so `SignatureAlgorithmName` can be implemented as a reverse lookup on `a.String()` and the two directions cannot drift: `SHA256-RSA`, `SHA384-RSA`, `SHA512-RSA`, `SHA256-RSAPSS`, `SHA384-RSAPSS`, `SHA512-RSAPSS`, `ECDSA-SHA256`, `ECDSA-SHA384`, `ECDSA-SHA512`, `Ed25519`. The value side is the OID of the algorithm identifier (for example `SHA256-RSA` is 1.2.840.113549.1.1.11, `ECDSA-SHA256` is 1.2.840.10045.4.3.2, `Ed25519` is 1.3.101.112). Deliberately omit `MD2-RSA`, `MD5-RSA`, `SHA1-RSA`, `ECDSA-SHA1`, and `DSA-*`: SHA-1 and MD5 signatures are not offered, and Go cannot create DSA certificates.
+
+**RSASSA-PSS is the one genuine many-to-one entry, and it must not be papered over.** RFC 8017 registers exactly one OID for PSS — `1.2.840.113549.1.1.10` — and the hash is a PSS *parameter*, not part of the OID. So all three of `SHA256-RSAPSS`, `SHA384-RSAPSS`, and `SHA512-RSAPSS` map to that same value in `ByName`, and `ByOID` **omits** it, because an OID that cannot determine the hash cannot name one algorithm.
+
+Do not resolve this by appending a synthetic arc such as `1.2.840.113549.1.1.10.256`. No such arc is registered, and `data "pki_oids"` publishes this table to users who will paste values from it into configuration — a fabricated OID there produces a certificate no other implementation can interpret. Do not resolve it by picking one PSS name as the reverse value either; that silently misreports the hash. `TestSignatureAlgorithmTableIsNotBijective` pins both prohibitions, and `TestTablesAreBidirectional` exempts this one group from strict bijection while still requiring that every `ByOID` entry round-trips.
+
+The `signature_algorithms` group's description in the Plan 2 data source must state this asymmetry, so a user reading generated documentation is not surprised that `by_oid` is smaller than `by_name`.
 
 `OIDByName` and `NameByOID` search `dn_attributes`, then `extensions`, then `extended_key_usages`, and skip `key_usages` and `signature_algorithms` — the former has no OIDs and the latter's names would collide conceptually with nothing but add no value to the terse `provider::pki::oid()` path. Return an error naming the input on a miss, for example `unknown OID name "commonNam"`.
 
@@ -851,7 +937,13 @@ func TestParseSerialHandlesValuesBeyondInt64(t *testing.T) {
 	t.Parallel()
 	// A random 128-bit serial does not fit in an int64; big.Int is not
 	// decoration here.
-	const in = "0102030405060708090a0b0c0d0e0f10"
+	//
+	// The input deliberately has no leading zero, so it is already in
+	// canonical form and must round-trip to itself byte-for-byte. (Using a
+	// leading-zero input here would only re-assert what
+	// TestFormatSerialIsNormalizeSerialFixedPoint already covers, and would
+	// not show that a large value survives the round trip intact.)
+	const in = "102030405060708090a0b0c0d0e0f10"
 	got, err := ParseSerial(in)
 	if err != nil {
 		t.Fatalf("ParseSerial: %v", err)
@@ -966,6 +1058,17 @@ func NormalizeSerial(s string) string {
 // all-zero input parses to zero.
 func ParseSerial(s string) (*big.Int, error) {
 	norm := NormalizeSerial(s)
+
+	// big.Int.SetString accepts a leading sign, so SetString("-1", 16)
+	// succeeds and yields -1. A negative serial is invalid under RFC 5280 and
+	// some parsers reject such a certificate outright, so the digits are
+	// checked explicitly first rather than trusting SetString's ok result.
+	for _, c := range norm {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return nil, fmt.Errorf("invalid serial number %q: want a hexadecimal string, optionally prefixed with 0x", s)
+		}
+	}
+
 	n, ok := new(big.Int).SetString(norm, 16)
 	if !ok {
 		return nil, fmt.Errorf("invalid serial number %q: want a hexadecimal string, optionally prefixed with 0x", s)
@@ -1458,9 +1561,20 @@ Expected: PASS, including every subcase of the three-algorithm loops.
 
 - [ ] **Step 5: Cross-validate against `openssl`**
 
-The unit tests prove Go can read what Go wrote. This step proves an outside consumer can too. Add a test that shells out to `openssl pkey -check`, using the `requireOpenSSL` helper Task 6 introduces — write it now and let it fail to compile until Task 6 lands, or add the six-line helper here and delete the duplicate later. The helper:
+The unit tests prove Go can read what Go wrote. This step proves an outside consumer can too. Add a test that shells out to `openssl pkey -check`.
+
+Create `internal/pki/testhelper_test.go` in this task with the shared `requireOpenSSL` helper; Tasks 6, 9, 10, 11, and 12 extend the same file with their own fixtures:
 
 ```go
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package pki
+
+import (
+	"os/exec"
+	"testing"
+)
+
 // requireOpenSSL returns the path to the openssl binary, skipping the test when
 // it is not installed. Cross-validation against a real parser is valuable but
 // must never be the reason a contributor's test run fails.
@@ -1510,7 +1624,7 @@ func TestEmittedKeysAreReadableByOpenSSL(t *testing.T) {
 - [ ] **Step 6: Commit**
 
 ```bash
-git add internal/pki/key.go internal/pki/key_test.go go.mod go.sum
+git add internal/pki/key.go internal/pki/key_test.go internal/pki/testhelper_test.go go.mod go.sum
 git commit -m "feat: key generation, parsing, and encoding for RSA, ECDSA, Ed25519"
 ```
 
@@ -1523,6 +1637,7 @@ The highest-risk file in the package. DN attribute order and ASN.1 string type a
 **Files:**
 - Create: `internal/pki/subject.go`
 - Test: `internal/pki/subject_test.go`
+- Modify: `internal/pki/testhelper_test.go` (add the `mustDNOID` fixture; Task 5 created the file)
 
 **Interfaces:**
 - Consumes: `ParseOID`, `FormatOID`, `DNAttributeOID` (Task 2).
@@ -1852,7 +1967,9 @@ func TestParseSubjectDERRoundTripsByteExact(t *testing.T) {
 func TestParseSubjectDERFlattensMultiValuedRDNs(t *testing.T) {
 	t.Parallel()
 	// A DN produced elsewhere may pack several attributes into one RDN SET.
-	// Parsing must not lose them; the ordered form flattens them in order.
+	// Parsing must not lose them; the ordered form flattens them in the
+	// order they appear ON THE WIRE, which is not necessarily the order the
+	// literal below declares -- see the sort note in the assertion.
 	// Re-encoding will produce single-attribute RDNs, so this case is
 	// deliberately NOT byte-exact -- it is the one shape import cannot
 	// reproduce, and callers detect it by comparing the DER themselves.
@@ -1876,9 +1993,28 @@ func TestParseSubjectDERFlattensMultiValuedRDNs(t *testing.T) {
 	if len(parsed.Attributes) != 3 {
 		t.Fatalf("parsed %d attributes, want 3", len(parsed.Attributes))
 	}
-	if parsed.Attributes[0].Value != "homelab" || parsed.Attributes[1].Value != "infra" || parsed.Attributes[2].Value != "cn" {
-		t.Fatalf("flattened order = %q, %q, %q; want homelab, infra, cn",
+
+	// The expected order is infra, homelab, cn -- NOT the declaration order
+	// above. DER requires the members of a SET OF to be sorted by their
+	// encodings (X.690 11.6), and asn1.Marshal enforces it, so the
+	// organizationalUnit ATV (which encodes to 30 0c ...) sorts before the
+	// organization ATV (30 0e ...). The bytes this fixture produces really do
+	// carry infra first, whatever the literal says.
+	if parsed.Attributes[0].Value != "infra" || parsed.Attributes[1].Value != "homelab" || parsed.Attributes[2].Value != "cn" {
+		t.Fatalf("flattened order = %q, %q, %q; want infra, homelab, cn (DER sorts SET OF members)",
 			parsed.Attributes[0].Value, parsed.Attributes[1].Value, parsed.Attributes[2].Value)
+	}
+
+	// Guard the fixture itself: if a future edit collapses the first RDN to a
+	// single attribute, the assertions above would still pass while no longer
+	// testing a multi-valued RDN at all.
+	var check rawRDNSequence
+	if _, err := asn1.Unmarshal(der, &check); err != nil {
+		t.Fatalf("re-parsing the fixture: %v", err)
+	}
+	if len(check) != 2 || len(check[0]) != 2 {
+		t.Fatalf("fixture is no longer a 2-RDN sequence whose first RDN is multi-valued: %d RDNs, first holds %d",
+			len(check), len(check[0]))
 	}
 }
 
@@ -1964,7 +2100,7 @@ func TestSubjectString(t *testing.T) {
 }
 ```
 
-Add this helper to `internal/pki/testhelper_test.go` (create the file in this task; Task 9 and later tasks extend it):
+Add this helper to `internal/pki/testhelper_test.go`, which Task 5 created (its import block gains `encoding/asn1`):
 
 ```go
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -2034,7 +2170,7 @@ var asn1Tag = map[StringType]int{
 	StringTypeUTF8:      asn1.TagUTF8String,      // 12
 	StringTypePrintable: asn1.TagPrintableString, // 19
 	StringTypeIA5:       asn1.TagIA5String,       // 22
-	StringTypeBMP:       28,                      // BMPString; encoding/asn1 has no constant
+	StringTypeBMP:       asn1.TagBMPString,       // 30 -- NOT 28, which is UniversalString (UCS-4)
 	StringTypeT61:       asn1.TagT61String,       // 20
 }
 
@@ -2072,7 +2208,7 @@ The empty-string-is-unset rule from `TestNamedSubjectExpandOmitsUnsetFields` app
 // Each attribute becomes its own single-element RDN SET. Multi-valued RDNs are
 // not produced: openssl's [dn] config section cannot express them, so no
 // certificate this provider needs to reproduce contains one. ParseSubjectDER
-// still reads them, flattening in order.
+// still reads them, flattening in wire order.
 func (s Subject) EncodeDER() ([]byte, error) {
 	if len(s.Attributes) == 0 {
 		// An empty DN is legal DER (an empty SEQUENCE) and is what a
@@ -2115,6 +2251,12 @@ func (s Subject) EncodeDER() ([]byte, error) {
 - `StringTypeIA5`: reject any rune above `unicode.MaxASCII`.
 - `StringTypeT61`: reject any rune above `unicode.MaxASCII` as an approximation; T.61's full repertoire is not worth implementing and no input this provider handles needs it. Say so in a comment.
 - `StringTypeBMP`: encode as big-endian UTF-16 (`unicode/utf16.Encode` over the runes, then two bytes per code unit); reject anything outside the BMP, meaning any code unit that came from a surrogate pair.
+
+**Add tests for `bmp`, `t61`, and the unknown-tag parse path.** The test file above exercises only `utf8`, `printable`, and `ia5`, which means an incorrect tag number for `bmp` or `t61` would ship green — and the first draft of this plan did in fact specify the wrong tag for `bmp` (28, which is UniversalString, rather than 30). Three cases close that hole:
+
+1. Encode a value as `StringTypeBMP` and as `StringTypeT61`, and assert the tag actually present in the emitted DER is 30 and 20 respectively. Read the tag off the wire rather than comparing against the `asn1Tag` map, or the test just restates the map to itself.
+2. Assert the repertoire rejections: a non-ASCII rune under `t61`, and a rune outside the BMP (any astral character, which UTF-16 encodes as a surrogate pair) under `bmp`.
+3. Assert `ParseSubjectDER` errors on an attribute whose value carries a string tag outside the five supported ones — construct one with an `asn1.RawValue` using, for instance, tag 27 (`GeneralString`). The prose already requires this rejection but nothing above exercises it.
 
 Setting `Bytes` on an `asn1.RawValue` (rather than `FullBytes`) makes `asn1.Marshal` write the tag and length itself, which is what keeps the output canonical DER.
 
@@ -2178,41 +2320,7 @@ go test ./internal/pki/
 
 Expected: PASS. If `TestEncodeDERDefaultsToUTF8String` fails, the `asn1.RawValue` is not being used and `asn1.Marshal` has fallen back to its own string-type selection — that is the bug this whole design decision exists to prevent, so fix it rather than relaxing the test.
 
-- [ ] **Step 7: Cross-validate the DN against `openssl`**
-
-Byte-level assertions can pass while producing a DN no other tool renders correctly. Confirm with a real parser. Add this test, which skips cleanly where `openssl` is absent:
-
-```go
-func TestSubjectDERIsReadableByOpenSSL(t *testing.T) {
-	t.Parallel()
-	openssl := requireOpenSSL(t)
-
-	// A self-signed certificate is the smallest container openssl will parse a
-	// DN out of. Task 9 provides CreateCertificate; until then, skip.
-	t.Skip("enabled in Task 9, once CreateCertificate exists")
-	_ = openssl
-}
-```
-
-Also add the `requireOpenSSL` helper to `internal/pki/testhelper_test.go`:
-
-```go
-// requireOpenSSL returns the path to the openssl binary, skipping the test when
-// it is not installed. Cross-validation against a real parser is valuable but
-// must never be the reason a contributor's test run fails.
-func requireOpenSSL(t *testing.T) string {
-	t.Helper()
-	path, err := exec.LookPath("openssl")
-	if err != nil {
-		t.Skip("openssl not found in PATH; skipping cross-validation")
-	}
-	return path
-}
-```
-
-The skip is temporary and Task 9 Step 6 replaces the body. Leaving the shell in place now keeps the helper's first use in the same commit as the helper itself.
-
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add internal/pki/subject.go internal/pki/subject_test.go internal/pki/testhelper_test.go
@@ -2940,20 +3048,68 @@ func TestSubjectKeyIDExtension(t *testing.T) {
 	}
 }
 
+// TestParsersRejectWrongOID confirms each parser checks the extension's OID.
+//
+// Each case must carry a value that is VALID for that parser's own extension,
+// presented under the wrong OID. Sharing one placeholder value across all four
+// -- an empty SEQUENCE, say -- makes the test near-vacuous: every parser then
+// fails on the malformed value rather than on the OID, so deleting three of the
+// four OID guards leaves the suite green. Verified by doing exactly that.
 func TestParsersRejectWrongOID(t *testing.T) {
 	t.Parallel()
-	wrong := pkix.Extension{Id: asn1.ObjectIdentifier{1, 2, 3, 4}, Value: []byte{0x30, 0x00}}
-	if _, err := ParseBasicConstraints(wrong); err == nil {
-		t.Error("ParseBasicConstraints accepted the wrong OID")
+	const wrongOID = "2.5.29.99"
+
+	// A valid basicConstraints value: SEQUENCE { cA TRUE }.
+	bcValue, err := (BasicConstraints{CA: true, Critical: true}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid basicConstraints value: %v", err)
 	}
-	if _, err := ParseKeyUsage(wrong); err == nil {
-		t.Error("ParseKeyUsage accepted the wrong OID")
+	// A valid keyUsage BIT STRING.
+	kuValue, err := (KeyUsage{Usages: []string{"digitalSignature"}, Critical: true}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid keyUsage value: %v", err)
 	}
-	if _, err := ParseExtKeyUsage(wrong); err == nil {
-		t.Error("ParseExtKeyUsage accepted the wrong OID")
+	// A valid extendedKeyUsage SEQUENCE OF OID.
+	ekuValue, err := (ExtKeyUsage{Usages: []string{"clientAuth"}}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid extendedKeyUsage value: %v", err)
 	}
-	if _, err := ParseNameConstraints(wrong); err == nil {
-		t.Error("ParseNameConstraints accepted the wrong OID")
+	// A valid nameConstraints SEQUENCE with one permitted subtree.
+	ncValue, err := (NameConstraints{PermittedDNSDomains: []string{".example"}, Critical: true}).Extension()
+	if err != nil {
+		t.Fatalf("building a valid nameConstraints value: %v", err)
+	}
+
+	misfiled := func(v pkix.Extension) pkix.Extension {
+		return pkix.Extension{Id: mustOID(t, wrongOID), Critical: v.Critical, Value: v.Value}
+	}
+
+	if _, err := ParseBasicConstraints(misfiled(bcValue)); err == nil {
+		t.Error("ParseBasicConstraints accepted a valid value under the wrong OID")
+	}
+	if _, err := ParseKeyUsage(misfiled(kuValue)); err == nil {
+		t.Error("ParseKeyUsage accepted a valid value under the wrong OID")
+	}
+	if _, err := ParseExtKeyUsage(misfiled(ekuValue)); err == nil {
+		t.Error("ParseExtKeyUsage accepted a valid value under the wrong OID")
+	}
+	if _, err := ParseNameConstraints(misfiled(ncValue)); err == nil {
+		t.Error("ParseNameConstraints accepted a valid value under the wrong OID")
+	}
+
+	// Sanity check the fixtures: each value must parse cleanly under its own
+	// OID, or the assertions above would pass for the wrong reason.
+	if _, err := ParseBasicConstraints(bcValue); err != nil {
+		t.Errorf("the basicConstraints fixture does not parse under its own OID: %v", err)
+	}
+	if _, err := ParseKeyUsage(kuValue); err != nil {
+		t.Errorf("the keyUsage fixture does not parse under its own OID: %v", err)
+	}
+	if _, err := ParseExtKeyUsage(ekuValue); err != nil {
+		t.Errorf("the extendedKeyUsage fixture does not parse under its own OID: %v", err)
+	}
+	if _, err := ParseNameConstraints(ncValue); err != nil {
+		t.Errorf("the nameConstraints fixture does not parse under its own OID: %v", err)
 	}
 }
 ```
@@ -2974,7 +3130,9 @@ Every `Extension()` method returns a `pkix.Extension` whose `Value` is the DER o
 - `KeyUsage.Extension` maps names through `KeyUsageBit`, rejecting an empty list, an unknown name, and a duplicate (track seen bits in a `map[int]bool`). Build an `asn1.BitString` whose `Bytes` is `(maxBit/8)+1` octets with each used bit set most-significant-first, and whose `BitLength` is `maxBit+1`. Trim trailing all-zero octets so the encoding is canonical: RFC 5280 requires the DER minimal form, and `openssl x509 -text` renders a non-minimal BIT STRING differently. Setting `BitLength` from the highest set bit rather than from a fixed 9 is what makes `TestKeyUsageConfigOrderDoesNotChangeBytes` and `TestKeyUsageDecipherOnlyCrossesTheByteBoundary` both pass.
 - `ExtKeyUsage.Extension` maps each entry through `ExtKeyUsageOID` (which accepts a name or a dotted OID), rejects empty and duplicates, and marshals `[]asn1.ObjectIdentifier` preserving list order.
 - `NameConstraints.Extension` marshals RFC 5280's `NameConstraints ::= SEQUENCE { permittedSubtrees [0] GeneralSubtrees OPTIONAL, excludedSubtrees [1] GeneralSubtrees OPTIONAL }` where each `GeneralSubtree ::= SEQUENCE { base GeneralName, ... }`. Model it with local structs and `asn1.RawValue` bases carrying the same context-specific tags Task 7 defined, plus tag 7 for IP ranges, whose payload is the 4-or-16-byte address followed by the equal-length mask (8 or 32 bytes total) per RFC 5280 4.2.1.10. Parse CIDRs with `net.ParseCIDR` and reject a bare IP — `net.ParseCIDR` already does. Error when every list is empty.
-- `ExtraExtension.Extension` validates the OID has at least two arcs and the value is non-empty, then passes the bytes through verbatim. No parsing or re-encoding: the whole point is that the provider does not need to understand the extension.
+- `ExtraExtension.Extension` validates the OID is structurally a real ASN.1 OID and the value is non-empty, then passes the bytes through verbatim. No parsing or re-encoding: the whole point is that the provider does not need to understand the extension.
+
+  **Amended 2026-07-26 (minor-fix wave 2).** This originally required only "at least two arcs", which let a structurally impossible OID like `{5, 99}` through to fail later inside `x509.CreateCertificate` with an opaque error. The full rules are now enforced so it is a config-level error instead: arc 0 must be 0, 1 or 2, and when arc 0 is 0 or 1 the second component must be under 40 (those two arcs are encoded into a single first byte as `40*arc0 + arc1`). Arc 2 has no such limit, so `2.999.x` stays legal — do not over-reject it. The provider layer's `extra_extension.oid` description must state what is actually enforced rather than the old two-arc wording.
 - `SubjectKeyIDExtension` marshals the public key with `x509.MarshalPKIXPublicKey`, unmarshals it into `struct { Algo pkix.AlgorithmIdentifier; SubjectPublicKey asn1.BitString }`, takes `sha1.Sum` of `SubjectPublicKey.Bytes`, and marshals that 20-byte digest as an OCTET STRING. Add a comment that SHA-1 here is a key identifier, not a signature, and is RFC 5280's method 1 — required for interoperability with the certificates already issued, and not a security decision open to revision.
 
 The parsers are the mirror image: verify the OID, unmarshal, check for trailing bytes, and map back to names. `ParseKeyUsage` walks bits 0 through 8 and emits names in bit order. `ParseExtKeyUsage` renders each OID through `NameByOID`, falling back to `FormatOID` on a miss.
@@ -3215,11 +3373,21 @@ func TestCreateCertificateCASignedChainVerifies(t *testing.T) {
 	}
 }
 
-// TestCreateCertificateEmitsExactlyOneOfEachExtension is the guard against the
-// double-emission trap: if a template field were passed to both
-// x509.Certificate's convenience field and ExtraExtensions, Go would write the
-// extension twice with different criticality and some parsers would take the
-// wrong one.
+// TestCreateCertificateEmitsExactlyOneOfEachExtension asserts every extension
+// appears exactly once and that the expected set is present.
+//
+// Note what this test does NOT prove, despite an earlier draft of this plan
+// claiming it did. It cannot catch a template field being set on both
+// x509.Certificate's convenience field and ExtraExtensions, because
+// crypto/x509 guards every one of those fields with
+// !oidInExtensions(oid, template.ExtraExtensions) -- see x509.go around lines
+// 1187-1269. Double emission is therefore impossible by construction, and
+// setting BasicConstraintsValid, IsCA, KeyUsage and DNSNames alongside the
+// extension list leaves this test green. Verified by doing exactly that.
+//
+// The real hazard is an extension appearing that the template never asked for,
+// which a count cannot see. TestCreateCertificateEmitsNothingBeyondTheTemplate
+// below is what covers it.
 func TestCreateCertificateEmitsExactlyOneOfEachExtension(t *testing.T) {
 	t.Parallel()
 	ca, caKey := testCA(t, nil, nil, "ca")
@@ -3539,6 +3707,11 @@ func testCA(t *testing.T, parent *x509.Certificate, parentKey crypto.Signer, cn 
 }
 
 // mustOID parses a dotted OID or fails the test.
+//
+// NOTE: Task 8 already added this helper to testhelper_test.go, because its
+// wrong-OID test needs it. Do not add it again -- a second declaration in the
+// same package will not compile. Check the file first; if it is present, use
+// it as is.
 func mustOID(t *testing.T, s string) asn1.ObjectIdentifier {
 	t.Helper()
 	oid, err := ParseOID(s)
@@ -3590,19 +3763,39 @@ Reject a duplicate OID across the whole list — an `extra_extension` block whos
 // buildTemplate assembles the x509.Certificate Go needs. Note what is NOT set:
 // Subject, DNSNames, EmailAddresses, IPAddresses, URIs, KeyUsage,
 // ExtKeyUsage, BasicConstraintsValid, IsCA, MaxPathLen, and the name
-// constraint fields are all left zero. Every one of those has an equivalent in
-// t.Extensions(), and setting both would make Go emit the extension twice --
-// once with its own hardcoded criticality -- which some parsers resolve in
-// favor of the wrong copy.
+// constraint fields are all left zero.
+//
+// The reason is single-source-of-truth, not double emission. crypto/x509
+// guards each of those fields with !oidInExtensions(oid, ExtraExtensions), so
+// setting one alongside the extension list is silently ignored rather than
+// duplicated. Leaving them zero means t.Extensions() is the only thing that
+// decides what a certificate carries -- which is what lets Task 14 compare
+// against that same function instead of reimplementing the rules.
+//
+// One consequence of never setting IsCA: Go's automatic SubjectKeyId
+// generation is gated on it, so the RFC 7093 path described in the SubjectKeyId
+// note below is unreachable in this design. The note stands anyway, because the
+// gate is Go's implementation detail and not a promise.
 ```
 
-Set `SerialNumber`, `RawSubject`, `NotBefore`, `NotAfter`, `SignatureAlgorithm`, `ExtraExtensions`, and `SubjectKeyId`. `SubjectKeyId` must be set from the same computation `SubjectKeyIDExtension` uses, because Go skips its own SKI synthesis when `ExtraExtensions` already contains OID 2.5.29.14 but still needs the field populated for the AKI it writes into children.
+Set `SerialNumber`, `RawSubject`, `NotBefore`, `NotAfter`, `SignatureAlgorithm`, `ExtraExtensions`, and `SubjectKeyId`.
+
+**`SubjectKeyId` must always be set explicitly, from the same computation `SubjectKeyIDExtension` uses. Leaving it empty is a correctness bug, not a stylistic choice.** Two independent reasons, and the second is the dangerous one:
+
+- Go skips its own SKI synthesis when `ExtraExtensions` already contains OID 2.5.29.14, but it still reads the `SubjectKeyId` field to build the `authorityKeyIdentifier` it writes into children. An empty field yields children with no AKI.
+- **Go's automatic SKI is not RFC 5280's algorithm.** Since **Go 1.25** (`internal/godebugs/table.go` records `{Name: "x509sha256skid", Changed: 25}`), `x509.CreateCertificate` fills an empty `SubjectKeyId` on a CA using RFC 7093 method 1 — SHA-256 truncated to 160 bits — and only falls back to RFC 5280's SHA-1 under `GODEBUG=x509sha256skid=0`. Note that pinning an older toolchain is therefore *not* a workaround worth considering: this plan's floor is Go 1.25, and relying on pre-1.25 behavior would make the output depend on the build toolchain. Both are 20 bytes, so the mistake is invisible to a length check. Verified directly on Go 1.25.12 for one ECDSA key: Go's automatic value was `17 5b 2e 7a 33 d6 c4 10 47 a5 38 05 68 98 4b 92 60 a8 60 b1` while RFC 5280's SHA-1 of the same key is `00 3b 02 f3 25 82 61 90 74 1b 54 b8 e0 57 d3 4f a2 a4 b7 99`.
+
+  The consequence is exactly the failure this whole design exists to prevent. The certificates being adopted carry SHA-1 SKIs, because `openssl`'s `subjectKeyIdentifier = hash` computes RFC 5280 method 1. If issuance produced RFC 7093 values instead, every adopted certificate would differ from its reissued form in the SKI alone, Task 14 would report drift on every plan, and the drift would never converge no matter how many times it was applied. Task 15's golden comparison against real `openssl` output is what would catch it, one task too late to be cheap.
+
+This finding came from Task 8's implementer, which confirmed it by re-running under `GODEBUG=x509sha256skid=0`.
 
 Self-signing: when `parent` is nil, Go requires the template itself as the parent, so pass a locally-built `x509.Certificate` that carries `RawSubject` and `SubjectKeyId`. Building it explicitly rather than reusing the template variable makes the intent legible and avoids Go's `RawSubject`-as-issuer path silently picking up a stale field.
 
 Before calling `x509.CreateCertificate`, check that the requested `SignatureAlgorithm` is compatible with `signerKey`: compare against `DefaultSignatureAlgorithm(signerKey)`'s public key family. That is what turns `TestCreateCertificateRejectsMismatchedSignatureAlgorithm`'s case into a clear error instead of Go's `x509: requested SignatureAlgorithm does not match private key type`.
 
 `ParseCertificatePEM` decodes one `CERTIFICATE` block and calls `x509.ParseCertificate`, erroring on trailing data. `ParseCertificateChainPEM` loops `pem.Decode`, requires at least one block, and errors on any block whose type is not `CERTIFICATE` — that is what rejects a chain with a key block spliced in, which would otherwise leak a private key into a `certificate_chain_pem` attribute. `ParseCertRequestPEM` additionally calls `csr.CheckSignature()` and returns an error when it fails.
+
+**Amended 2026-07-26 (minor-fix wave 2).** Both chain and single-block parsers also reject a `-----BEGIN ` marker that fails to decode, instead of silently treating it as end-of-input. `pem.Decode` returns nil for malformed input, and the original loop read nil as "no more blocks", so a truncated or corrupted certificate part-way through a chain was silently dropped and the caller got a short chain with no error. What is deliberately still legal is non-PEM *text* before, between and after blocks: `openssl crl2pkcs7 | openssl pkcs7 -print_certs` emits `subject=`/`issuer=` metadata lines between blocks, so rejecting free text would reject the output of the most common way an operator produces a chain to adopt. Measured against openssl 3.5.7 both ways. The distinction is a BEGIN marker that does not decode (an error) versus text that never claimed to be PEM (ignored).
 
 `EncodeCertificatePEM` wraps DER in a `CERTIFICATE` block.
 
@@ -3616,9 +3809,9 @@ go test ./internal/pki/ -v
 
 Expected: PASS.
 
-- [ ] **Step 6: Fill in the openssl cross-validation left skipped in Task 6**
+- [ ] **Step 6: Cross-validate the DN against `openssl`**
 
-Replace `TestSubjectDERIsReadableByOpenSSL` in `subject_test.go` with a real body now that certificates can be created:
+Task 6 could not do this: rendering a DN through an outside parser needs a certificate to put it in, and `CreateCertificate` did not exist yet. Add it now, to `subject_test.go` alongside the rest of the DN tests:
 
 ```go
 // TestSubjectDERIsReadableByOpenSSL confirms an outside parser renders the DN
@@ -4002,10 +4195,16 @@ func TestCRLIsReadableByOpenSSL(t *testing.T) {
 		t.Fatalf("CreateCRL: %v", err)
 	}
 	text := opensslCRLText(t, crlPEM)
-	for _, want := range []string{"Serial Number: 2001", "Key Compromise", "CRL Number: 3"} {
+	for _, want := range []string{"Serial Number: 2001", "Key Compromise"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("openssl crl output does not contain %q:\n%s", want, text)
 		}
+	}
+	// The CRL number needs a whitespace-tolerant match: openssl 3.5.7 always
+	// prints an extension's name and its value on separate lines, so the
+	// literal "CRL Number: 3" never appears.
+	if !regexp.MustCompile(`(?s)X509v3 CRL Number:\s*3`).MatchString(text) {
+		t.Errorf("openssl crl output does not show CRL number 3:\n%s", text)
 	}
 	_ = x509.RevocationList{} // keep the x509 import honest if assertions change
 }
@@ -4088,7 +4287,9 @@ func CheckCRLSigner(caCert *x509.Certificate) error {
 
 `CreateCRL` validates the template (positive non-nil `Number`; non-zero `ThisUpdate` and `NextUpdate` with `NextUpdate` after `ThisUpdate`; every entry has a non-nil positive serial and a non-zero `RevokedAt`; reasons resolve; no duplicate serials), calls `CheckCRLSigner`, resolves the signature algorithm through `DefaultSignatureAlgorithm(caKey)` when zero, builds `x509.RevocationList` with `RevokedCertificateEntries`, calls `x509.CreateRevocationList`, and wraps the DER in an `X509 CRL` PEM block.
 
-Three details that the verified API notes make load-bearing. First, put the reason in `RevocationListEntry.ReasonCode` and never in `ExtraExtensions` — Go rejects a reasonCode OID appearing there. Second, `ReasonCode` 0 makes Go omit the extension entirely, which is the RFC-correct encoding for an unspecified reason and is what the test asserts; do not special-case it. Third, `Number` is required and must fit in 20 octets, so validate `Number.BitLen() <= 160` and give an error mentioning the limit rather than letting Go's message surface.
+Three details that the verified API notes make load-bearing. First, put the reason in `RevocationListEntry.ReasonCode` and never in `ExtraExtensions` — Go rejects a reasonCode OID appearing there. Second, `ReasonCode` 0 makes Go omit the extension entirely, which is the RFC-correct encoding for an unspecified reason and is what the test asserts; do not special-case it. Third, `Number` is required and must fit in 20 octets — but **do not validate it as `Number.BitLen() <= 160`**. That misses the boundary: a positive `Number` with `BitLen() == 160` has its top byte's high bit set, so the DER INTEGER encoding prepends a sign-padding octet and the value still exceeds 20 octets. `2^159` is exactly such a case — 20 bytes from `Bytes()`, rejected by Go. A `BitLen()` check would pass it through and Go would then fail with its own opaque `x509: CRL number exceeds 20 octets`, which is precisely the outcome this pre-validation exists to avoid.
+
+Replicate Go's own condition instead, which is `len(numBytes) > 20 || (len(numBytes) == 20 && numBytes[0]&0x80 != 0)` over `Number.Bytes()` (see `x509.go`'s `CreateRevocationList`), and give an error mentioning the 20-octet limit. Add a regression test at the boundary — `2^159` must be rejected — because nothing else in this task's tests exercises an oversized CRL number at all.
 
 Duplicate-serial rejection is not RFC-mandated but is always a config error, and a CRL with the same serial twice makes downstream revocation checks ambiguous.
 
@@ -4588,17 +4789,20 @@ func TestEncodePKCS12EmittedAlgorithms(t *testing.T) {
 		{
 			encoding: PKCS12Modern,
 			password: testPassword,
-			// AES-256-CBC content encryption with PBKDF2, HMAC-SHA256 MAC.
-			wantInOutput: []string{"PBES2", "aes-256-cbc", "sha256"},
-			notInOutput:  []string{"des-ede3-cbc", "RC2"},
+			// AES-256-CBC content encryption with PBKDF2, and an HMAC-SHA256
+			// MAC. The MAC assertion pins the "MAC:" line specifically, not a
+			// bare "sha256" -- modern's PRF line also mentions SHA-256, so a
+			// bare substring would pass even if the MAC were SHA-1.
+			wantInOutput: []string{"PBES2", "PBKDF2", "AES-256-CBC", "MAC: sha256"},
+			notInOutput:  []string{"TripleDES", "RC2", "MAC: sha1"},
 		},
 		{
 			encoding: PKCS12Legacy,
 			password: testPassword,
-			// 3DES content encryption, SHA-1 MAC. This is the only combination
-			// that is universally importable on iOS < 18 and Android < 14.
-			wantInOutput: []string{"des-ede3-cbc", "sha1"},
-			notInOutput:  []string{"aes-256-cbc", "RC2"},
+			// 3DES content encryption with a SHA-1 MAC -- the only combination
+			// universally importable on iOS < 18 and Android < 14.
+			wantInOutput: []string{"pbeWithSHA1And3-KeyTripleDES-CBC", "MAC: sha1"},
+			notInOutput:  []string{"AES-256-CBC", "PBES2", "RC2", "sha256"},
 		},
 	} {
 		out, err := EncodeBundle(BundleInput{
@@ -4653,11 +4857,22 @@ func TestEncodePKCS12ModernAndLegacyDifferInBothAxes(t *testing.T) {
 	modernText := strings.ToLower(opensslRun(t, modern, "pkcs12", "-info", "-nokeys", "-nocerts", "-passin", "pass:"+testPassword))
 	legacyText := strings.ToLower(opensslRun(t, legacy, "pkcs12", "-info", "-nokeys", "-nocerts", "-passin", "pass:"+testPassword))
 
-	if strings.Contains(modernText, "sha1") && !strings.Contains(modernText, "sha256") {
+	// Pin the MAC line on each side, positively. An earlier draft used the
+	// conjunction `Contains(modernText, "sha1") && !Contains(modernText,
+	// "sha256")`, which can never fire: modern always contains "sha256" via
+	// its PRF line, so the second clause is always false. Matching "mac: "
+	// specifically is what distinguishes the MAC from the PRF.
+	if !strings.Contains(modernText, "mac: sha256") {
+		t.Error("modern did not emit a SHA-256 MAC")
+	}
+	if strings.Contains(modernText, "mac: sha1") {
 		t.Error("modern emitted a SHA-1 MAC; it must be SHA-256")
 	}
-	if !strings.Contains(legacyText, "sha1") {
+	if !strings.Contains(legacyText, "mac: sha1") {
 		t.Error("legacy did not emit a SHA-1 MAC; Android 12 rejects SHA-256 even with 3DES content")
+	}
+	if strings.Contains(legacyText, "mac: sha256") {
+		t.Error("legacy emitted a SHA-256 MAC; only SHA-1 is universally importable")
 	}
 }
 
@@ -4736,10 +4951,21 @@ func TestEncodePKCS12FriendlyName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeBundle: %v", err)
 	}
+	// A keyed PKCS#12 bundle has NO settable alias. go-pkcs12 v0.7.3's
+	// Encoder.Encode writes only localKeyId; oidFriendlyName is emitted solely
+	// by EncodeTrustStoreEntries. keytool therefore shows the alias as "1"
+	// regardless of FriendlyName. Ruled 2026-07-25: accept and document.
+	//
+	// This assertion is deliberately negative and self-expiring: if go-pkcs12
+	// ever honors the name here, it fails and tells you to delete it and
+	// restore a positive assertion.
 	if requireKeytool(t, false) != "" {
-		text := keytoolList(t, out, testPassword)
-		if !strings.Contains(strings.ToLower(text), "nick-ipad") {
-			t.Errorf("keytool -list does not show the alias nick-ipad:\n%s", text)
+		text := strings.ToLower(keytoolList(t, out, testPassword))
+		if strings.Contains(text, "nick-ipad") {
+			t.Errorf("keytool -list now shows the friendly name on a KEYED pkcs12 bundle, "+
+				"which go-pkcs12 v0.7.3 could not do. Upstream has gained support: drop this "+
+				"negative assertion, assert the alias positively instead, and update the "+
+				"friendly_name documentation in spec section 6.6.\n%s", text)
 		}
 	}
 
@@ -4958,10 +5184,18 @@ var pkcs12Encoders = map[PKCS12Encoding]*pkcs12.Encoder{
 
 1. Default `PKCS12Encoding` to `PKCS12Modern` when empty, then look up the encoder and error naming the input on a miss. Do not fall through to a default on an unknown value — a typo must fail, not silently produce `modern`.
 2. Apply `Rand` when set, via `encoder.WithRand(in.Rand)`. Note that `WithRand` has a value receiver returning a new `*Encoder`, so this does not mutate the package-level variable.
-3. Validate the password against the encoding: `PKCS12Passwordless` requires an empty password (go-pkcs12 errors with `pkcs12: password must be empty`, which is accurate but does not tell the user which attribute to change, so pre-empt it with a message naming `pkcs12_encoding` and `password_wo`). The other two encodings require a non-empty password — an empty password with `modern` produces a file whose MAC is keyed on the empty string, which some tools accept and others reject, and no caller wants that ambiguity.
-4. When `PrivateKey` is nil, build a truststore. Use `EncodeTrustStoreEntries` with one `pkcs12.TrustStoreEntry` per certificate rather than `EncodeTrustStore`, because `EncodeTrustStore` derives each friendly name from the certificate's subject and two certificates sharing a subject then collapse into one keytool entry. Name the entries from `FriendlyName` when set — suffixing `-1`, `-2` and so on across multiple certificates — and otherwise from each certificate's `Subject.CommonName`, falling back to the serial when the CN is empty.
-5. When `PrivateKey` is set, require `Certificate` to be non-nil and require the key to match the certificate: compare `PublicKeyOf(in.PrivateKey)` against `in.Certificate.PublicKey` with `PublicKeysEqual`. This is the check that catches a crossed-wires HCL reference before a device does.
-6. Call `encoder.Encode(in.PrivateKey, in.Certificate, in.Chain, in.Password)`. go-pkcs12 accepts `crypto.Signer` for all three key types, so no PKCS#8 conversion is needed here — that is only the JKS path.
+3. **Reject `passwordless` together with a `PrivateKey`.** The combination encodes an unshrouded key bag that Java's `PKCS12KeyStore` will not load: `openssl pkcs12 -info` shows the key and both certificates, and `pkcs12.DecodeChain` reads it back fine, but `keytool -list` reports **0 entries** — measured. Since `passwordless` exists for Java truststores, silently emitting a bundle the one target consumer reads as empty is the sort of quiet breakage this plan exists to avoid. Error naming `pkcs12_encoding` and `private_key_pem`, and say that an unencrypted key belongs in `format = "pem"` instead.
+
+4. Validate the password against the encoding: `PKCS12Passwordless` requires an empty password (go-pkcs12 errors with `pkcs12: password must be empty`, which is accurate but does not tell the user which attribute to change, so pre-empt it with a message naming `pkcs12_encoding` and `password_wo`). The other two encodings require a non-empty password — an empty password with `modern` produces a file whose MAC is keyed on the empty string, which some tools accept and others reject, and no caller wants that ambiguity.
+5. When `PrivateKey` is nil, build a truststore. Use `EncodeTrustStoreEntries` with one `pkcs12.TrustStoreEntry` per certificate rather than `EncodeTrustStore`, because `EncodeTrustStore` derives each friendly name from the certificate's subject and two certificates sharing a subject then collapse into one keytool entry.
+
+   **De-duplicate the derived aliases case-insensitively.** Java folds PKCS#12 aliases to lowercase, so `Root` and `root` are the same alias and one trust anchor is silently dropped — measured with `keytool -list`, which reported one entry for two distinct self-signed roots. Key the seen-set on `strings.ToLower(candidate)`, not the raw string. A test using two certificates whose CNs differ only in case is required; identical subjects do not cover this. The same applies to Task 13, since `keystore-go` lowercases aliases too, where a collision overwrites rather than merges. Name the entries from `FriendlyName` when set — suffixing `-1`, `-2` and so on across multiple certificates — and otherwise from each certificate's `Subject.CommonName`, falling back to the serial when the CN is empty.
+6. When `PrivateKey` is set, require `Certificate` to be non-nil and require the key to match the certificate.
+
+   **This asymmetry with `pkcs7` is deliberate.** A degenerate PKCS#7 is a flat bag of certificates with no designated end entity, so Task 11 correctly allows a chain-only bundle — that is how a trust bundle is distributed. PKCS#12 and JKS are different: a keystore entry pairs one specific certificate with the key, so with a key present the certificate is not optional. Without a key both become truststores, where every certificate is a peer and no leaf is designated. Task 11's reviewer asked whether the two behaviours were consistent; they differ because the formats differ.
+
+   The check itself: compare `PublicKeyOf(in.PrivateKey)` against `in.Certificate.PublicKey` with `PublicKeysEqual`. This is the check that catches a crossed-wires HCL reference before a device does.
+7. Call `encoder.Encode(in.PrivateKey, in.Certificate, in.Chain, in.Password)`. go-pkcs12 accepts `crypto.Signer` for all three key types, so no PKCS#8 conversion is needed here — that is only the JKS path.
 
 `PKCS12Encodings()` returns the three constants in declaration order.
 
@@ -4973,7 +5207,18 @@ go test ./internal/pki/ -run PKCS12 -v
 
 Expected: PASS. `TestEncodePKCS12EmittedAlgorithms` skips if openssl is absent; on this machine (OpenSSL 3.5.7) it runs.
 
-If `openssl pkcs12 -info` labels the algorithms differently than the assertions expect, read the actual output before editing the test, and adjust the expected substrings to whatever that OpenSSL build prints for AES-256-CBC/PBES2/SHA-256 and 3DES/SHA-1. Do not weaken the test to "it decoded" — the whole point is asserting the algorithms.
+**The substrings above are what OpenSSL 3.5.7 actually prints, measured.** An earlier draft of this plan expected `des-ede3-cbc` for `legacy`, which OpenSSL never emits — it prints `pbeWithSHA1And3-KeyTripleDES-CBC`. That error was worse than a failing test: `legacy`'s assertion would have failed always, while `modern`'s `notInOutput: ["des-ede3-cbc"]` passed **vacuously**, because that string appears in no output at all. So `modern` could have silently emitted 3DES and no test would have noticed — exactly the device-lockout bug these assertions exist to prevent. Verified observed output, OpenSSL 3.5.7:
+
+```
+modern:  MAC: sha256, Iteration 2048
+         PKCS7 Encrypted data: PBES2, PBKDF2, AES-256-CBC, Iteration 2048, PRF hmacWithSHA256
+legacy:  MAC: sha1, Iteration 1
+         PKCS7 Encrypted data: pbeWithSHA1And3-KeyTripleDES-CBC, Iteration 2048
+```
+
+Two lessons encoded in the assertions above. Match the `MAC:` line rather than a bare hash name, because `modern`'s PRF line also says SHA-256 and a bare match would not distinguish MAC from PRF. And put a *positive* assertion on each axis for both encodings, so neither can pass by the absence of a string that never appears.
+
+If a future OpenSSL changes these labels, read the real output and re-pin — but never weaken an assertion to "it decoded". Go decodes both encodings happily; only an external tool can tell them apart, which is the entire reason this test exists.
 
 - [ ] **Step 5: Verify against a real device path, manually, once**
 
@@ -5207,9 +5452,24 @@ func encodeJKS(in BundleInput) ([]byte, error) {
 Steps:
 
 1. Require a non-empty `Password` of at least six characters, the JKS minimum, and construct the store with `keystore.New(keystore.WithOrderedAliases(), keystore.WithMinPasswordLen(6))`. Ordered aliases make the output deterministic for a given input, which keeps a Kubernetes Secret from churning on every apply.
-2. `creationTime` must be a fixed value, not `time.Now()`, for the same determinism reason. Use `in.Certificate.NotBefore` when a certificate is present, and the first chain entry's `NotBefore` otherwise. Say why in a comment: a wall-clock timestamp in the file makes every apply produce different bytes.
+2. `creationTime` must be a fixed value, not `time.Now()`. Use `in.Certificate.NotBefore` when a certificate is present, and the first chain entry's `NotBefore` otherwise. Say why in a comment: a wall-clock timestamp in the file makes every encode produce different bytes for no reason.
+
+   **Scope the determinism claim honestly, and thread `in.Rand`.** Ordered aliases and a fixed `creationTime` remove *gratuitous* nondeterminism, and they make the **truststore** path fully byte-deterministic. They do not make a **keyed** keystore byte-deterministic, and nothing should: `keystore-go`'s Sun key protector draws a fresh random salt per `SetPrivateKeyEntry`, and pinning that salt in production would be a real security defect, not a fix. PKCS#12 has the same property, which is why Task 12 asserts *algorithms* rather than bytes.
+
+   Two consequences. First, pass `keystore.WithCustomRandomNumberGenerator(in.Rand)` when `in.Rand` is non-nil, mirroring what `encodePKCS12` already does with `WithRand` — production leaves `Rand` nil and gets `crypto/rand`, while a test can pin it. Second, assert the property that is actually true and useful:
+
+   - truststore path, no `Rand` set: two encodes of identical input are byte-identical;
+   - keyed path, `Rand` pinned to a deterministic reader: two encodes are byte-identical, which proves nothing *else* in the path is nondeterministic — no stray `time.Now()`, no map-iteration order leaking in.
+
+   Without the second test the earlier draft of this plan asserted determinism it did not have: two encodes of a keyed keystore differed from byte 61 to EOF and no test noticed. Task 13's reviewer found it by comparing two encodes directly.
+
+   This does not churn a Kubernetes Secret, and the reason is worth writing down where someone will find it: the provider encodes a bundle once at create and holds the bytes in state under `UseStateForUnknown`. `Read` never re-encodes — it cannot, since the password is write-only and absent from state. So state stability comes from the resource's plan modifiers, not from the encoder being deterministic.
 3. When `PrivateKey` is set: require `Certificate`, require the key to match it via `PublicKeysEqual`, convert with `EncodePrivateKeyPKCS8DER`, build the `[]keystore.Certificate` chain with `Type: "X509"` and `Content: cert.Raw` for the certificate followed by each chain entry, and call `SetPrivateKeyEntry(alias, entry, []byte(in.Password))`. The alias is `FriendlyName` when set, otherwise the certificate's CN, otherwise `"key"`.
-4. When `PrivateKey` is nil: add one `SetTrustedCertificateEntry` per certificate, deriving distinct aliases the same way the PKCS#12 truststore path does — `FriendlyName` with a numeric suffix across multiple entries, or each certificate's CN. Duplicate aliases silently overwrite in keystore-go, which is why the alias derivation cannot just use the CN when subjects can repeat.
+4. When `PrivateKey` is nil: add one `SetTrustedCertificateEntry` per certificate. **Reuse Task 12's `trustStoreAliases` helper — do not re-derive the aliases here.** It already handles the two hazards, and re-implementing them is how the two paths drift apart.
+
+   The consequence is strictly worse in JKS than in PKCS#12. `keystore-go` lowercases aliases (`keystore.go` around line 334) *and* a duplicate silently **overwrites** rather than merging, so a colliding alias means the keystore quietly holds fewer trust anchors than the configuration asked for, with no error anywhere. Both collision sources apply: two certificates sharing a subject, and two whose CNs differ only in case — `Root` and `root` are one alias after folding.
+
+   Add the case-only test against a JKS, mirroring Task 12's `TestEncodePKCS12TrustStoreAliasesAreCaseInsensitivelyDistinct`: two self-signed roots with CNs differing only in case, keyless, asserted through `keytool -list` to produce two entries. Go's own reader cannot observe the loss, which is why the external tool is the assertion.
 5. `Store` into a `bytes.Buffer` and return its bytes.
 
 Note in the doc comment that the literal `"X509"` is required: keystore-go's decoder writes exactly that string and `"X.509"` produces an entry Java does not recognize.
@@ -5247,7 +5507,8 @@ Spec §9's comparison, implemented against parsed DER. This is the library half 
   - `func (d Drift) String() string`
   - `type CompareInput struct { Desired CertTemplate; DesiredPublicKey crypto.PublicKey; Actual *x509.Certificate; CA *x509.Certificate }`
   - `func CompareCertificate(in CompareInput) ([]Drift, error)` — empty slice means no drift
-  - `func CompareValidity(actual *x509.Certificate, earlyRenewal time.Duration, now time.Time) (readyForRenewal bool)`
+  - `func CompareValidity(actual *x509.Certificate, earlyRenewal time.Duration, now time.Time) (readyForRenewal bool, err error)`
+    **Amended 2026-07-26 (minor-fix wave 3).** Originally returned only the bool. It took a pointer with no documented nil contract and panicked on nil, unlike every other precondition in `compare.go`, which returns an error. Now consistent: nil `actual` is a precondition error. Callers in Plan 2 (Tasks 8, 9 and 11 compute `ready_for_renewal`) must handle both returns.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5618,7 +5879,11 @@ func TestCompareValidity(t *testing.T) {
 		"inside the window":           {72 * time.Hour, true},
 		"longer than the lifetime":    {365 * 24 * time.Hour, true},
 	} {
-		if got := CompareValidity(&cert, tc.earlyRenewal, now); got != tc.want {
+		got, err := CompareValidity(&cert, tc.earlyRenewal, now)
+		if err != nil {
+			t.Fatalf("%s: CompareValidity: %v", label, err)
+		}
+		if got != tc.want {
 			t.Errorf("%s: CompareValidity = %v, want %v", label, got, tc.want)
 		}
 	}
@@ -5626,8 +5891,15 @@ func TestCompareValidity(t *testing.T) {
 	// An already-expired certificate is ready for renewal regardless.
 	expired := cert
 	expired.NotAfter = now.Add(-time.Hour)
-	if !CompareValidity(&expired, 0, now) {
+	if ready, err := CompareValidity(&expired, 0, now); err != nil {
+		t.Fatalf("CompareValidity on an expired certificate: %v", err)
+	} else if !ready {
 		t.Error("an expired certificate is not reported ready for renewal")
+	}
+
+	// A nil certificate is a precondition error, not a panic.
+	if _, err := CompareValidity(nil, 0, now); err == nil {
+		t.Error("CompareValidity(nil, ...) returned a nil error, want a precondition error")
 	}
 }
 ```
@@ -5680,13 +5952,32 @@ type CompareInput struct {
 
 `CompareCertificate` returns drift entries in a stable order, checking:
 
-1. `Actual` non-nil, else an error (not drift — a caller with no certificate has a bug, not a diff).
+1. `Actual` non-nil, else an error (not drift — a caller with no certificate has a bug, not a diff). **`DesiredPublicKey` must also be non-nil**, and a nil one is likewise an error rather than drift: `CertTemplate.Extensions` needs the public key to compute the subjectKeyIdentifier and fails without it, so step 6 could not run. Every real caller has one — from the CSR in `csr_pem` mode, or from `public_key_pem` inline — so requiring it costs nothing and turns an unexplained `Extensions()` error into a clear precondition. Task 9's reviewer raised this.
 2. **Subject**: `Desired.Subject.EncodeDER()` against `Actual.RawSubject`, compared as bytes. Report `Field: "subject"` with both sides rendered through `Subject.String()` for readability.
-3. **Public key**: `PublicKeysEqual(in.DesiredPublicKey, in.Actual.PublicKey)` when `DesiredPublicKey` is non-nil. Report `Field: "public_key"` with the fingerprints, never the keys.
+
+   **If `EncodeDER` fails, return the error — do not report it as drift.** This matters more than it looks. `Subject.Equal` (Task 6) swallows an encode failure and returns `false`, which is right for a boolean but wrong here: a subject that cannot be encoded would then be reported as permanently drifting with no stated cause, and the operator would watch Terraform propose the same replacement on every plan with no way to see why. The realistic trigger is an adopted certificate whose DN carries a value that violates its own declared string type — a `PrintableString` containing a character outside that repertoire, which Task 6's parser accepts but its encoder refuses. Surfacing the error names the attribute and turns unexplained churn into an actionable adoption failure. Task 6's implementer identified this and handed it forward specifically.
+3. **Public key**: `PublicKeysEqual(in.DesiredPublicKey, in.Actual.PublicKey)`. Report `Field: "public_key"` with the fingerprints, never the keys. No nil guard is needed here — step 1 already rejected a nil `DesiredPublicKey`.
 4. **Serial**: `Desired.Serial.Cmp(Actual.SerialNumber)`, reported as `serial_number` with `FormatSerial` on both sides.
 5. **Validity**: `NotBefore` and `NotAfter` compared with `Time.Equal` after truncating both to a second, because DER encodes `UTCTime` at second granularity and a template carrying sub-second precision would otherwise always differ. Report `not_before` and `not_after` in RFC3339.
-6. **Extensions**: build the desired list with `Desired.Extensions(in.DesiredPublicKey)` and index the actual certificate's `Extensions` by OID string. For each desired extension, report drift when it is absent, when `Critical` differs, or when the DER value differs. Then report every actual extension not in the desired set — that catches a removed `extra_extension`, and the `authorityKeyIdentifier` Go adds must be excluded from that sweep since the template never contains it. Use the extension's dotted OID as `Field` so the message is unambiguous even for extensions the provider has no friendly name for; the SAN is the one exception, reported as `san` because that is the schema block a user would edit.
-7. **Issuer and signature**: when `CA` is non-nil, compare `CA.RawSubject` against `Actual.RawIssuer` (`Field: "issuer"`) and call `Actual.CheckSignatureFrom(in.CA)` (`Field: "signature"`). When `CA` is nil, call `Actual.CheckSignatureFrom(in.Actual)` to confirm it really is self-signed.
+6. **Extensions**: build the desired list with `Desired.Extensions(in.DesiredPublicKey)` and index the actual certificate's `Extensions` by OID string.
+
+   **Index by OID; never compare positionally.** `Extensions()` returns its documented order, but the order in an *issued* certificate is not the same: `x509.CreateCertificate` prepends the `authorityKeyIdentifier` it synthesizes from the parent. Measured directly — a template yielding `[2.5.29.19, 2.5.29.15, 2.5.29.37, 2.5.29.17, 2.5.29.14]` produces a certificate carrying `[2.5.29.35, 2.5.29.19, 2.5.29.15, 2.5.29.37, 2.5.29.17, 2.5.29.14]`. A positional comparison would report drift on every extension of every certificate. Task 9's implementer found this. For each desired extension, report drift when it is absent, when `Critical` differs, or when the DER value differs. Then report every actual extension not in the desired set — that catches a removed `extra_extension`, and the `authorityKeyIdentifier` Go adds must be excluded from that sweep since the template never contains it. Use the extension's dotted OID as `Field` so the message is unambiguous even for extensions the provider has no friendly name for; the SAN is the one exception, reported as `san` because that is the schema block a user would edit.
+7. **Issuer and signature**: when `CA` is non-nil, compare `CA.RawSubject` against `Actual.RawIssuer` (`Field: "issuer"`). When `CA` is nil, the certificate is expected to be self-signed, so compare `Actual.RawSubject` against `Actual.RawIssuer` instead.
+
+   **For the signature itself, do not use `CheckSignatureFrom`.** It enforces issuer *constraints* before verifying any cryptography, so it fails for reasons that have nothing to do with whether the signature matches — and two of those failures are reachable from ordinary configuration and **never converge**:
+
+   - A self-signed certificate with `basic_constraints { ca = false }` fails with `x509: invalid signature: parent certificate cannot sign this kind of certificate`, even when the certificate matches its template byte for byte.
+   - A self-signed CA whose `key_usage` omits `keyCertSign` fails the same way. Spec §6.3 makes both `basic_constraints` and `key_usage` user-settable on `pki_certificate_authority`, so both are expressible in HCL.
+
+   In each case the proposed replacement produces an identically-constrained certificate that drifts again on the next plan: an endless replacement loop for a CA, which for a 20-year certificate on a device is the worst outcome this comparison exists to prevent. Task 14's reviewer measured both.
+
+   Verify the cryptography only, with the issuer's public key over the signed bytes: `signer.CheckSignature(Actual.SignatureAlgorithm, Actual.RawTBSCertificate, Actual.Signature)`, where `signer` is `in.CA` when non-nil and `in.Actual` otherwise.
+
+   **Switching to `CheckSignature` also fixes the SHA-1 problem for free**, which is worth knowing before anyone "improves" it back. `Certificate.CheckSignature` calls `checkSignature` with `allowSHA1 = true`, whereas `CheckSignatureFrom` passes `false`. So an adopted SHA-1 chain verifies normally here and reports **nothing at all** — no drift and no error — which is the right answer, since nothing about its content has changed. Under `CheckSignatureFrom` it would have produced `x509: cannot verify signature: insecure algorithm SHA1-RSA` and forced one reissue, and therefore one device re-enrollment, for a byte-identical certificate.
+
+   **Still distinguish "the signature is wrong" from "the signature cannot be checked."** A cryptographically invalid signature is drift, reported as `Field: "signature"`. An `x509.InsecureAlgorithmError` is **not** drift — return it as an error naming the algorithm, so the operator gets a real finding about the adopted material rather than an unexplained replacement. That follows the same rule as the `EncodeDER` failure above: something the comparison cannot evaluate is an error, not a diff. With `allowSHA1 = true` this branch is reached only by MD5, which `crypto/x509` refuses outright; detect it with `errors.As`, not by matching the message.
+
+   Add a test for each of the three: the `ca = false` self-signed case and the `keyCertSign`-less CA case must both report **no** drift, and an adopted SHA-1 chain must report **no** drift either — build that fixture with `crypto/x509` directly, since `sign.go` refuses SHA-1 at issuance.
 
 Render extension values as hex, truncated to 64 characters with an ellipsis, so a drift message stays readable in a plan.
 
@@ -5900,6 +6191,12 @@ func TestGoldenMatchesThePythonIssuer(t *testing.T) {
 	// criticality and the same value. authorityKeyIdentifier is compared
 	// separately below because openssl's "keyid, issuer" form and Go's keyid
 	// form can differ in what they include.
+	//
+	// Note both maps are keyed by OID rather than compared positionally. That
+	// is required, not stylistic: x509.CreateCertificate prepends the AKI it
+	// synthesizes, so the issued order differs from CertTemplate.Extensions()'
+	// order, and openssl's order differs from both. Only the set and the
+	// per-OID values are comparable.
 	akiOID := "2.5.29.35"
 	refExts := map[string]pkix.Extension{}
 	for _, e := range reference.Extensions {
@@ -6085,7 +6382,6 @@ The architectural invariant from spec §3, enforced rather than documented, plus
 
 **Files:**
 - Create: `internal/pki/boundary_test.go`
-- Modify: `internal/pki/doc_test.go` (delete the placeholder)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -6189,15 +6485,7 @@ go test ./internal/pki/ -run 'Boundary|Package|SPDX' -v
 
 Expected: PASS. If `TestEveryFileHasTheSPDXHeader` fails, add the missing headers rather than relaxing the test.
 
-- [ ] **Step 3: Delete the Task 1 placeholder test**
-
-`internal/pki/doc_test.go` exists only so the package had a test binary before any real code landed. The package now has real tests, so delete the file.
-
-```bash
-rm internal/pki/doc_test.go
-```
-
-- [ ] **Step 4: Verify the whole package, including race and coverage**
+- [ ] **Step 3: Verify the whole package, including race and coverage**
 
 ```bash
 gofmt -l .
@@ -6209,7 +6497,7 @@ go test ./internal/pki/ -cover
 
 Expected: `gofmt -l` silent, `go vet` silent, all three test runs green. Coverage should be above 85% for the package; if any file is far below that, the gap is a missing test case, not a reason to lower the bar. Note the actual number in the commit message.
 
-- [ ] **Step 5: Confirm the dependency licenses one final time**
+- [ ] **Step 4: Confirm the dependency licenses one final time**
 
 The dependency set is now final for this plan, so run the audit spec §13 requires:
 
@@ -6221,11 +6509,10 @@ For each module, confirm the license is one of MPL-2.0, BSD-3-Clause, MIT, or Ap
 
 Note that the automated `go-licenses` gate is spec §14 follow-up 3 and lands in Plan 2's CI task, once the full dependency set including the plugin framework is present.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add internal/pki/boundary_test.go
-git rm internal/pki/doc_test.go
 git commit -m "test: enforce the no-Terraform-imports boundary and SPDX headers"
 ```
 

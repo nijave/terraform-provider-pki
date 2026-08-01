@@ -1,0 +1,32 @@
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # The plugin-framework modules expect to move in lockstep, so grouping
+      # them avoids a set of PRs that individually fail to build.
+      terraform-plugin:
+        patterns: ["github.com/hashicorp/terraform-plugin-*"]
+      golang-x:
+        patterns: ["golang.org/x/*"]
+
+  # The tools module is separate, so it needs its own entry or tfplugindocs
+  # never gets updated.
+  - package-ecosystem: "gomod"
+    directory: "/tools"
+    schedule:
+      interval: "weekly"
+    groups:
+      tools:
+        patterns: ["*"]

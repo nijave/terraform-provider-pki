@@ -363,7 +363,7 @@ Format converter and composer. Optional fields are the switches: no
 | `certificate_pem` | optional | |
 | `private_key_pem` | optional, sensitive | |
 | `chain_pem` | optional, list | ordered, leaf-adjacent first |
-| `friendly_name` | optional | PKCS#12 / JKS alias |
+| `friendly_name` | optional | JKS alias, and the PKCS#12 alias for a **truststore** (no `private_key_pem`). Has **no effect** on a PKCS#12 bundle that includes a private key — see the note below. |
 | `pkcs12_encoding` | optional | `modern` (default), `legacy`, `passwordless` |
 | `password_wo` | write-only, sensitive | never persisted to state |
 | `password_wo_version` | optional | change to force re-encryption |
@@ -372,6 +372,20 @@ Format converter and composer. Optional fields are the switches: no
 
 `content_base64` feeds `kubernetes_secret.binary_data` directly, closing the
 workaround documented at `tofu/main.tf:23-35`.
+
+**`friendly_name` limitation on PKCS#12 keystores.** `go-pkcs12` v0.7.3 — the
+newest release — writes only `localKeyId` from `Encoder.Encode`; it emits
+`oidFriendlyName` solely from `EncodeTrustStoreEntries`. So a PKCS#12 bundle
+carrying a private key has no settable alias, and `keytool` displays it as `1`.
+Verified empirically during implementation.
+
+The attribute is therefore honored for `jks` and for keyless `pkcs12`
+truststores, and documented as having no effect for keyed `pkcs12`. Ruled
+2026-07-25: accept and document, rather than reject the combination or fork ~400
+lines of unexported PKCS#12 crypto into this project — the latter would also
+require re-running the §13 license audit. A negative test pins the limitation
+and fails loudly if `go-pkcs12` ever gains support, so the capability arrives
+automatically if upstream adds it.
 
 Write-only attributes are always null in state and therefore invisible to drift
 detection, which is why `password_wo_version` exists — the standard framework

@@ -1,0 +1,199 @@
+# Runs on pull requests and on pushes to main. Scoping push to main avoids a
+# duplicate run when a branch in this repo also has an open PR.
+name: Tests
+on:
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'docs/superpowers/**'
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/superpowers/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - run: go mod download
+      - run: go build -v ./...
+      - name: gofmt
+        run: |
+          test -z "$(gofmt -l .)" || (gofmt -l . && echo "run 'make fmt'" && exit 1)
+      - run: go vet ./...
+
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - run: go mod download
+      # keytool ships with a JDK, and ubuntu-latest happens to preinstall one
+      # today. That is a property of the runner image, not a guarantee, and the
+      # assertion below would turn its removal into a hard CI failure rather
+      # than a silent loss of coverage -- correct, but it would block the repo
+      # on someone else's image change. Provision the JDK explicitly so keytool
+      # is ours, and keep the assertion as the backstop for openssl (which the
+      # image does guarantee) and for a setup-java that succeeds without
+      # putting keytool on PATH.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      # internal/pki cross-validates its output against openssl and keytool, and
+      # each of those tests skips itself when the tool is absent. That is right
+      # for a contributor who does not have them and wrong for CI: with both off
+      # PATH, 12 tests vanish -- the PKCS#12 emitted-algorithm guards that keep a
+      # bundle importable on a phone, both truststore alias-collision guards that
+      # catch silent trust-anchor loss, and the subjectKeyIdentifier comparison
+      # against openssl -- while `go test` still prints ok. A runner-image change
+      # must not be able to delete this project's highest-value assertions
+      # silently, so assert the tools are here before running anything.
+      - name: Require openssl and keytool
+        run: |
+          missing=""
+          for tool in openssl keytool; do
+            command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "missing required test tools:$missing" >&2
+            echo "the internal/pki cross-validation tests would silently skip" >&2
+            exit 1
+          fi
+          openssl version
+          keytool -help 2>&1 | head -n 1
+      - name: go test
+        run: go test -v -cover ./internal/...
+
+  generate:
+    name: Generated Docs Are Current
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      # tfplugindocs formats the examples with `terraform fmt`, and OpenTofu's
+      # `tofu fmt` is equivalent for this purpose. Install OpenTofu rather than
+      # Terraform, so no BUSL-licensed binary is used anywhere in CI.
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: '1.12.4'
+          tofu_wrapper: false
+      - name: Generate
+        run: make docs
+      - name: Check for uncommitted changes
+        run: |
+          git diff --compact-summary --exit-code || \
+            (echo; echo "Generated documentation is out of date. Run 'make docs' and commit the result."; exit 1)
+
+  acceptance:
+    name: Acceptance (OpenTofu ${{ matrix.tofu }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # OpenTofu is the primary target and 1.11 is the floor, because
+        # pki_bundle's password_wo is a write-only attribute. Terraform is not
+        # tested: it is BUSL-licensed and is not the reference platform.
+        tofu:
+          - '1.11.*'
+          - '1.12.*'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ matrix.tofu }}
+          tofu_wrapper: false
+      - run: go mod download
+      # Resolve tofu's absolute path: terraform-plugin-testing requires an
+      # absolute TF_ACC_TERRAFORM_PATH on some versions, and the bare name on
+      # PATH is not guaranteed to satisfy it. This mirrors the Makefile's
+      # testacc target, which is known to work.
+      - name: Resolve tofu path
+        run: echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)" >> "$GITHUB_ENV"
+      - name: Require openssl and keytool
+        run: |
+          missing=""
+          for tool in openssl keytool; do
+            command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "missing required test tools:$missing" >&2
+            exit 1
+          fi
+      - name: Acceptance tests
+        timeout-minutes: 20
+        env:
+          TF_ACC: '1'
+          # terraform-plugin-testing performs no version check against a binary
+          # already present at this path, so the harness drives OpenTofu
+          # directly and never downloads Terraform.
+          TF_ACC_TERRAFORM_PATH: ${{ env.TF_ACC_TERRAFORM_PATH }}
+          # Required, not optional. terraform-plugin-testing defaults its
+          # reattach host to registry.terraform.io while still registering the
+          # legacy "-" namespace as a reattach candidate, and OpenTofu's address
+          # parser rejects that pairing outright. Without this, EVERY acceptance
+          # test fails before it reaches the provider. Measured during Task 1;
+          # the Makefile's testacc target sets it too.
+          TF_ACC_PROVIDER_HOST: registry.opentofu.org
+        run: go test -v -cover -timeout 20m ./internal/provider/
+
+  license:
+    name: Dependency Licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - name: Install go-licenses
+        run: go install github.com/google/go-licenses@latest
+      # The project is GPL-3.0-or-later, so every dependency must be
+      # GPLv3-compatible. The forbidden set is what actually threatens that:
+      # BUSL-1.1 (Terraform CLI since 1.6) and the copyleft-incompatible
+      # licenses. Apache-2.0 is allowed because this is GPLv3, not GPLv2 -- if
+      # the license is ever downgraded, re-audit spec section 13 first.
+      - name: Check licenses
+        run: |
+          go-licenses check ./... \
+            --disallowed_types=forbidden,restricted,unknown \
+            --ignore=github.com/nijave/terraform-provider-pki
+      - name: Report licenses
+        if: always()
+        run: go-licenses report ./... --ignore=github.com/nijave/terraform-provider-pki || true
+

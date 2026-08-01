@@ -27,7 +27,32 @@ Every task's requirements implicitly include this section.
 - **Provider address:** `registry.opentofu.org/nijave/pki`. Short name in configuration and in test factories: `pki`.
 - **`docs/` is generated, never hand-edited.** `make docs` must leave the tree clean; CI fails on a `git diff`. `docs/superpowers/` is unrelated hand-written content and must not be clobbered — Task 14 Step 3 verifies that explicitly.
 - **Formatter/linter/test runner:** `gofmt -l` empty, `go vet ./...` clean, `go test ./...` green, `make testacc` green against `tofu`.
+- **Do not use `listvalidator.IsRequired()` on an optional block, and do not use `SizeAtLeast(1)` to reject an empty one.** Both were measured in minor-fix wave 4 against OpenTofu 1.12.1 and neither does what its name suggests here. `IsRequired()` **rejects a config that omits the block entirely**, because the framework walks an absent block's nested attributes — so applying it to an optional block makes the block mandatory. And the stock validators skip null, so `SizeAtLeast(1)` cannot reject `key_usage {}` (a present block with a null list) at all. Use the shared `nonEmptyBlockValidator` in `internal/provider` instead, which is what closes that case with a real attribute path. Binds Tasks 6 through 11.
+- **Every `validity` and `early_renewal` attribute must document the duration ceiling.** `pki.ParseDuration` rejects anything above `time.Duration`'s int64-nanosecond limit — **292y / 106751d** — because the alternative is a silently wrapped, far shorter certificate lifetime. That ceiling is a real limit on a user-facing attribute, so every such attribute's `MarkdownDescription` must state the accepted syntax (Go `time.Duration` syntax, or an integer count with a `d`/`y` suffix, where `y` is a calendar-naive 365 days) **and** the maximum. Binds Tasks 8, 9 and 11. Recorded as a residual concern from Plan 1's whole-branch review; the library side already documents it in `duration.go` and names the ceiling in the error.
 - **Commit style:** Conventional Commits. **Stage explicit paths;** never `git add -A`.
+- **Every `ExpectError` regexp must match text only the provider produces.** Terraform and OpenTofu echo the offending configuration inside a diagnostic, so a pattern matching an attribute name or a literal that appears in the test's own config will pass whether or not the provider ever ran. Task 2 measured this: its two patterns, `commonNam` and `1\.2\.3\.4\.5\.6\.7\.8\.9`, both passed **before any implementation existed**, matching the source line quoted in OpenTofu's "function not found" diagnostic.
+
+  **Many of the `ExpectError` values written into the tasks below have this defect.** They were drafted before the trap was understood. Each one is the implementing task's responsibility to tighten, and these are the ones already identified as suspect — every case where the pattern names something the config also contains:
+
+  | Task | Pattern | Also in the config |
+  | --- | --- | --- |
+  | 5 | `DSA\|Invalid Attribute Value` | `algorithm = "DSA"` |
+  | 5 | `ecdsa_curve\|ECDSA` | `ecdsa_curve = "P256"` |
+  | 5 | `rsa_bits\|RSA` | `rsa_bits = 2048` |
+  | 6 | `mutually exclusive\|attribute` | `attribute {` |
+  | 7 | `base64` | `content_base64` |
+  | 8 | `validity\|duration` | `validity = "forever"` |
+  | 8 | `serial\|hex` | `serial_number = "not-hex"` |
+  | 9 | `does not match\|ca_private_key_pem` | `ca_private_key_pem` |
+  | 11 | `reason\|Invalid Attribute Value` | `reason = "becauseISaidSo"` |
+  | 11 | `next_update\|duration` | `next_update = "soon"` |
+  | 11 | `revoked_at\|RFC3339` | `revoked_at = "yesterday"` |
+  | 11 | `duplicate\|2001` | `serial_number = "2001"` |
+  | 12 | `pkcs11\|Invalid Attribute Value` | `format = "pkcs11"` |
+  | 12 | `der\|private key` | `format = "der"` |
+  | 12 | `pkcs7\|private key` | `format = "pkcs7"` |
+
+  Replace each with a distinctive fragment of the message the implementation actually emits, then **verify by removing the check** — or, for a schema validator, by loosening it — and confirming the test fails. A pattern you have not seen fail is a pattern you have not tested. Patterns that match framework-generated text (`cannot be configured together`, `Invalid Attribute Combination`) or a value absent from the config (`2048` where the config says `1024`, `crlSign` where it says `keyCertSign`, `file://` where the ID has no scheme) are already sound and need no change.
 
 ## Naming conventions fixed by this plan
 
@@ -199,12 +224,12 @@ import (
 	"github.com/nijave/terraform-provider-pki/internal/provider"
 )
 
-// Generate the documentation. Run from the tools module so tfplugindocs and its
-// dependency graph stay out of this module's go.sum:
-//
-//	make docs
-//
-//go:generate echo "run 'make docs' -- generation lives in the tools module"
+// Documentation is generated from the tools module, which keeps tfplugindocs'
+// dependency graph out of this module's go.sum. There is deliberately no
+// //go:generate directive here: `go generate ./...` at the repo root does not
+// descend into a nested module, so the directive would either be a no-op or
+// duplicate the tools module's work. `make docs` is the entry point, and CI
+// runs it followed by a git diff.
 
 var (
 	// version and commit are set by goreleaser's ldflags.
@@ -319,6 +344,17 @@ func testAccPreCheck(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("TF_ACC_TERRAFORM_PATH=%q is not usable: %v", path, err)
 	}
+	// Without this, terraform-plugin-testing pairs its default host
+	// registry.terraform.io with the legacy "-" namespace it registers for
+	// reattach, and OpenTofu refuses the combination with a message about
+	// provider address parsing that says nothing about the real cause. Fail
+	// here instead, where the message can name the fix.
+	if os.Getenv("TF_ACC_PROVIDER_HOST") == "" {
+		t.Fatal("TF_ACC_PROVIDER_HOST is not set. Run `make testacc`, which sets it to " +
+			"registry.opentofu.org. Without it terraform-plugin-testing pairs its default " +
+			"registry.terraform.io host with the legacy \"-\" namespace, and OpenTofu rejects " +
+			"that pairing before the provider is ever reached.")
+	}
 }
 
 // TestProviderSchema is a unit test -- no TF_ACC required -- that catches a
@@ -341,6 +377,8 @@ func TestProviderSchema(t *testing.T) {
 `TestProviderSchema` references `data "pki_oids"`, which does not exist until Task 3. Write the test now with the data source line omitted — `Config: "provider \"pki\" {}"` alone is a valid plan-only step — and add the data source reference in Task 3. Note that in the plan comment so the sequencing is not mistaken for an error.
 
 Using package `provider_test` rather than `provider` is deliberate: it forces the tests to exercise only the exported surface, the same way OpenTofu does.
+
+**Also add a repo-wide SPDX header test here.** `internal/pki/boundary_test.go`'s header check resolves `os.ReadDir(".")` to its own package directory, so it guards nothing outside `internal/pki` — and every file the remaining fifteen tasks add lands outside it. Walk the module root with `filepath.WalkDir`, skipping `.git`, `.claude`, and `.superpowers`, and assert every `.go` file begins with `// SPDX-License-Identifier: GPL-3.0-or-later`. Carry the same `checked == 0` guard the `internal/pki` version has, so a wrong root path fails the test instead of silently passing it. Leave `internal/pki`'s own copy in place; the overlap is harmless and it belongs with that package's self-enforcement.
 
 - [ ] **Step 6: Add the Makefile targets**
 
@@ -820,7 +858,9 @@ Note the import is `datasource/schema`, not `resource/schema`. The five groups a
 - `extensions` — "Certificate extension types, such as `subjectAltName` and `basicConstraints`."
 - `extended_key_usages` — "Extended key usage purposes, such as `clientAuth`."
 - `key_usages` — "Key usage names mapped to their **RFC 5280 bit position**, not to an OID: key usages are bits in a `BIT STRING` and have no object identifiers. `by_oid` is therefore keyed by that same decimal bit position."
-- `signature_algorithms` — "Signature algorithm names, spelled as Go's `crypto/x509` spells them, mapped to their algorithm OIDs."
+- `signature_algorithms` — "Signature algorithm names, spelled as Go's `crypto/x509` spells them, mapped to their algorithm OIDs. **`by_oid` is smaller than `by_name`:** RFC 8017 registers a single OID for RSASSA-PSS (`1.2.840.113549.1.1.10`) across all hash sizes, because the hash is a PSS parameter rather than part of the OID. All three of `SHA256-RSAPSS`, `SHA384-RSAPSS`, and `SHA512-RSAPSS` therefore share that value in `by_name`, and `by_oid` omits it, because that OID alone cannot say which hash is in use."
+
+The bolded asymmetry is not optional wording. `signature_algorithms` is the one group in the table that is not a bijection, a user comparing `length(by_name)` against `length(by_oid)` will notice, and the alternative — inventing a sub-arc per hash size — was tried during Plan 1 Task 2 and rejected precisely because this data source publishes these strings to users who paste them into configuration. A test in Plan 1 (`TestSignatureAlgorithmTableIsNotBijective`) now forbids it.
 
 The `key_usages` description carries the design decision so a user reading generated docs is not surprised; that wording is the resolution of the gap spec §11 left open.
 
@@ -1362,15 +1402,33 @@ func TestResolveImportIDErrorNamesTheSchemes(t *testing.T) {
 // TestResolveImportIDErrorDoesNotEchoContents matters because a private key can
 // be imported inline with pem:// or base64://, and a diagnostic is printed to
 // the console and to CI logs.
+//
+// Cover the malformed-scheme shapes, not just the well-formed one. The first
+// version of this test used only "base64://<bad base64>", which the code
+// handled safely, while a one-slash typo and a bare payload both leaked the
+// start of the key.
 func TestResolveImportIDErrorDoesNotEchoContents(t *testing.T) {
 	t.Parallel()
-	const secret = "c3VwZXJzZWNyZXRrZXltYXRlcmlhbA"
-	_, err := resolveImportID("base64://" + secret + "!!!")
-	if err == nil {
-		t.Fatal("expected an error for malformed base64")
-	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatalf("error message echoes the payload: %q", err.Error())
+	const secret = "c3VwZXJzZWNyZXRrZXltYXRlcmlhbHBheWxvYWQ"
+	for _, id := range []string{
+		"base64://" + secret + "!!!", // right scheme, bad payload
+		"base64:/" + secret,          // one slash: no "://" to split on
+		"pem:/" + secret,             // same, other scheme
+		secret,                       // no scheme at all
+		"nonsense://" + secret,       // unknown but well-formed scheme
+	} {
+		_, err := resolveImportID(id)
+		if err == nil {
+			t.Errorf("resolveImportID(%.12s...) returned nil error, want an error", id)
+			continue
+		}
+		// Any run of the payload long enough to be recognizable is a leak.
+		for n := 8; n <= len(secret); n += 8 {
+			if strings.Contains(err.Error(), secret[:n]) {
+				t.Errorf("error message echoes %d characters of the payload: %q", n, err.Error())
+				break
+			}
+		}
 	}
 }
 ```
@@ -1461,20 +1519,46 @@ func resolveImportID(id string) ([]byte, error) {
 		return nil, fmt.Errorf("import ID is empty; %s", usage)
 
 	default:
-		return nil, fmt.Errorf("import ID %q has no recognized scheme; %s", firstSegment(id), usage)
+		if scheme := schemeOf(id); scheme != "" {
+			return nil, fmt.Errorf("import ID scheme %q is not recognized; %s", scheme, usage)
+		}
+		// No scheme to name, and nothing else in the ID is safe to print.
+		return nil, fmt.Errorf("import ID has no recognized scheme; %s", usage)
 	}
 }
 
-// firstSegment returns a short, safe prefix of an ID for use in an error
-// message: enough to identify a typo, never enough to leak a payload.
-func firstSegment(id string) string {
-	if i := strings.Index(id, "://"); i >= 0 {
-		return id[:i+3]
+// schemeOf returns the scheme of an import ID for use in an error message, or
+// the empty string when there is no recognizable one.
+//
+// It returns ONLY the scheme, and nothing when there is no scheme. An earlier
+// version of this helper echoed the first sixteen characters of an
+// unrecognized ID, which leaks key material: `base64:/<key>` -- a one-slash
+// typo -- has no "://" to split on, so it fell through to the length branch and
+// printed the start of the payload. So did an ID with no scheme at all, which
+// is exactly what someone pasting a bare base64 key produces. Measured on all
+// three shapes.
+//
+// A scheme name is not secret and naming it helps a user see the typo. Anything
+// after it may be a private key, and no part of it belongs in a diagnostic that
+// prints to a console and a CI log.
+func schemeOf(id string) string {
+	i := strings.Index(id, "://")
+	if i < 0 {
+		return ""
 	}
-	if len(id) > 16 {
-		return id[:16] + "..."
+	scheme := id[:i]
+	// A scheme is a short token. If the text before "://" is long or contains
+	// anything unexpected, it is not a scheme -- it is payload that happens to
+	// contain "://", so return nothing rather than echoing it.
+	if len(scheme) > 12 {
+		return ""
 	}
-	return id
+	for _, r := range scheme {
+		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && r != '+' && r != '-' && r != '.' {
+			return ""
+		}
+	}
+	return scheme + "://"
 }
 ```
 
@@ -1608,18 +1692,24 @@ func TestAccPrivateKeyRejectsInvalidConfig(t *testing.T) {
 			expect: regexp.MustCompile(`(?s)DSA|Invalid Attribute Value`),
 		},
 		"rsa too small": {
-			config: `resource "pki_private_key" "test" { algorithm = "RSA"
-  rsa_bits = 1024 }`,
+			config: `resource "pki_private_key" "test" {
+  algorithm = "RSA"
+  rsa_bits  = 1024
+}`,
 			expect: regexp.MustCompile(`(?s)2048`),
 		},
 		"curve on rsa": {
-			config: `resource "pki_private_key" "test" { algorithm = "RSA"
-  ecdsa_curve = "P256" }`,
+			config: `resource "pki_private_key" "test" {
+  algorithm   = "RSA"
+  ecdsa_curve = "P256"
+}`,
 			expect: regexp.MustCompile(`(?s)ecdsa_curve|ECDSA`),
 		},
 		"bits on ed25519": {
-			config: `resource "pki_private_key" "test" { algorithm = "ED25519"
-  rsa_bits = 2048 }`,
+			config: `resource "pki_private_key" "test" {
+  algorithm = "ED25519"
+  rsa_bits  = 2048
+}`,
 			expect: regexp.MustCompile(`(?s)rsa_bits|RSA`),
 		},
 	} {
@@ -1664,6 +1754,13 @@ resource "local_sensitive_file" "key" {
   file_permission = "0600"
 }
 `, keyPath),
+				// terraform-plugin-testing v1.16.0 rejects providers being
+				// specified at both levels ("Providers must only be specified
+				// either at the TestCase or TestStep level"), so this step
+				// declares BOTH the external provider and the in-process
+				// factories, and the TestCase must not set
+				// ProtoV6ProviderFactories at all. Measured during Task 5.
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 				ExternalProviders: map[string]resource.ExternalProvider{
 					"local": {Source: "hashicorp/local"},
 				},
@@ -1815,6 +1912,8 @@ git commit -m "feat: pki_private_key resource with scheme-prefixed import"
 ### Task 6: Resource `pki_cert_request` and data source `pki_cert_request`
 
 The CSR pair. The resource creates one; the data source decodes one that arrived from elsewhere, which spec §11 motivates as "a device or another team hands you a CSR and you want to inspect or assert on it before issuing, rather than signing blind."
+
+**Cleanup this task owns (from minor-fix wave 4).** Wave 4 added a test-only probe resource, `pkiprobe_shared_blocks`, in `internal/provider/schema_common_test.go`, because the shared `subject`/`san`/extension blocks had no real resource embedding them and the empty-block rejection could not otherwise be exercised through a real OpenTofu run. `pki_cert_request` is the first resource to embed those blocks. **Delete the probe and re-point its acceptance tests at `pki_cert_request`**, so the behavior is verified on the real schema rather than on a stand-in that could drift from it. Confirm the tests still fail when `nonEmptyBlockValidator` is removed — a probe-to-real-resource move is exactly where an assertion can quietly stop biting.
 
 **Files:**
 - Create: `internal/provider/resource_cert_request.go`
@@ -2494,7 +2593,12 @@ func TestAccDataSourceCertificateRejectsBadInput(t *testing.T) {
 }
 ```
 
-The two tests referencing `pki_certificate_authority` and `pki_certificate` cannot pass until Tasks 8 and 9. Write them now — they are the specification of what those tasks must produce — and expect them red until then. Note that in the commit message for this task so a red test run is not mistaken for a regression.
+**Write only the tests this task can make pass.** Of the four above, `TestAccDataSourceCertificateRejectsBadInput` needs nothing beyond the data source, so it lands here. The other three exercise `pki_certificate_authority` and `pki_certificate`, which do not exist yet — so they do **not** land here. Instead:
+
+- `TestAccDataSourceCertificate` and `TestAccDataSourceCertificateAcceptsBase64` move to Task 8, which introduces `pki_certificate_authority` and the `testAccCAConfig` fragment they depend on. Task 8's Step 1 adds them to `data_source_certificate_test.go`.
+- `TestAccDataSourceCertificateExtensionsAndSAN` moves to Task 9, which introduces `pki_certificate`.
+
+The `testAccCAConfig` constant above moves with them: define it in Task 8's `resource_certificate_authority_test.go`, not here. This task's test file therefore contains one test and no references to resources that do not exist, so the suite is green at every commit.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -2568,22 +2672,20 @@ output "ca_expires" {
 }
 ```
 
-- [ ] **Step 5: Verify what can pass now**
+- [ ] **Step 5: Run the tests to verify they pass**
 
 ```bash
-make testacc TESTARGS='-run "TestAccDataSourceCertificateRejectsBadInput"'
+make testacc TESTARGS='-run TestAccDataSourceCertificate'
+go test ./internal/... -count=1
 ```
 
-Expected: PASS. The other three tests in the file stay red until Tasks 8 and 9 land.
+Expected: PASS. The whole suite is green — the resource-dependent assertions were deferred to Tasks 8 and 9 rather than landing red here.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add internal/provider/data_source_certificate.go internal/provider/data_source_certificate_test.go internal/provider/provider.go examples/data-sources/pki_certificate/
-git commit -m "feat: pki_certificate data source
-
-Three of its acceptance tests depend on pki_certificate_authority and
-pki_certificate and stay red until those resources land."
+git commit -m "feat: pki_certificate data source"
 ```
 
 ---
@@ -2595,8 +2697,16 @@ Self-signs a root with no parent; issues an intermediate with one. This collapse
 **Files:**
 - Create: `internal/provider/resource_certificate_authority.go`
 - Test: `internal/provider/resource_certificate_authority_test.go`
+- Test: `internal/provider/data_source_certificate_test.go` (add the two tests deferred from Task 7, below)
 - Modify: `internal/provider/provider.go`
 - Create: `examples/resources/pki_certificate_authority/resource.tf`, `examples/resources/pki_certificate_authority/import.sh`
+
+**Deferred from Task 7.** Task 7 built the `pki_certificate` data source but could only test its input validation, because there was no certificate resource to decode. Two of its tests belong here, now that there is one. Add both to `internal/provider/data_source_certificate_test.go` in Step 1, taking their bodies from Task 7's Step 1 verbatim:
+
+- `TestAccDataSourceCertificate` — decodes `pki_certificate_authority.root.certificate_pem` and asserts on subject, `is_ca`, `signature_algorithm`, serial, `not_after`, `subject_key_id`, and `fingerprint_sha256`.
+- `TestAccDataSourceCertificateAcceptsBase64` — the same via `content_base64`, which is the shape a Kubernetes Secret delivers.
+
+Both depend on the `testAccCAConfig` constant, which this task defines (see Step 1).
 
 **Interfaces:**
 - Consumes: `pki.CreateCertificate`, `pki.CertTemplate`, `pki.ParseCertificatePEM`, `pki.ParseCertificateChainPEM`, `pki.EncodeCertificatePEM`, `pki.RandomSerial`, `pki.ParseSerial`, `pki.FormatSerial`, `pki.ParseDuration`, `pki.CompareValidity`, `pki.DefaultCAKeyUsage` (Plan 1); Task 4's blocks; Task 7's helpers; Task 5's `resolveImportID`.
@@ -3035,6 +3145,7 @@ Issues a leaf signed by a CA. The CA is supplied as bare PEM, so the Bitwarden-d
 **Files:**
 - Create: `internal/provider/resource_certificate.go`
 - Test: `internal/provider/resource_certificate_test.go`
+- Test: `internal/provider/data_source_certificate_test.go` (add `TestAccDataSourceCertificateExtensionsAndSAN`, deferred from Task 7 — take its body verbatim from Task 7's Step 1; it asserts on the SAN's three types, `key_usage`, `extended_key_usage`, `basic_constraints`, and `is_ca` of a decoded leaf)
 - Modify: `internal/provider/provider.go`
 - Create: `examples/resources/pki_certificate/resource.tf`, `examples/resources/pki_certificate/import.sh`
 
@@ -3590,7 +3701,7 @@ terraform import 'pki_certificate.device["nick-ipad"]' 'file:///tmp/nick-ipad.cr
 make testacc TESTARGS='-run "TestAccCertificate|TestAccDataSourceCertificate"'
 ```
 
-Expected: PASS, including `TestAccDataSourceCertificateExtensionsAndSAN`, which has been red since Task 7.
+Expected: PASS, including `TestAccDataSourceCertificateExtensionsAndSAN`, which this task adds to `data_source_certificate_test.go` (deferred there from Task 7, which had no `pki_certificate` to exercise).
 
 - [ ] **Step 6: Commit**
 
@@ -4905,7 +5016,7 @@ Schema per spec §6.6:
 | `certificate_pem` | Optional, String | |
 | `private_key_pem` | Optional, Sensitive, String | |
 | `chain_pem` | Optional, List of String | ordered, leaf-adjacent first |
-| `friendly_name` | Optional, String | PKCS#12 / JKS alias |
+| `friendly_name` | Optional, String | JKS alias; PKCS#12 alias for a truststore only. **No effect on a keyed PKCS#12 bundle** — `go-pkcs12` cannot set one (spec §6.6). The description must say so, since silently ignoring an attribute is worse than not offering it. |
 | `pkcs12_encoding` | Optional + Computed, String | `OneOf` over `pki.PKCS12Encodings()`; defaults to `modern` |
 | `password_wo` | Optional, **WriteOnly**, Sensitive, String | never persisted |
 | `password_wo_version` | Optional, Int64 | change to force re-encryption |
@@ -5007,6 +5118,8 @@ git commit -m "feat: pki_bundle converter with write-only password support"
 ### Task 13: Import fidelity and the end-to-end homelab scenario
 
 Spec §10's remaining acceptance criteria, including the one that gates the migration follow-up: an existing device certificate is imported and the subsequent plan is empty.
+
+**Note on non-standard keyUsage (from the review-gate fix round).** `pki.ParseKeyUsage` now rejects — rather than silently truncates — a keyUsage extension carrying any bit above bit 8 (decipherOnly), whether or not a named bit is also set. RFC 5280 §4.2.1.3 assigns no key usage there, so such a bit has no name this provider can represent, and byte-exact reproduction is this project's hardest requirement: dropping the bit would make an adopted certificate re-issue with fewer keyUsage bytes than it carries. A reference certificate that ever carries such a bit therefore fails import loudly, with a message naming the offending bit position — and that is the correct outcome, not a test failure to suppress. The homelab reference fixtures (Plan 1 Task 15) use only RFC 5280 bits, so the fidelity scenario is unaffected; this note exists so a future fixture change that adds a non-standard bit is read correctly.
 
 **Files:**
 - Create: `internal/provider/import_fidelity_test.go`
@@ -5376,7 +5489,7 @@ Keep the `{{ .SchemaMarkdown }}` and example blocks the default template provide
 
 - [ ] **Step 2: Fix the generate wiring**
 
-Task 1 left `main.go` with a placeholder `//go:generate echo`. Replace it now that the tools module exists:
+Task 1 already wrote the correct comment in `main.go` explaining that generation lives in the tools module and why there is no `//go:generate` directive. Verify it is still accurate and matches this:
 
 ```go
 // Documentation is generated from the tools module, which keeps tfplugindocs'
@@ -5502,6 +5615,14 @@ Append to `.github/workflows/test.yml`:
           # already present at this path, so the harness drives OpenTofu
           # directly and never downloads Terraform.
           TF_ACC_TERRAFORM_PATH: tofu
+          # Required, not optional. terraform-plugin-testing defaults its
+          # reattach host to registry.terraform.io while still registering the
+          # legacy "-" namespace as a reattach candidate, and OpenTofu's address
+          # parser rejects that pairing outright: `The legacy provider namespace
+          # "-" can be used only with hostname registry.opentofu.org`. Without
+          # this, EVERY acceptance test fails before it reaches the provider.
+          # Measured during Task 1; the Makefile's testacc target sets it too.
+          TF_ACC_PROVIDER_HOST: registry.opentofu.org
         run: go test -v -cover -timeout 20m ./internal/provider/
 ```
 
@@ -5540,6 +5661,8 @@ This is spec §14 follow-up 3, now actionable because the dependency set is fina
         if: always()
         run: go-licenses report ./... --ignore=github.com/nijave/terraform-provider-pki || true
 ```
+
+**Scan the build graph, not the module graph.** `go-licenses check ./...` walks packages actually imported, which is correct. Do not switch it to anything driven by `go list -m all`: that lists transitive requirements from dependencies' own `go.mod` files even when nothing imports them. Measured at the end of Plan 1 — `golang.org/x/net`, `golang.org/x/term`, and `golang.org/x/text` all appear in `go list -m all` via `golang.org/x/crypto`'s `go.mod`, while `go mod why golang.org/x/text` reports "main module does not need package golang.org/x/text" and none is linked into the build. All three are BSD-3-Clause, so nothing was at risk, but a module-graph-driven gate would have demanded an audit trail for dependencies the binary never contains.
 
 `go-licenses` classifies MPL-2.0 as `reciprocal`, which is not in the disallowed set — correct, because spec §13 establishes that MPL-2.0 §3.3 permits distributing the combined work under GPLv3 and that the framework's sources carry no Exhibit B notice. If `go-licenses check` reports an unexpected classification, read spec §13 before changing the allowlist; the MPL false-positive trap documented there is exactly the kind of finding that looks like a real problem.
 
