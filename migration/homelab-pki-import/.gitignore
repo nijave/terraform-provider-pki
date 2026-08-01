@@ -8,3 +8,7 @@ crl.pem
 migration-test.crt
 .terraform/
 .terraform.lock.hcl
+*.crt
+*.key
+*.p12
+*.pem
