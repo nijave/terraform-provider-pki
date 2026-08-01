@@ -104,6 +104,8 @@ jobs:
           tofu_wrapper: false
       - name: Generate
         run: make docs
+      - name: DEBUG full diff
+        run: git diff
       - name: Check for uncommitted changes
         run: |
           git diff --compact-summary --exit-code || \
