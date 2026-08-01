@@ -41,6 +41,7 @@ vet:
 
 .PHONY: docs
 docs:
+	./tools/gen-schema.sh
 	cd tools && go generate ./...
 
 .PHONY: release

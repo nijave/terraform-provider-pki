@@ -34,3 +34,6 @@ go.work.sum
 # Agent scratch: git worktrees and subagent-driven-development ledgers
 .claude/worktrees/
 .superpowers/
+
+# Provider schema exported by tools/gen-schema.sh for `make docs`
+tools/schema.json
