@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework-validators/datasourcevalidator"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
@@ -188,15 +189,15 @@ func (d *certRequestDataSource) ConfigValidators(_ context.Context) []datasource
 // shapes — {oid, value, string_type} and {oid, value_base64, critical} — are the
 // same shapes the resource's blocks use, and the tfsdk tags already match.
 type certRequestDataSourceModel struct {
-	ContentPEM          types.String          `tfsdk:"content_pem"`
-	ContentBase64       types.String          `tfsdk:"content_base64"`
-	Subject             []attributeModel      `tfsdk:"subject"`
-	SAN                 *sanModel             `tfsdk:"san"`
-	RequestedExtensions []extraExtensionModel `tfsdk:"requested_extensions"`
-	PublicKeyAlgorithm  types.String          `tfsdk:"public_key_algorithm"`
-	PublicKeyPEM        types.String          `tfsdk:"public_key_pem"`
-	SignatureAlgorithm  types.String          `tfsdk:"signature_algorithm"`
-	SignatureValid      types.Bool            `tfsdk:"signature_valid"`
+	ContentPEM          types.String `tfsdk:"content_pem"`
+	ContentBase64       types.String `tfsdk:"content_base64"`
+	Subject             types.List   `tfsdk:"subject"`
+	SAN                 *sanModel    `tfsdk:"san"`
+	RequestedExtensions types.List   `tfsdk:"requested_extensions"`
+	PublicKeyAlgorithm  types.String `tfsdk:"public_key_algorithm"`
+	PublicKeyPEM        types.String `tfsdk:"public_key_pem"`
+	SignatureAlgorithm  types.String `tfsdk:"signature_algorithm"`
+	SignatureValid      types.Bool   `tfsdk:"signature_valid"`
 }
 
 func (d *certRequestDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
@@ -248,7 +249,16 @@ func (d *certRequestDataSource) Read(ctx context.Context, req datasource.ReadReq
 		resp.Diagnostics.AddError("Unable to parse certificate request subject", err.Error())
 		return
 	}
-	config.Subject = certRequestSubjectFromPKI(subject)
+	// subjectListValue -- the same helper the certificate data source and Tasks
+	// 8/9 use -- so the two data sources produce the same shape for an empty
+	// subject (null, not []). An empty-subject CSR (openssl req -subj "/" with a
+	// SAN-only identity) previously serialized as [] here and null there.
+	var diags diag.Diagnostics
+	config.Subject, diags = subjectListValue(ctx, subject)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	// SAN: decoded if the extension is present, null otherwise. sanFromPKI
 	// returns nil for an empty SAN, which serializes as a null attribute.
@@ -273,17 +283,14 @@ func (d *certRequestDataSource) Read(ctx context.Context, req datasource.ReadReq
 		}
 	}
 
-	// Requested extensions: every extension, unparsed, in declaration order.
-	// Ranging over csr.Extensions with := avoids naming pkix.Extension here.
-	requested := make([]extraExtensionModel, 0, len(csr.Extensions))
-	for _, ext := range csr.Extensions {
-		requested = append(requested, extraExtensionModel{
-			OID:         types.StringValue(pki.FormatOID(ext.Id)),
-			Critical:    types.BoolValue(ext.Critical),
-			ValueBase64: types.StringValue(base64.StdEncoding.EncodeToString(ext.Value)),
-		})
+	// Requested extensions: every extension, unparsed, in declaration order,
+	// through extensionListValue -- the shared helper, so an extensionless CSR
+	// yields null rather than [], matching the certificate data source.
+	config.RequestedExtensions, diags = extensionListValue(ctx, csr.Extensions)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
-	config.RequestedExtensions = requested
 
 	// Public key algorithm in the provider's canonical spelling (ED25519, not
 	// Go's "Ed25519"). The mapping lives in pki.PublicKeyAlgorithm so the
@@ -312,25 +319,4 @@ func (d *certRequestDataSource) Read(ctx context.Context, req datasource.ReadReq
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &config)...)
-}
-
-// certRequestSubjectFromPKI converts a parsed subject to the data source's
-// always-populated form. Unlike subjectFromPKI (the import direction, which
-// writes null for the utf8 default), this always writes string_type, because
-// the data source's computed subject documents the encoding every attribute
-// carries — a caller comparing two requests needs to see it.
-func certRequestSubjectFromPKI(s pki.Subject) []attributeModel {
-	out := make([]attributeModel, 0, len(s.Attributes))
-	for _, a := range s.Attributes {
-		st := a.StringType
-		if st == "" {
-			st = pki.StringTypeUTF8
-		}
-		out = append(out, attributeModel{
-			OID:        types.StringValue(pki.FormatOID(a.OID)),
-			Value:      types.StringValue(a.Value),
-			StringType: types.StringValue(string(st)),
-		})
-	}
-	return out
 }

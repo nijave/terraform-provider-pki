@@ -282,10 +282,12 @@ func (d *certificateDataSource) Read(ctx context.Context, req datasource.ReadReq
 	var diags diag.Diagnostics
 
 	// Subject and issuer: ordered form, with string_type always populated.
-	// Both go through subjectListValue, the same helper Tasks 8 and 9 use in
-	// ImportState, so the data source and the resource import path produce the
-	// same state shape for the same certificate -- including the empty case,
-	// which is null, not [].
+	// Both go through subjectListValue, the same helper the pki_cert_request
+	// data source uses, so the two certificate-shaped data sources produce the
+	// same state shape for the same subject -- including the empty case, which
+	// is null, not []. (The importable resources reconstruct their subject as a
+	// block via subjectFromPKI, a different schema surface; the shared shape
+	// here is between the two data sources.)
 	subject, err := pki.ParseSubjectDER(cert.RawSubject)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to parse certificate subject", err.Error())
@@ -397,9 +399,9 @@ func (d *certificateDataSource) Read(ctx context.Context, req datasource.ReadReq
 	}
 
 	// Every extension, including the typed ones dispatched above, in one place:
-	// extensionListValue, the same helper Tasks 8 and 9 use in ImportState, so
-	// the raw list's shape (and its empty case -- null, not []) matches the
-	// resource import path reading the same certificate.
+	// extensionListValue, the same helper the pki_cert_request data source uses
+	// for requested_extensions, so the raw list's shape (and its empty case --
+	// null, not []) matches across the two data sources.
 	config.Extensions, diags = extensionListValue(ctx, cert.Extensions)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -463,13 +465,15 @@ func (d *certificateDataSource) Read(ctx context.Context, req datasource.ReadReq
 }
 
 // subjectListValue converts a parsed Subject to a types.List of `{oid, value,
-// string_type}` objects, matching the shape the data source's `subject` and
-// `issuer` attributes and the resources' `attribute`/`extra_attribute` blocks
-// all use. The data source's Read calls it directly, and Tasks 8 and 9 call it
-// during ImportState to reconstruct subject state from a parsed certificate --
-// one conversion in one place, so the data source and the resource import path
-// cannot drift on the subject's shape (including the empty case, which is
-// null).
+// string_type}` objects, matching the shape the certificate and cert_request
+// data sources' computed `subject`/`issuer` attributes use. Both data sources
+// call it (the certificate one for subject and issuer, the cert_request one for
+// subject), so one conversion in one place means they cannot drift on the
+// subject's shape -- including the empty case, which is null, not [].
+//
+// The importable resources reconstruct their subject as a *block* via
+// subjectFromPKI, which is a different schema surface (named-field or ordered
+// attribute blocks, not a computed list), so it is deliberately not shared here.
 //
 // An empty Subject produces a null list rather than an empty one, matching
 // stringsToList and the import convention that an absent collection is null.
@@ -503,9 +507,10 @@ func subjectListValue(ctx context.Context, s pki.Subject) (types.List, diag.Diag
 }
 
 // extensionListValue converts a parsed extension list to a types.List of `{oid,
-// critical, value_base64}` objects, matching the shape the data source's
-// `extensions` attribute and the resource's `extra_extension` block both use.
-// Tasks 8 and 9 call this during ImportState.
+// critical, value_base64}` objects, the shape the certificate data source's
+// `extensions` attribute and the cert_request data source's
+// `requested_extensions` attribute both use, so the two share this one
+// conversion (and its empty case, null).
 //
 // crypto/x509/pkix is the type of x509.Certificate.Extensions, which is the
 // slice Tasks 8 and 9 already have in hand; accepting pkix.Extension directly
