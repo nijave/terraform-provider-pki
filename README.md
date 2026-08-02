@@ -1,18 +1,62 @@
 # terraform-provider-pki
 
-A Terraform/OpenTofu provider for running a private X.509 certificate
-authority entirely in-process. No external CA service, no `openssl` binary, no
-`cfssl` binary.
+Terraform/OpenTofu provider for managing a private certificate authority (CA) entirely through Terraform. It is a solution to fully manage private PKI in-process: generate keys, build a CA hierarchy, issue and rotate certificates, publish revocation lists, and package certificate material without an external CA service or command-line dependency.
 
-Status: in development. See
-[`docs/superpowers/specs/2026-07-25-terraform-provider-pki-design.md`](docs/superpowers/specs/2026-07-25-terraform-provider-pki-design.md)
-for the design.
+No `openssl` binary, `cfssl` binary, CA endpoint, or provider credentials are required. Each resource performs its work in-process, while CA material can be supplied as PEM from an existing secret manager or Terraform-managed resource.
 
-## Why
+## What you can manage
 
-`hashicorp/tls` cannot express a DN with arbitrary OIDs or repeated OUs, cannot
-set a certificate serial, cannot emit `rfc822Name` SANs, and has no PKCS#12 or
-CRL support. This provider closes those gaps.
+- **CA hierarchy** — create self-signed roots and intermediates with path-length limits, name constraints, custom distinguished-name OIDs, and explicit extension criticality.
+- **Keys and CSRs** — generate RSA, ECDSA, or Ed25519 private keys and create certificate signing requests with rich subjects and SANs.
+- **Certificates** — issue leaf certificates from a CSR or inline public key, control validity and serial numbers, and rotate them with early-renewal windows.
+- **Revocation** — issue CRLs with monotonic CRL numbers, validity windows, and RFC 5280 revocation reasons.
+- **Distribution formats** — package certificates and keys as PEM, DER, PKCS#7, PKCS#12, or JKS bundles.
+- **Inspection** — decode certificates and CSRs, inspect OIDs, and use provider functions for OID lookup.
+
+## Example: root, intermediate, and leaf workflow
+
+```hcl
+resource "pki_private_key" "root" {
+  algorithm   = "ECDSA"
+  ecdsa_curve = "P384"
+}
+
+resource "pki_certificate_authority" "root" {
+  private_key_pem = pki_private_key.root.private_key_pem
+  validity        = "175320h"
+
+  subject {
+    common_name = "example-root"
+  }
+}
+
+resource "pki_private_key" "intermediate" {
+  algorithm   = "ECDSA"
+  ecdsa_curve = "P256"
+}
+
+resource "pki_certificate_authority" "intermediate" {
+  private_key_pem        = pki_private_key.intermediate.private_key_pem
+  parent_certificate_pem = pki_certificate_authority.root.certificate_pem
+  parent_private_key_pem = pki_private_key.root.private_key_pem
+  validity               = "87600h"
+
+  subject {
+    common_name = "example-intermediate"
+  }
+
+  basic_constraints {
+    ca       = true
+    path_len = 0
+  }
+}
+```
+
+Use `pki_certificate` to issue certificates from the intermediate, and `pki_crl` to publish revocations. See the complete [CA hierarchy example](examples/resources/pki_certificate_authority/resource.tf), [certificate example](examples/resources/pki_certificate/resource.tf), and [CRL example](examples/resources/pki_crl/resource.tf).
+
+## Documentation
+
+The [provider documentation](docs/index.md) lists all resources, data sources, and functions. The provider is self-contained and has no configuration block; keys and CA material are passed explicitly to the resources that use them.
 
 ## Requirements
 
