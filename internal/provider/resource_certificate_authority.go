@@ -415,7 +415,7 @@ func (r *certificateAuthorityResource) Delete(_ context.Context, _ resource.Dele
 // null: it is not a property of the certificate, and the readiness check
 // reduces to "has the certificate expired" until configuration sets a window.
 func (r *certificateAuthorityResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	pemBytes, err := resolveImportID(req.ID)
+	pemBytes, err := resolveImportID(req.ID, true) // certificate: public by design, inline is fine
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to resolve import ID", err.Error())
 		return
