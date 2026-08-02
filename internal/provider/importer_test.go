@@ -19,7 +19,7 @@ func TestResolveImportIDFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(testPEM), 0o600); err != nil {
 		t.Fatalf("writing the fixture: %v", err)
 	}
-	got, err := resolveImportID("file://" + path)
+	got, err := resolveImportID("file://"+path, true)
 	if err != nil {
 		t.Fatalf("resolveImportID: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestResolveImportIDFile(t *testing.T) {
 
 func TestResolveImportIDPEM(t *testing.T) {
 	t.Parallel()
-	got, err := resolveImportID("pem://" + testPEM)
+	got, err := resolveImportID("pem://"+testPEM, true)
 	if err != nil {
 		t.Fatalf("resolveImportID: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestResolveImportIDPEM(t *testing.T) {
 func TestResolveImportIDBase64(t *testing.T) {
 	t.Parallel()
 	encoded := base64.StdEncoding.EncodeToString([]byte(testPEM))
-	got, err := resolveImportID("base64://" + encoded)
+	got, err := resolveImportID("base64://"+encoded, true)
 	if err != nil {
 		t.Fatalf("resolveImportID: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestResolveImportIDBase64(t *testing.T) {
 	}
 	// Unpadded base64 is what a shell pipeline is most likely to produce, so
 	// accept it too.
-	if _, err := resolveImportID("base64://" + strings.TrimRight(encoded, "=")); err != nil {
+	if _, err := resolveImportID("base64://"+strings.TrimRight(encoded, "="), true); err != nil {
 		t.Errorf("resolveImportID rejected unpadded base64: %v", err)
 	}
 }
@@ -69,7 +69,7 @@ func TestResolveImportIDRejectsBadInput(t *testing.T) {
 		"bad base64":      "base64://!!!!",
 		"empty base64":    "base64://",
 	} {
-		if _, err := resolveImportID(id); err == nil {
+		if _, err := resolveImportID(id, true); err == nil {
 			t.Errorf("resolveImportID(%s) returned nil error, want an error", label)
 		}
 	}
@@ -81,7 +81,7 @@ func TestResolveImportIDRejectsBadInput(t *testing.T) {
 // will see at that moment.
 func TestResolveImportIDErrorNamesTheSchemes(t *testing.T) {
 	t.Parallel()
-	_, err := resolveImportID("/tmp/tls.crt")
+	_, err := resolveImportID("/tmp/tls.crt", true)
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -89,6 +89,78 @@ func TestResolveImportIDErrorNamesTheSchemes(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err.Error(), want)
 		}
+	}
+}
+
+// TestResolveImportIDInlineDisallowed covers allowInline=false, used only by
+// pki_private_key's ImportState: pem:// and base64:// must be rejected
+// (OpenTofu/Terraform prints an import ID in full, unconditionally, before
+// this provider ever runs -- inline schemes would put a private key itself
+// into that output), while file:// -- the one scheme whose id string is never
+// the key itself -- must keep working exactly as it does when inline is
+// allowed.
+func TestResolveImportIDInlineDisallowed(t *testing.T) {
+	t.Parallel()
+
+	for _, scheme := range []string{"pem://", "base64://"} {
+		scheme := scheme
+		t.Run(scheme, func(t *testing.T) {
+			t.Parallel()
+			_, err := resolveImportID(scheme+"whatever", false)
+			if err == nil {
+				t.Fatalf("resolveImportID(%q, allowInline=false) returned nil error, want an error", scheme+"whatever")
+			}
+			if !strings.Contains(err.Error(), scheme) {
+				t.Errorf("error %q does not name the rejected scheme %q", err.Error(), scheme)
+			}
+			if !strings.Contains(err.Error(), "file://") {
+				t.Errorf("error %q does not point at file:// as the alternative", err.Error())
+			}
+		})
+	}
+
+	t.Run("file:// still works", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		path := filepath.Join(dir, "tls.key")
+		if err := os.WriteFile(path, []byte(testPEM), 0o600); err != nil {
+			t.Fatalf("writing the fixture: %v", err)
+		}
+		got, err := resolveImportID("file://"+path, false)
+		if err != nil {
+			t.Fatalf("resolveImportID: %v", err)
+		}
+		if string(got) != testPEM {
+			t.Fatalf("got %q, want the file's contents", got)
+		}
+	})
+}
+
+// TestResolveImportIDInlineDisallowedErrorDoesNotEchoPayload guards the
+// rejection path itself: a private key resource rejecting pem://<key> or
+// base64://<key> must not turn around and put the key into the rejection
+// message -- that would just move the leak from the import log line into a
+// diagnostic that reaches the same console and CI logs.
+func TestResolveImportIDInlineDisallowedErrorDoesNotEchoPayload(t *testing.T) {
+	t.Parallel()
+	const secret = "c3VwZXJzZWNyZXRrZXltYXRlcmlhbA"
+
+	for _, id := range []string{"pem://" + secret, "base64://" + secret} {
+		id := id
+		t.Run(id, func(t *testing.T) {
+			t.Parallel()
+			_, err := resolveImportID(id, false)
+			if err == nil {
+				t.Fatalf("expected an error for %q", id)
+			}
+			msg := err.Error()
+			const minRunLength = 8
+			for length := minRunLength; length <= len(secret); length++ {
+				if run := secret[:length]; strings.Contains(msg, run) {
+					t.Fatalf("error message echoes %d bytes of the payload (%q): %q", length, run, msg)
+				}
+			}
+		})
 	}
 }
 
@@ -122,7 +194,7 @@ func TestResolveImportIDErrorDoesNotEchoContents(t *testing.T) {
 	for label, id := range cases {
 		t.Run(label, func(t *testing.T) {
 			t.Parallel()
-			_, err := resolveImportID(id)
+			_, err := resolveImportID(id, true)
 			if err == nil {
 				t.Fatalf("expected an error for %q", id)
 			}

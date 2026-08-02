@@ -503,7 +503,7 @@ func (r *certificateResource) Delete(_ context.Context, _ resource.DeleteRequest
 // pki_private_key.public_key_pem resolves to when the adopted key is the cert's
 // subject key.
 func (r *certificateResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	pemBytes, err := resolveImportID(req.ID)
+	pemBytes, err := resolveImportID(req.ID, true) // certificate: public by design, inline is fine
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to resolve import ID", err.Error())
 		return

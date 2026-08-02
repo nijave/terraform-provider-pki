@@ -21,8 +21,27 @@ import (
 //
 // hashicorp/tls supports no import at all, so there is no prior convention to
 // match and the error message has to teach the format.
-func resolveImportID(id string) ([]byte, error) {
-	const usage = `want an ID of the form "file://<path>", "pem://<pem>", or "base64://<base64-encoded pem>"`
+//
+// allowInline gates pem:// and base64://. Both `terraform import <addr> <id>`
+// and a declarative `import` block print the literal id string in full,
+// unconditionally, before any provider ever runs (e.g. `Importing from ID
+// "..."...` / `Preparing import... [id=...]`) -- a resource's own
+// sensitive-attribute redaction (the "(sensitive value)" a plan diff shows)
+// never applies to it, because Core is not rendering a resource attribute
+// here, just echoing the string it was given. That is harmless for a
+// certificate, which is public by design, but disastrous for a private key:
+// pem:// and base64:// both carry the key itself inline, so importing one
+// either way puts the entire key, verbatim (base64 is trivially reversible),
+// into the console and into whatever captures it -- CI logs, a Kubernetes
+// Job's logs, a terminal scrollback. Call sites that import private key
+// material (only pki_private_key) must pass allowInline=false, which forces
+// file://: the only scheme whose id string is never the key itself, only a
+// path to it.
+func resolveImportID(id string, allowInline bool) ([]byte, error) {
+	usage := `want an ID of the form "file://<path>", "pem://<pem>", or "base64://<base64-encoded pem>"`
+	if !allowInline {
+		usage = `want an ID of the form "file://<path>"`
+	}
 
 	switch {
 	case strings.HasPrefix(id, "file://"):
@@ -41,6 +60,11 @@ func resolveImportID(id string) ([]byte, error) {
 		return content, nil
 
 	case strings.HasPrefix(id, "pem://"):
+		if !allowInline {
+			return nil, fmt.Errorf("pem:// is not accepted for this resource: OpenTofu/Terraform prints an "+
+				"import ID in full, unconditionally, before this provider ever runs, which would put the "+
+				"private key itself into your console and logs. %s", usage)
+		}
 		content := strings.TrimPrefix(id, "pem://")
 		if strings.TrimSpace(content) == "" {
 			return nil, fmt.Errorf("import ID has an empty pem:// payload; %s", usage)
@@ -48,6 +72,11 @@ func resolveImportID(id string) ([]byte, error) {
 		return []byte(content), nil
 
 	case strings.HasPrefix(id, "base64://"):
+		if !allowInline {
+			return nil, fmt.Errorf("base64:// is not accepted for this resource: OpenTofu/Terraform prints an "+
+				"import ID in full, unconditionally, before this provider ever runs, which would put the "+
+				"private key itself (base64-encoded, but trivially reversible) into your console and logs. %s", usage)
+		}
 		payload := strings.TrimPrefix(id, "base64://")
 		if payload == "" {
 			return nil, fmt.Errorf("import ID has an empty base64:// payload; %s", usage)

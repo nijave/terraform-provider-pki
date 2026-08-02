@@ -307,9 +307,18 @@ func (r *privateKeyResource) Delete(_ context.Context, _ resource.DeleteRequest,
 // same helper Create uses, so an imported key's state cannot drift from a
 // generated key's state in shape.
 //
-// This is not ImportStatePassthroughID: the ID is a locator (file://, pem://,
-// or base64://) that describes where to find the key, not the resource's
-// identity. The resource's identity, once imported, is its fingerprint.
+// This is not ImportStatePassthroughID: the ID is a locator (file:// only for
+// this resource -- see resolveImportID) that describes where to find the key,
+// not the resource's identity. The resource's identity, once imported, is its
+// fingerprint.
+//
+// resolveImportID is called with allowInline=false: pem:// and base64:// both
+// carry the key itself inline, and OpenTofu/Terraform prints an import ID in
+// full, unconditionally, in its own progress output before this provider ever
+// runs -- unlike this resource's private_key_pem attribute, which the
+// framework correctly redacts in a plan diff, that progress line is not a
+// resource attribute and is never redacted. A private key resource is the one
+// place in this provider where that distinction is not academic.
 func (r *privateKeyResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	// These three errors are deliberately resource-level (AddError, no path),
 	// not attribute-level. Import runs against `terraform import <addr> <id>`
@@ -319,7 +328,7 @@ func (r *privateKeyResource) ImportState(ctx context.Context, req resource.Impor
 	// the operator wrote is wrong; here the failure is the import ID itself, and
 	// the framework renders a resource-level diagnostic against the resource
 	// address, which is the right place for it.
-	pemBytes, err := resolveImportID(req.ID)
+	pemBytes, err := resolveImportID(req.ID, false)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to resolve import ID", err.Error())
 		return
