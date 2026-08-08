@@ -7,7 +7,7 @@ require (
 	github.com/hashicorp/terraform-plugin-framework-validators v0.19.0
 	github.com/hashicorp/terraform-plugin-go v0.31.0
 	github.com/hashicorp/terraform-plugin-testing v1.16.0
-	github.com/smallstep/pkcs7 v0.2.2
+	github.com/smallstep/pkcs7 v0.2.3
 	golang.org/x/crypto v0.54.0
 	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
