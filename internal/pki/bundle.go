@@ -51,10 +51,16 @@ type PKCS12Encoding string
 
 const (
 	// PKCS12Modern is AES-256-CBC content encryption with PBKDF2 and an
-	// HMAC-SHA256 MAC. It is the default because it is what a bare
-	// `openssl pkcs12 -export` produces under OpenSSL 3, which is what the
-	// homelab reconciler already emits, so migrating to this provider does not
-	// change what lands on a device.
+	// HMAC-SHA256 MAC, the same algorithm suite a bare `openssl pkcs12 -export`
+	// produces under OpenSSL 3, which is what the homelab reconciler already
+	// emits, so migrating to this provider does not change what lands on a
+	// device.
+	//
+	// Upstream go-pkcs12 omits the NULL parameter on the PBKDF2 PRF
+	// AlgorithmIdentifier that RFC 8018 B.1.1 requires and that OpenSSL emits.
+	// OpenSSL, BouncyCastle and Apple tolerate the omission; BoringSSL
+	// (Android apps using dart:io or Chrome's stack) rejects the whole bundle.
+	// go.mod pins a fork that emits the NULL until the fix lands upstream.
 	//
 	// Requires iOS/iPadOS 18+, macOS 15+, or Android 14+ (Android 12-13 depends
 	// on the device's Play system update).

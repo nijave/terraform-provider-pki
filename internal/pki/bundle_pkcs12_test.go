@@ -588,3 +588,32 @@ func TestPKCS12EncodingsList(t *testing.T) {
 		}
 	}
 }
+
+// RFC 8018 B.1.1 gives the PBKDF2 PRF AlgorithmIdentifier a NULL parameter.
+// BoringSSL rejects a PKCS#12 bundle that omits it, so a modern bundle must
+// carry {hmacWithSHA256, NULL} on every PBES2 algorithm (the certificate bag
+// and the shrouded key bag) and never the bare {hmacWithSHA256} form that
+// upstream go-pkcs12 emits.
+func TestEncodePKCS12ModernPrfCarriesNullParameter(t *testing.T) {
+	t.Parallel()
+	leaf, key, ca := testLeaf(t)
+	out, err := EncodeBundle(BundleInput{
+		Format: FormatPKCS12, Certificate: leaf, PrivateKey: key, Chain: []*x509.Certificate{ca},
+		Password: testPassword, PKCS12Encoding: PKCS12Modern,
+	})
+	if err != nil {
+		t.Fatalf("EncodeBundle: %v", err)
+	}
+
+	// DER of OBJECT IDENTIFIER 1.2.840.113549.2.9 (hmacWithSHA256).
+	oid := []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x09}
+	withNull := append(append([]byte{0x30, 0x0c}, oid...), 0x05, 0x00)
+	bare := append([]byte{0x30, 0x0a}, oid...)
+
+	if n := bytes.Count(out, withNull); n != 2 {
+		t.Errorf("found %d PRF AlgorithmIdentifiers with a NULL parameter, want 2 (certificate bag and key bag)", n)
+	}
+	if n := bytes.Count(out, bare); n != 0 {
+		t.Errorf("found %d PRF AlgorithmIdentifiers without the NULL parameter, want 0", n)
+	}
+}
