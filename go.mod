@@ -9,7 +9,7 @@ require (
 	github.com/hashicorp/terraform-plugin-testing v1.16.0
 	github.com/smallstep/pkcs7 v0.2.3
 	golang.org/x/crypto v0.57.0
-	software.sslmate.com/src/go-pkcs12 v0.7.3
+	software.sslmate.com/src/go-pkcs12 v0.7.4
 )
 
 require (
@@ -67,5 +67,3 @@ require (
 	github.com/pavlo-v-chernykh/keystore-go/v4 v4.5.0
 	golang.org/x/sys v0.48.0 // indirect
 )
-
-replace software.sslmate.com/src/go-pkcs12 => github.com/nijave/go-pkcs12 v0.7.4-0.20261010220224-7bb8ce955470
