@@ -182,8 +182,13 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-      - name: Install go-licenses
-        run: go install github.com/google/go-licenses@latest
+      # go-licenses is pinned as a tool dependency of the tools module
+      # (tools/go.mod), so Dependabot's gomod updates keep it current; a
+      # `go install ...@version` pin in a run step would be invisible to it.
+      # Build the binary from the tools module, then run it against the root
+      # module's packages from the repo root.
+      - name: Build go-licenses
+        run: (cd tools && go build -o "$RUNNER_TEMP/go-licenses" github.com/google/go-licenses/v2)
       # The project is GPL-3.0-or-later, so every dependency must be
       # GPLv3-compatible. The forbidden set is what actually threatens that:
       # BUSL-1.1 (Terraform CLI since 1.6) and the copyleft-incompatible
@@ -191,10 +196,11 @@ jobs:
       # the license is ever downgraded, re-audit spec section 13 first.
       - name: Check licenses
         run: |
-          go-licenses check ./... \
+          "$RUNNER_TEMP/go-licenses" check ./... \
             --disallowed_types=forbidden,restricted,unknown \
             --ignore=github.com/nijave/terraform-provider-pki
       - name: Report licenses
         if: always()
-        run: go-licenses report ./... --ignore=github.com/nijave/terraform-provider-pki || true
+        run: |
+          "$RUNNER_TEMP/go-licenses" report ./... --ignore=github.com/nijave/terraform-provider-pki || true
 
